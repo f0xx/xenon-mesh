@@ -118,7 +118,7 @@ pub fn assemble_context(
 
     let mut ranked: Vec<(f32, &PromptEntry)> = Vec::new();
     let embeddings_ok = !query_emb.is_empty();
-    for e in entries.iter().filter(|e| !is_always_included(e)) {
+    for e in entries.iter().filter(|e| e.entry_type == ENTRY_DYNAMIC && !is_always_included(e)) {
         let lexical = lexical_score(query, &e.content).max(lexical_score(query, &e.source_path));
         let score =
             if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty() {
