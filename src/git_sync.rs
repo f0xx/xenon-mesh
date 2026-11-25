@@ -4,6 +4,9 @@ use git2::{DiffOptions, Repository};
 use std::path::Path;
 
 pub fn scan_bare_repo(bare_path: &Path, namespace: &str) -> Result<Vec<ContextEntry>> {
+    if bare_path.join(".xmeshignore").exists() {
+        return Ok(vec![]);
+    }
     let repo = Repository::open_bare(bare_path)?;
     let head_tree = repo.head()?.peel_to_tree()?;
     let mut entries = Vec::new();
