@@ -1,12 +1,21 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct Attachment {
+    pub name: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ChatTurn {
     pub role: String,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 pub struct GeminiClient {
@@ -44,18 +53,30 @@ impl GeminiClient {
     }
 
     pub async fn generate_chat_with_model(&self, model: &str, system_ctx: &str, turns: &[ChatTurn]) -> Result<String> {
-        let contents: Vec<Value> = turns.iter().map(|t| json!({ "role": t.role, "parts": [{ "text": t.text }] })).collect();
+        let contents: Vec<Value> = turns.iter().map(|t| {
+            let mut parts = vec![json!({ "text": t.text })];
+            for att in &t.attachments {
+                parts.push(json!({ "inlineData": { "mimeType": att.mime_type, "data": att.data_base64 } }));
+            }
+            json!({ "role": t.role, "parts": parts })
+        }).collect();
+
         let mut body = json!({ "contents": contents, "generationConfig": { "temperature": 0.3 } });
         if !system_ctx.trim().is_empty() {
             body["systemInstruction"] = json!({ "parts": [{ "text": system_ctx }] });
         }
+
         let res: Value = self.http.post(self.endpoint(model, "generateContent")).json(&body).send().await?.json().await?;
-        res["candidates"][0]["content"]["parts"][0]["text"].as_str().map(str::to_string).context("Empty Gemini response")
+        if let Some(err_msg) = res["error"]["message"].as_str() {
+            bail!("Gemini API error: {err_msg}");
+        }
+        res["candidates"].get(0).and_then(|c| c["content"]["parts"].get(0)).and_then(|p| p["text"].as_str())
+            .map(str::to_string).context("Empty Gemini response")
     }
 
     pub async fn distill_lesson(&self, thread_summary: &str) -> Result<String> {
         let sys = "Extract strict technical invariants, node/router configs and code conventions as a concise list (max 10 lines).";
-        self.generate_chat(sys, &[ChatTurn { role: "user".into(), text: thread_summary.into() }]).await
+        self.generate_chat(sys, &[ChatTurn { role: "user".into(), text: thread_summary.into(), attachments: vec![] }]).await
     }
 }
 

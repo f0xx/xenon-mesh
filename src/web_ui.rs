@@ -1,4 +1,4 @@
-use crate::gemini::{ChatTurn, GeminiClient};
+use crate::gemini::{Attachment, ChatTurn, GeminiClient};
 use crate::git_sync::{discover_bare_repos, scan_bare_repo};
 use crate::storage::pb::cluster_service_client::ClusterServiceClient;
 use crate::storage::pb::{ContextEntry, EntryType, NodeTaskRequest, SessionMessage};
@@ -23,6 +23,8 @@ pub struct ChatReq {
     pub thread: String,
     pub prompt: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Deserialize)]
@@ -77,12 +79,13 @@ pub fn router(state: Arc<WebState>) -> Router {
             Json(st.status.read().await.clone())
         }))
         .route("/v1/chat/completions", post(handle_oai_compat))
+        .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state)
 }
 
 async fn handle_history(State(st): State<Arc<WebState>>, Query(q): Query<HistoryQuery>) -> Result<Json<Vec<ChatTurn>>, StatusCode> {
     let msgs = st.db.load_thread(&q.channel, &q.thread, 200).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(msgs.into_iter().map(|m| ChatTurn { role: m.author, text: m.content }).collect()))
+    Ok(Json(msgs.into_iter().map(|m| ChatTurn { role: m.author, text: m.content, attachments: vec![] }).collect()))
 }
 
 async fn handle_list_threads(State(st): State<Arc<WebState>>, Query(q): Query<ThreadsQuery>) -> Result<Json<Vec<String>>, StatusCode> {
@@ -90,23 +93,33 @@ async fn handle_list_threads(State(st): State<Arc<WebState>>, Query(q): Query<Th
 }
 
 async fn handle_persistent_chat(State(st): State<Arc<WebState>>, Json(req): Json<ChatReq>) -> Result<Json<ChatRes>, StatusCode> {
-    let mut past = st.db.load_thread(&req.channel, &req.thread, 100).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let past = st.db.load_thread(&req.channel, &req.thread, 100).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let next_seq = past.last().map(|m| m.seq + 1).unwrap_or(1);
 
+    // В историю БД сохраняем пометку о прикрепленных файлах
+    let att_note = if req.attachments.is_empty() { String::new() } else {
+        let names: Vec<&str> = req.attachments.iter().map(|a| a.name.as_str()).collect();
+        format!("\n[Attached: {}]", names.join(", "))
+    };
     let user_msg = SessionMessage {
         channel_id: req.channel.clone(), thread_id: req.thread.clone(),
-        seq: next_seq, author: "user".into(), content: req.prompt.clone(), created_at_ms: 0,
+        seq: next_seq, author: "user".into(), content: format!("{}{}", req.prompt, att_note), created_at_ms: 0,
     };
     st.db.append_message(&user_msg).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    past.push(user_msg);
 
-    let turns: Vec<ChatTurn> = past.into_iter().map(|m| ChatTurn { role: m.author, text: m.content }).collect();
+    let mut turns: Vec<ChatTurn> = past.into_iter().map(|m| ChatTurn {
+        role: m.author, text: m.content, attachments: vec![],
+    }).collect();
+    turns.push(ChatTurn { role: "user".into(), text: req.prompt.clone(), attachments: req.attachments });
+
     let q_emb = st.gemini.embed_text(&req.prompt).await.unwrap_or_default();
     let ctx = build_prompt_context(&st.db, &req.channel, &q_emb, 8).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let model = req.model.as_deref().filter(|s| !s.is_empty()).unwrap_or(&st.default_model);
-    let reply = st.gemini.generate_chat_with_model(model, &ctx, &turns)
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let reply = match st.gemini.generate_chat_with_model(model, &ctx, &turns).await {
+        Ok(r) => r,
+        Err(e) => return Ok(Json(ChatRes { reply: format!("[ERROR] {e}") })),
+    };
 
     let bot_msg = SessionMessage {
         channel_id: req.channel, thread_id: req.thread,
@@ -115,6 +128,7 @@ async fn handle_persistent_chat(State(st): State<Arc<WebState>>, Json(req): Json
     st.db.append_message(&bot_msg).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ChatRes { reply }))
 }
+
 #[derive(Deserialize)] pub struct LearnReq { pub channel: String, pub title: String, pub text: String, pub pin: bool }
 #[derive(Deserialize)] pub struct ApproveReq {
     pub node_grpc_url: String, pub target_repo: String, pub unified_diff: String, pub deploy_pipeline: String,
@@ -184,6 +198,7 @@ async fn handle_oai_compat(State(st): State<Arc<WebState>>, Json(req): Json<OaiC
     let ctx = build_prompt_context(&st.db, channel, &q_emb, 8).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let turns: Vec<ChatTurn> = req.messages.into_iter().map(|m| ChatTurn {
         role: if m.role == "assistant" { "model".into() } else { "user".into() }, text: m.content,
+        attachments: vec![],
     }).collect();
     let reply = st.gemini.generate_chat(&ctx, &turns).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
 

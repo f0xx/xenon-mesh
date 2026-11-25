@@ -47,7 +47,15 @@
     </div>
   </div>
   <div id="log"></div>
-  <div class="bar"><textarea id="prompt" data-i18n-ph="promptPh"></textarea><button onclick="send()" data-i18n="send">Send</button></div>
+  <div style="background:#181b20;border-top:1px solid #2d3748;padding:8px 12px">
+    <div id="attBar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;font-size:12px"></div>
+    <div class="bar" style="padding:0;border:0">
+      <input type="file" id="fileInput" multiple style="display:none" onchange="handleFiles(this.files)">
+      <button style="background:#4a5568" onclick="fileInput.click()" title="Attach images, PDF, logs, code">+ File</button>
+      <textarea id="prompt" data-i18n-ph="promptPh" onpaste="handlePaste(event)"></textarea>
+      <button onclick="send()" data-i18n="send">Send</button>
+    </div>
+  </div>
 </main>
 <div class="resizer" id="resizerR"></div>
 <div id="panel">
@@ -145,15 +153,49 @@ function appendBubble(who, txt) {
   }
   log.appendChild(box); log.scrollTop = log.scrollHeight;
 }
+let pendingAtts = [];
+
+function renderAtts() {
+  attBar.innerHTML = '';
+  pendingAtts.forEach((a, idx) => {
+    const tag = document.createElement('span');
+    tag.style.cssText = 'background:#2d3748;padding:2px 8px;border-radius:3px';
+    tag.textContent = `📎 ${a.name} `;
+    const x = document.createElement('b'); x.textContent = '×'; x.style.cursor = 'pointer';
+    x.onclick = () => { pendingAtts.splice(idx, 1); renderAtts(); };
+    tag.appendChild(x); attBar.appendChild(tag);
+  });
+}
+
+function handleFiles(files) {
+  Array.from(files).forEach(f => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const b64 = reader.result.split(',')[1];
+      pendingAtts.push({ name: f.name, mime_type: f.type || 'text/plain', data_base64: b64 });
+      renderAtts();
+    };
+    reader.readAsDataURL(f);
+  });
+  fileInput.value = '';
+}
+
+function handlePaste(e) {
+  const items = (e.clipboardData || {}).items || [];
+  const files = Array.from(items).filter(i => i.kind === 'file').map(i => i.getAsFile()).filter(Boolean);
+  if (files.length) handleFiles(files);
+}
+
 async function send() {
   const box = document.getElementById('prompt');
   const p = box.value.trim();
-  if (!p) return;
+  if (!p && !pendingAtts.length) return;
+  const atts = pendingAtts; pendingAtts = []; renderAtts();
   box.value = '';
-  appendBubble('user', p);
+  appendBubble('user', p + (atts.length ? `\n[Attached: ${atts.map(a=>a.name).join(', ')}]` : ''));
   const d = await (await fetch('/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ channel: ch, thread, prompt: p, model: modelSelect.value })
+    body: JSON.stringify({ channel: ch, thread, prompt: p || 'Analyze attached files', model: modelSelect.value, attachments: atts })
   })).json();
   appendBubble(modelSelect.value, d.reply || 'error');
   await refreshThreads();
