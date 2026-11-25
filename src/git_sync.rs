@@ -82,23 +82,24 @@ pub fn extract_local_diff(repo_path: &Path, namespace: &str, base_ref: &str, nod
     }))
 }
 
+
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub fn discover_bare_repos(root: &Path) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
+    let mut visited = HashSet::new();
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
+        let Ok(canon) = std::fs::canonicalize(&dir) else { continue; };
+        if !visited.insert(canon) { continue; } // Защита от циклических симлинков
+
         let Ok(entries) = std::fs::read_dir(&dir) else { continue; };
         for ent in entries.flatten() {
             let path = ent.path();
             if !path.is_dir() { continue; }
-
-            // Признак bare-репозитория: наличие файла HEAD и каталогов objects + refs
-            let is_bare = path.join("HEAD").is_file()
-                && path.join("objects").is_dir()
-                && path.join("refs").is_dir();
-
+            let is_bare = path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir();
             if is_bare {
                 let rel = path.strip_prefix(root).unwrap_or(&path);
                 let ns = rel.with_extension("").to_string_lossy().replace('\\', "/");
@@ -111,4 +112,5 @@ pub fn discover_bare_repos(root: &Path) -> Vec<(String, PathBuf)> {
     found.sort_by(|a, b| a.0.cmp(&b.0));
     found
 }
+
 

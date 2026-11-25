@@ -22,7 +22,10 @@ impl GeminiClient {
     }
 
     fn endpoint(&self, model: &str, action: &str) -> String {
-        format!("https://googleapis.com{model}:{action}?key={}", self.api_key)
+        format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:{action}?key={}",
+            self.api_key
+        )
     }
 
     pub async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {

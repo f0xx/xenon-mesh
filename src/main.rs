@@ -88,28 +88,25 @@ async fn main() -> Result<()> {
             if let Some(root) = cfg.git.bare_repos_root.clone() {
                 let (db_bg, gem_bg, st_bg) = (db.clone(), gemini.clone(), status);
                 tokio::spawn(async move {
-                    let repos = git_sync::discover_bare_repos(std::path::Path::new(&root));
+                    // Даем Web UI 1 секунду гарантированно подняться до начала сканирования
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let r_clone = root.clone();
+                    let repos = tokio::task::spawn_blocking(move || git_sync::discover_bare_repos(std::path::Path::new(&r_clone)))
+                        .await.unwrap_or_default();
                     let total = repos.len();
-                    {
-                        let mut s = st_bg.write().await;
-                        s.busy = true; s.phase = "indexing".into(); s.total_repos = total;
-                    }
+                    { let mut s = st_bg.write().await; s.busy = true; s.phase = "indexing".into(); s.total_repos = total; }
+
                     for (idx, (ns, path)) in repos.into_iter().enumerate() {
-                        {
-                            let mut s = st_bg.write().await;
-                            s.done_repos = idx; s.current_repo = ns.clone();
-                        }
-                        if let Ok(entries) = git_sync::scan_bare_repo(&path, &ns) {
-                            for mut e in entries {
-                                if db_bg.is_unchanged(&e.id, &e.content_hash).await.unwrap_or(false) {
-                                    continue;
-                                }
-                                if let Ok(emb) = gem_bg.embed_text(&e.content).await { e.embedding = emb; }
-                                if db_bg.upsert_proto(&e, false).await.unwrap_or(false) {
-                                    st_bg.write().await.indexed_files += 1;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            }
+                        { let mut s = st_bg.write().await; s.done_repos = idx; s.current_repo = ns.clone(); }
+                        let ns_c = ns.clone();
+                        let entries = tokio::task::spawn_blocking(move || git_sync::scan_bare_repo(&path, &ns_c))
+                            .await.unwrap_or(Ok(vec![])).unwrap_or_default();
+
+                        for mut e in entries {
+                            if db_bg.is_unchanged(&e.id, &e.content_hash).await.unwrap_or(false) { continue; }
+                            if let Ok(emb) = gem_bg.embed_text(&e.content).await { e.embedding = emb; }
+                            if db_bg.upsert_proto(&e, false).await.unwrap_or(false) { st_bg.write().await.indexed_files += 1; }
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                         }
                     }
                     let mut s = st_bg.write().await;
