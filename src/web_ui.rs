@@ -1,4 +1,3 @@
-use crate::gemini::{Attachment, ChatTurn, GeminiClient};
 use crate::git_sync::{discover_bare_repos, scan_bare_repo};
 use crate::storage::pb::cluster_service_client::ClusterServiceClient;
 use crate::storage::pb::{ContextEntry, EntryType, NodeTaskRequest, SessionMessage};
@@ -7,6 +6,11 @@ use crate::watcher::build_prompt_context;
 use axum::{extract::{Query, State}, http::StatusCode, response::Html, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
+use crate::gemini::{Attachment, ChatTurn, GeminiClient, StreamEvent};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use std::convert::Infallible;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+
 
 pub struct WebState {
     pub db: Arc<Storage>,
@@ -37,7 +41,7 @@ pub struct ForkThreadReq {
     pub keep_tail: usize,
 }
 
-#[derive(Serialize)] pub struct ChatRes { pub reply: String }
+//#[derive(Serialize)] pub struct ChatRes { pub reply: String }
 #[derive(Deserialize)] pub struct HistoryQuery { pub channel: String, pub thread: String }
 #[derive(Deserialize)] pub struct ThreadsQuery { pub channel: String }
 #[derive(Deserialize)] pub struct ReindexQuery { pub namespace: String }
@@ -94,43 +98,6 @@ async fn handle_history(State(st): State<Arc<WebState>>, Query(q): Query<History
 
 async fn handle_list_threads(State(st): State<Arc<WebState>>, Query(q): Query<ThreadsQuery>) -> Result<Json<Vec<String>>, StatusCode> {
     st.db.list_threads(&q.channel).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-async fn handle_persistent_chat(State(st): State<Arc<WebState>>, Json(req): Json<ChatReq>) -> Result<Json<ChatRes>, StatusCode> {
-    let past = st.db.load_thread(&req.channel, &req.thread, 100).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let next_seq = past.last().map(|m| m.seq + 1).unwrap_or(1);
-
-    // В историю БД сохраняем пометку о прикрепленных файлах
-    let att_note = if req.attachments.is_empty() { String::new() } else {
-        let names: Vec<&str> = req.attachments.iter().map(|a| a.name.as_str()).collect();
-        format!("\n[Attached: {}]", names.join(", "))
-    };
-    let user_msg = SessionMessage {
-        channel_id: req.channel.clone(), thread_id: req.thread.clone(),
-        seq: next_seq, author: "user".into(), content: format!("{}{}", req.prompt, att_note), created_at_ms: 0,
-    };
-    st.db.append_message(&user_msg).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut turns: Vec<ChatTurn> = past.into_iter().map(|m| ChatTurn {
-        role: m.author, text: m.content, attachments: vec![],
-    }).collect();
-    turns.push(ChatTurn { role: "user".into(), text: req.prompt.clone(), attachments: req.attachments });
-
-    let q_emb = st.gemini.embed_text(&req.prompt).await.unwrap_or_default();
-    let ctx = build_prompt_context(&st.db, &req.channel, &q_emb, 8).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let model = req.model.as_deref().filter(|s| !s.is_empty()).unwrap_or(&st.default_model);
-
-    let reply = match st.gemini.generate_chat_with_model(model, &ctx, &turns).await {
-        Ok(r) => r,
-        Err(e) => return Ok(Json(ChatRes { reply: format!("[ERROR] {e}") })),
-    };
-
-    let bot_msg = SessionMessage {
-        channel_id: req.channel, thread_id: req.thread,
-        seq: next_seq + 1, author: "model".into(), content: reply.clone(), created_at_ms: 0,
-    };
-    st.db.append_message(&bot_msg).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(ChatRes { reply }))
 }
 
 #[derive(Deserialize)] pub struct LearnReq { pub channel: String, pub title: String, pub text: String, pub pin: bool }
@@ -235,6 +202,55 @@ async fn handle_delete_memory(
     Query(q): Query<MemDelQuery>,
 ) -> Result<StatusCode, StatusCode> {
     st.db.delete_entry(&q.id).await.map(|_| StatusCode::OK).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn handle_persistent_chat(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<ChatReq>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let past = st.db.load_thread(&req.channel, &req.thread, 100).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let next_seq = past.last().map(|m| m.seq + 1).unwrap_or(1);
+
+    let att_note = if req.attachments.is_empty() { String::new() } else {
+        format!("\n[Attached: {}]", req.attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    let user_msg = SessionMessage {
+        channel_id: req.channel.clone(), thread_id: req.thread.clone(),
+        seq: next_seq, author: "user".into(), content: format!("{}{}", req.prompt, att_note), created_at_ms: 0,
+    };
+    st.db.append_message(&user_msg).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut turns: Vec<ChatTurn> = past.into_iter().map(|m| ChatTurn { role: m.author, text: m.content, attachments: vec![] }).collect();
+    turns.push(ChatTurn { role: "user".into(), text: req.prompt.clone(), attachments: req.attachments });
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
+    let st_bg = st.clone();
+    let model = req.model.filter(|s| !s.is_empty()).unwrap_or_else(|| st.default_model.clone());
+
+    tokio::spawn(async move {
+        let _ = tx.send(StreamEvent::Status { text: "Building context...".into() }).await;
+        let q_emb = st_bg.gemini.embed_text(&req.prompt).await.unwrap_or_default();
+        let ctx = build_prompt_context(&st_bg.db, &req.channel, &q_emb, 8).await.unwrap_or_default();
+
+        let (author, final_text) = match st_bg.gemini.stream_chat_with_fallback(&model, &ctx, &turns, tx.clone()).await {
+            Ok(reply) => (model, reply),
+            Err(e) => {
+                let err_txt = format!("[ERROR] {e}");
+                let _ = tx.send(StreamEvent::Delta { text: err_txt.clone() }).await;
+                ("error".into(), err_txt)
+            }
+        };
+
+        let _ = st_bg.db.append_message(&SessionMessage {
+            channel_id: req.channel, thread_id: req.thread,
+            seq: next_seq + 1, author, content: final_text, created_at_ms: 0,
+        }).await;
+    });
+
+    let stream = ReceiverStream::new(rx).map(|ev| {
+        Ok(Event::default().data(serde_json::to_string(&ev).unwrap_or_default()))
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 

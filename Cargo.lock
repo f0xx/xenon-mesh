@@ -3102,6 +3102,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",

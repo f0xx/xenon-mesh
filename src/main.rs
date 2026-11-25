@@ -81,7 +81,12 @@ async fn main() -> Result<()> {
 
     let hmac_key = *blake3::hash(&std::fs::read(&cfg.node.hmac_secret_path)?).as_bytes();
     let api_key = std::env::var(&cfg.gemini.api_key_env).unwrap_or_default();
-    let gemini = Arc::new(GeminiClient::new(api_key, &cfg.gemini.chat_model, &cfg.gemini.embed_model));
+    let gemini = Arc::new(GeminiClient::new(
+        api_key,
+        &cfg.gemini.chat_model,
+        &cfg.gemini.embed_model,
+        cfg.gemini.available_models.clone(),
+    ));
 
     match cfg.node.mode {
         NodeMode::Master => {
