@@ -1,0 +1,25 @@
+node:
+  id: "unconfigured-node"
+  mode: "node"
+  listen_addr: "0.0.0.0:8443"
+  master_url: "http://10.10.0.1:8443"
+  hmac_secret_path: "/etc/xmeshd/hmac.key"
+  allowed_workspaces:
+    - "/srv/projects"
+
+storage:
+  # На воркерах primary_url пустой — сразу используется локальный SQLite без ошибок в логах
+  primary_url: null
+  fallback_sqlite: "/var/lib/xmeshd/cache.db"
+
+git:
+  bare_repos_root: null
+  watched_repos: []
+
+deploy_pipelines:
+  run-cargo-test:
+    workdir: "/srv/projects/router-fw"
+    command: ["cargo", "test", "--offline"]
+    use_bwrap: true
+    allow_network: false
+

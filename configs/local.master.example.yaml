@@ -1,0 +1,12 @@
+node:
+  id: "xen-master"
+  mode: "master"
+
+storage:
+  # Если Postgres временно упадет при обновлении Gentoo, демон автоматически перейдет на SQLite
+  primary_url: "postgres://xmesh:labpass@127.0.0.1:5432/xmesh_lab"
+  fallback_sqlite: "/var/lib/xmeshd/master_fallback.db"
+
+git:
+  bare_repos_root: "/srv/git"
+

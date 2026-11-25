@@ -1,0 +1,15 @@
+node:
+  id: "router-lab-01"
+  allowed_workspaces:
+    - "/srv/projects/router-fw"
+    - "/etc/nftables"
+
+watched_repos: []
+
+deploy_pipelines:
+  reload-nft:
+    workdir: "/srv/projects/router-fw"
+    command: ["/usr/local/libexec/safe-nft-apply.sh"]
+    use_bwrap: false # Нужен доступ к netlink ядра через doas/sudo враппер
+    allow_network: false
+

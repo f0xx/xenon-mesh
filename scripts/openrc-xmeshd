@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+
+name="xmeshd"
+description="Distributed AI Context & Lab Orchestration Daemon"
+command="/usr/local/bin/xmeshd"
+command_user="xmeshd:xmeshd"
+
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+
+output_log="/var/log/xmeshd/stdout.log"
+error_log="/var/log/xmeshd/stderr.log"
+
+depend() {
+    need net
+    use postgresql mariadb
+    after firewall wireguard
+}
+

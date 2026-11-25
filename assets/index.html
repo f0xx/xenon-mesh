@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><title>xmeshd lab</title>
+<style>
+  body { margin:0; font:14px/1.4 monospace; background:#111317; color:#e2e8f0; display:flex; height:100vh; }
+  aside { width:200px; background:#181b20; border-right:1px solid #2d3748; padding:12px; }
+  aside div { padding:6px 8px; cursor:pointer; border-radius:4px; }
+  aside div.active, aside div:hover { background:#2b6cb0; color:#fff; }
+  main { flex:1; display:flex; flex-direction:column; }
+  #log { flex:1; overflow-y:auto; padding:16px; white-space:pre-wrap; }
+  .msg { margin-bottom:14px; padding:10px; background:#1a202c; border-left:3px solid #4299e1; }
+  .bar { display:flex; gap:8px; padding:12px; background:#181b20; border-top:1px solid #2d3748; }
+  textarea, input { background:#0d0f12; color:#fff; border:1px solid #2d3748; padding:8px; font:inherit; }
+  textarea { flex:1; height:54px; resize:none; }
+  button { background:#2b6cb0; color:#fff; border:0; padding:8px 14px; cursor:pointer; }
+  #panel { width:290px; background:#181b20; border-left:1px solid #2d3748; padding:12px; display:flex; flex-direction:column; gap:8px; }
+  #diffView { flex:1; overflow:auto; background:#0b0d10; border:1px solid #2d3748; padding:8px; font-size:12px; white-space:pre; }
+  .d-add { background:#132e21; color:#68d391; display:block; }
+  .d-del { background:#33181b; color:#fc8181; display:block; }
+  .d-hunk { color:#63b3ed; font-weight:bold; display:block; margin-top:4px; }
+  .d-file { color:#f6e05e; font-weight:bold; display:block; }
+</style>
+</head>
+<body>
+<aside>
+  <b>LAB CHANNELS</b><hr style="border-color:#2d3748">
+  <div class="active" onclick="setCh(this,'router-fw')"># router-fw</div>
+  <div onclick="setCh(this,'xen-kernel')"># xen-kernel</div>
+  <div onclick="setCh(this,'deploy-ops')"># deploy-ops</div>
+</aside>
+<!-- Добавить в <aside> сразу после списка каналов -->
+<br><b>THREADS</b> <button style="padding:2px 6px;float:right" onclick="newThread()">+</button>
+<hr style="border-color:#2d3748">
+<div id="threadList"></div>
+
+<script>
+let ch = 'general', thread = 'main', currentDiff = '';
+
+async function setCh(el, c) {
+  ch = c; thread = 'main';
+  if (el) { document.querySelectorAll('aside > div[onclick]').forEach(d => d.classList.remove('active')); el.classList.add('active'); }
+  await refreshThreads();
+  await loadHistory();
+}
+
+async function refreshThreads() {
+  const r = await fetch(`/api/threads?channel=${encodeURIComponent(ch)}`);
+  const list = await r.json();
+  threadList.innerHTML = '';
+  list.forEach(t => {
+    const d = document.createElement('div');
+    d.textContent = `↳ ${t}`;
+    if (t === thread) d.className = 'active';
+    d.onclick = () => { thread = t; refreshThreads(); loadHistory(); };
+    threadList.appendChild(d);
+  });
+}
+
+async function newThread() {
+  const name = window.prompt('Имя нового треда (напр. ipv6-nat):');
+  if (!name) return;
+  thread = name.trim().replace(/\s+/g, '-');
+  await refreshThreads();
+  log.innerHTML = `<div class="msg">[system] Создан тред #${ch} / ${thread}</div>`;
+}
+
+async function loadHistory() {
+  log.innerHTML = '';
+  const r = await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`);
+  const msgs = await r.json();
+  msgs.forEach(m => appendBubble(m.role, m.text));
+}
+
+window.onload = () => setCh(null, 'general');
+</script>
+<main>
+  <div id="log"></div>
+  <div class="bar">
+    <textarea id="prompt" placeholder="Query channel context..."></textarea>
+    <button onclick="send()">Send</button>
+  </div>
+</main>
+<div id="panel">
+  <b>CONTEXT & MEMORY</b>
+  <input id="mTitle" placeholder="Key (f.ex. nft-rules)">
+  <textarea id="mText" placeholder="Compression thread..."></textarea>
+  <div style="display:flex;gap:6px">
+    <button onclick="saveMem(true)">Pin Raw</button>
+    <button onclick="saveMem(false)">Distill Learn</button>
+  </div>
+  <hr style="border-color:#2d3748;width:100%">
+  <b>HITL DEPLOY (HMAC)</b>
+  <input id="dNode" placeholder="http://10.10.0.12:8443">
+  <input id="dRepo" placeholder="/srv/projects/router-fw">
+  <input id="dPipe" placeholder="pipeline (f.ex. reload-nft)">
+  <textarea id="dDiff" placeholder="unified diff (optional)"></textarea>
+  <button style="background:#2f855a" onclick="approveTask()">Approve & Execute</button>
+</div>
+<script>
+let ch = 'router-fw';
+function setCh(el, c) {
+  ch = c; document.querySelectorAll('aside div').forEach(d=>d.classList.remove('active'));
+  el.classList.add('active'); log.innerHTML = `<div class="msg">Switched to #${ch}</div>`;
+}
+function addMsg(who, txt) { log.innerHTML += `<div class="msg"><b>[${who}]</b>\n${txt}</div>`; log.scrollTop = log.scrollHeight; }
+async function send() {
+  const p = prompt.value.trim(); if (!p) return; prompt.value = ''; addMsg('you', p);
+  const r = await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, prompt:p}) });
+  const d = await r.json(); addMsg('gemini', d.reply || 'error');
+}
+async function saveMem(pin) {
+  await fetch('/api/memory/learn', { method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({channel:ch, title:mTitle.value, text:mText.value, pin}) });
+  addMsg('system', pin ? 'Pinned to channel' : 'Distilled & learned');
+}
+async function approveTask() {
+  const r = await fetch('/api/task/approve', { method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({node_grpc_url:dNode.value, target_repo:dRepo.value, deploy_pipeline:dPipe.value, unified_diff:dDiff.value}) });
+  addMsg('deploy-result', JSON.stringify(await r.json(), null, 2));
+}
+</script>
+<script>
+let ch = 'general', currentDiff = '', history = { general: [], 'router-fw': [], 'xen-kernel': [] };
+
+function setCh(el, c) {
+  ch = c; document.querySelectorAll('aside div').forEach(d => d.classList.remove('active'));
+  el.classList.add('active'); renderLog();
+}
+
+function renderLog() {
+  log.innerHTML = '';
+  history[ch].forEach(m => appendBubble(m.role, m.text));
+}
+
+function appendBubble(who, txt) {
+  const box = document.createElement('div'); box.className = 'msg';
+  const body = document.createElement('div'); body.textContent = `[${who}]\n${txt}`;
+  box.appendChild(body);
+
+  const match = txt.match(/```diff\n([\s\(\S\)]*?)```/);
+  if (match) {
+    const btn = document.createElement('button');
+    btn.style.marginTop = '8px'; btn.textContent = 'Inspect Diff in Review Panel ->';
+    btn.onclick = () => loadDiff(match[1]);
+    box.appendChild(btn);
+  }
+  log.appendChild(box); log.scrollTop = log.scrollHeight;
+}
+
+function loadDiff(raw) {
+  currentDiff = raw; diffView.innerHTML = '';
+  let adds = 0, dels = 0;
+  raw.split('\n').forEach(line => {
+    const span = document.createElement('span'); span.textContent = line || ' ';
+    if (line.startsWith('+++') || line.startsWith('---')) span.className = 'd-file';
+    else if (line.startsWith('@@')) span.className = 'd-hunk';
+    else if (line.startsWith('+')) { span.className = 'd-add'; adds++; }
+    else if (line.startsWith('-')) { span.className = 'd-del'; dels++; }
+    diffView.appendChild(span);
+  });
+  diffStats.textContent = `+${adds} / -${dels} lines`;
+  btnApprove.disabled = false;
+}
+
+function pasteManualDiff() {
+  const raw = window.prompt('Вставьте unified diff:');
+  if (raw) loadDiff(raw);
+}
+
+async function send() {
+  const p = prompt.value.trim(); if (!p) return; prompt.value = '';
+  history[ch].push({ role: 'user', text: p }); appendBubble('user', p);
+  const r = await fetch('/api/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: ch, messages: history[ch] })
+  });
+  const d = await r.json();
+  history[ch].push({ role: 'model', text: d.reply }); appendBubble('gemini', d.reply);
+}
+
+async function approveTask() {
+  btnApprove.disabled = true;
+  const r = await fetch('/api/task/approve', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ node_grpc_url: dNode.value, target_repo: dRepo.value, deploy_pipeline: dPipe.value, unified_diff: currentDiff })
+  });
+  appendBubble('deploy-result', JSON.stringify(await r.json(), null, 2));
+}
+</script>
+<script>
+let ch = 'general', thread = 'main', currentDiff = '';
+
+async function setCh(el, c) {
+  ch = c;
+  if (el) { document.querySelectorAll('aside div').forEach(d => d.classList.remove('active')); el.classList.add('active'); }
+  log.innerHTML = '';
+  const r = await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`);
+  const msgs = await r.json();
+  msgs.forEach(m => appendBubble(m.role, m.text));
+}
+
+async function send() {
+  const p = prompt.value.trim(); if (!p) return; prompt.value = '';
+  appendBubble('user', p);
+  const r = await fetch('/api/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: ch, thread, prompt: p })
+  });
+  const d = await r.json();
+  appendBubble('model', d.reply || 'error');
+}
+
+window.onload = () => setCh(null, 'general');
+</script>
+
+</body>
+</html>
+
+
+
+<!--div id="panel">
+  <b>DIFF INSPECTOR & DEPLOY</b>
+  <input id="dNode" value="http://10.10.0.12:8443" placeholder="Node gRPC URL">
+  <input id="dRepo" value="/srv/projects/router-fw" placeholder="Target workspace">
+  <input id="dPipe" value="reload-nft" placeholder="Deploy pipeline">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <span id="diffStats" style="color:#a0aec0">No diff loaded</span>
+    <button onclick="pasteManualDiff()">Paste Raw</button>
+  </div>
+  <div id="diffView">Ожидание патча из чата или вставки...</div>
+  <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()">Approve & Execute</button>
+</div-->
+
+
+
+
+
+
+
+
+
+

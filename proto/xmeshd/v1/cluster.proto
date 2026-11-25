@@ -1,0 +1,84 @@
+syntax = "proto3";
+package xmeshd.v1;
+
+service ClusterService
+{
+  rpc SyncContexts (SyncEnvelope) returns (SyncAck);
+  rpc QueryNodeContext (ContextQuery) returns (SyncEnvelope);
+  rpc ExecuteTask (NodeTaskRequest) returns (NodeTaskResponse);
+}
+
+enum EntryType
+{
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_DYNAMIC = 1;
+  ENTRY_TYPE_PINNED = 2;
+  ENTRY_TYPE_LEARNED = 3;
+}
+
+message ContextEntry
+{
+  string id = 1;
+  string namespace = 2;
+  EntryType entry_type = 3;
+  string source_path = 4;
+  string content = 5;
+  string content_hash = 6;
+  repeated float embedding = 7;
+  int64 updated_at_ms = 8;
+  string origin_node = 9;
+    map < string, string > meta = 10;
+    reserved 11 to 15;
+}
+
+message SessionMessage
+{
+  string channel_id = 1;
+  string thread_id = 2;
+  uint64 seq = 3;
+  string author = 4;
+  string content = 5;
+  int64 created_at_ms = 6;
+}
+
+message SyncEnvelope
+{
+  uint32 schema_version = 1;
+  string source_node = 2;
+  int64 timestamp_ms = 3;
+  repeated ContextEntry entries = 4;
+  repeated SessionMessage messages = 5;
+}
+
+message SyncAck
+{
+  uint32 accepted_entries = 1;
+  uint32 skipped_unchanged = 2;
+}
+
+message ContextQuery
+{
+  string namespace = 1;
+  string query_text = 2;
+  repeated float query_embedding = 3;
+  uint32 top_k = 4;
+}
+
+message NodeTaskRequest
+{
+  string task_id = 1;
+  string target_repo = 2;
+  string unified_diff = 3;
+  string deploy_pipeline = 4;
+  bytes master_hmac_sig = 5;
+  int64 expires_at_ms = 6;
+}
+
+message NodeTaskResponse
+{
+  string task_id = 1;
+  bool success = 2;
+  int32 exit_code = 3;
+  string stdout_log = 4;
+  string stderr_log = 5;
+}

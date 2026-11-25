@@ -1,0 +1,82 @@
+use anyhow::{Context, Result};
+use figment::{
+    providers::{Env, Format, Yaml},
+    Figment,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeMode {
+    Master,
+    Node,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub node: NodeSection,
+    pub storage: StorageSection,
+    pub git: GitSection,
+    #[serde(default)]
+    pub deploy_pipelines: HashMap<String, DeployPipeline>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSection {
+    pub id: String,
+    pub mode: NodeMode,
+    pub listen_addr: String,
+    pub master_url: Option<String>,
+    pub hmac_secret_path: String,
+    #[serde(default)]
+    pub allowed_workspaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageSection {
+    pub primary_url: Option<String>, // postgres://... or mysql://...
+    pub fallback_sqlite: String,     // /var/lib/xmeshd/local.db
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitSection {
+    pub bare_repos_root: Option<String>, // Master: /srv/git
+    #[serde(default)]
+    pub watched_repos: Vec<WatchedRepo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedRepo {
+    pub namespace: String,
+    pub local_path: String,
+    pub base_branch: String, // local diff vs origin/<base_branch>
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployPipeline {
+    pub workdir: String,
+    pub command: Vec<String>,
+    pub use_bwrap: bool,
+    pub allow_network: bool,
+}
+
+impl AppConfig {
+    pub fn load(cluster_path: &str, local_path: &str) -> Result<Self> {
+        let mut figment = Figment::new();
+
+        if Path::new(cluster_path).exists() {
+            figment = figment.merge(Yaml::file(cluster_path));
+        }
+        if Path::new(local_path).exists() {
+            figment = figment.merge(Yaml::file(local_path));
+        }
+
+        figment
+            .merge(Env::prefixed("XMESHD_").split("__"))
+            .extract()
+            .context("Failed to parse merged configuration")
+    }
+}
+
