@@ -4,7 +4,7 @@ set -euo pipefail
 BIN_SRC="${1:-./target/release/xmeshd}"
 GIT_ROOT=${GIT_ROOT:-"/svc/git"}
 NODE_ID=${NODE_ID:-"euphoria"}
-INSTALL_PREFIX=${INSTALL_PREFIX:-"/usr/local/bin"}
+INSTALL_PREFIX=${INSTALL_PREFIX:-"/usr/local/bin/"}
 GEMINI_MODEL=${GEMINI_MODEL:-"gemini-2.5-flash"}
 
 getent group xmeshd >/dev/null || groupadd -r xmeshd
@@ -48,8 +48,60 @@ gemini:
   api_key_env: "MY_GEMINI_CONFIG"
 
 git:
-  bare_repos_root: "/mnt/lvmd0/lvmd0p0/"
+  bare_repos_root: "${GIT_ROOT}"
 EOF
+
 chown root:xmeshd /etc/xmeshd/local.yaml
 chmod 0640 /etc/xmeshd/local.yaml
+
+if [ ! -f /etc/conf.d/xmeshd ]; then
+    cat > /etc/conf.d/xmeshd <<'EOF'
+      export MY_GEMINI_CONFIG="REPLACE_WITH_YOUR_GEMINI_KEY"
+EOF
+    chmod 0600 /etc/conf.d/xmeshd
+fi
+
+cat > /etc/init.d/xmeshd <<'EOF'
+#!/sbin/openrc-run
+
+name="xmeshd"
+description="Xenon Mesh Distributed AI & Lab Orchestration Daemon"
+command="${INSTALL_PREFIX}/xmeshd"
+command_user="xmeshd:xmeshd"
+
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+
+output_log="/var/log/xmeshd/stdout.log"
+error_log="/var/log/xmeshd/stderr.log"
+
+depend() {
+    need net
+    use postgresql mariadb
+    after firewall wireguard
+}
+EOF
+chmod 0755 /etc/init.d/xmeshd
+
+if command -v psql >/dev/null 2>&1 && su - postgres -c "psql -c '\q'" >/dev/null 2>&1; then
+    su - postgres -c "psql -v ON_ERROR_STOP=1" <<'EOF'
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'xmesh') THEN
+        CREATE ROLE xmesh WITH LOGIN PASSWORD 'labpass';
+    END IF;
+END $$;
+SELECT 'CREATE DATABASE xmesh_lab OWNER xmesh ENCODING ''UTF8'''
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'xmesh_lab')\gexec
+\c xmesh_lab
+GRANT ALL PRIVILEGES ON DATABASE xmesh_lab TO xmesh;
+GRANT ALL ON SCHEMA public TO xmesh;
+EOF
+    echo "PostgreSQL role 'xmesh' and database 'xmesh_lab' initialized."
+else
+    echo "PostgreSQL not running/installed — xmeshd will use SQLite fallback."
+fi
+
+#rc-update add xmeshd default
+echo "Done! Set MY_GEMINI_CONFIG in /etc/conf.d/xmeshd and run: rc-service xmeshd start"
 
