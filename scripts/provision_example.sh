@@ -31,7 +31,7 @@ if [ ! -f /etc/xmeshd/hmac.key ]; then
     echo "Generated new /etc/xmeshd/hmac.key (copy this file to all lab nodes!)"
 fi
 
-cat > /etc/xmeshd/local.yaml <<'EOF'
+cat > /etc/xmeshd/local.yaml <<EOF
 node:
   id: "${NODE_ID}"
   mode: "master"
@@ -45,7 +45,7 @@ storage:
 gemini:
   chat_model: "${GEMINI_MODEL}"
   embed_model: "gemini-embedding-001"
-  api_key_env: "MY_GEMINI_CONFIG"
+  api_key_env: "MY_GEMINI_API_KEY"
 
 git:
   bare_repos_root: "${GIT_ROOT}"
@@ -56,18 +56,18 @@ chmod 0640 /etc/xmeshd/local.yaml
 
 if [ ! -f /etc/conf.d/xmeshd ]; then
     cat > /etc/conf.d/xmeshd <<'EOF'
-      export MY_GEMINI_CONFIG="REPLACE_WITH_YOUR_GEMINI_KEY"
+      export MY_GEMINI_API_KEY="REPLACE_WITH_YOUR_GEMINI_KEY"
 EOF
     chmod 0600 /etc/conf.d/xmeshd
 fi
 
-cat > /etc/init.d/xmeshd <<'EOF'
+cat > /etc/init.d/xmeshd <<EOF
 #!/sbin/openrc-run
 
 name="xmeshd"
 description="Xenon Mesh Distributed AI & Lab Orchestration Daemon"
 command="${INSTALL_PREFIX}/xmeshd"
-command_user="xmeshd:xmeshd"
+command_user="xmeshd"
 
 supervisor="supervise-daemon"
 respawn_delay=3
@@ -103,5 +103,5 @@ else
 fi
 
 #rc-update add xmeshd default
-echo "Done! Set MY_GEMINI_CONFIG in /etc/conf.d/xmeshd and run: rc-service xmeshd start"
+echo "Done! Set MY_GEMINI_API_KEY in /etc/conf.d/xmeshd and run: rc-service xmeshd start"
 

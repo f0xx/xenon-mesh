@@ -88,7 +88,6 @@ impl Storage {
 
 
 impl Storage {
-    /// Записывает Proto-запись в текущую СУБД. Возвращает true, если запись обновлена.
     pub async fn upsert_proto(&self, entry: &pb::ContextEntry, force: bool) -> Result<bool> {
         if !force {
             let row = sqlx::query("SELECT entry_type, content_hash FROM context_entries WHERE id = $1")
@@ -99,7 +98,6 @@ impl Storage {
             if let Some(r) = row {
                 let etype: i32 = r.get("entry_type");
                 let hash: String = r.get("content_hash");
-                // Не перезаписываем PINNED-контексты и неизмененные чанки
                 if etype == pb::EntryType::Pinned as i32 || hash == entry.content_hash {
                     return Ok(false);
                 }
@@ -135,7 +133,6 @@ impl Storage {
         Ok(true)
     }
 
-    /// Экспорт данных в версионный Protobuf-конверт для сети или миграции между СУБД
     pub async fn export_envelope(&self, node_name: &str, namespace: Option<&str>) -> Result<pb::SyncEnvelope> {
         let rows = if let Some(ns) = namespace {
             sqlx::query("SELECT * FROM context_entries WHERE namespace = $1")
@@ -236,7 +233,6 @@ impl Storage {
         }).collect())
     }
 
-    /// Загружает последние N сообщений треда в хронологическом порядке
     pub async fn load_thread(&self, channel_id: &str, thread_id: &str, limit: i64) -> Result<Vec<pb::SessionMessage>> {
         let rows = sqlx::query(
             "SELECT channel_id, thread_id, seq, author, content, created_at_ms
@@ -341,6 +337,43 @@ impl Storage {
     pub async fn delete_entry(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM context_entries WHERE id = $1").bind(id).execute(&self.pool).await?;
         Ok(())
+    }
+}
+
+impl Storage {
+    pub async fn list_channels(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT namespace AS ch FROM context_entries
+             UNION
+             SELECT DISTINCT channel_id AS ch FROM session_messages
+             ORDER BY ch ASC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut list: Vec<String> = rows.into_iter().map(|r| r.get("ch")).collect();
+        if !list.contains(&"general".to_string()) {
+            list.insert(0, "general".to_string());
+        }
+        Ok(list)
+    }
+}
+
+impl Storage {
+    pub async fn is_unchanged(&self, id: &str, content_hash: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT entry_type, content_hash FROM context_entries WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(match row {
+            Some(r) => {
+                let etype: i32 = r.get("entry_type");
+                let hash: String = r.get("content_hash");
+                etype == pb::EntryType::Pinned as i32 || hash == content_hash
+            }
+            None => false,
+        })
     }
 }
 

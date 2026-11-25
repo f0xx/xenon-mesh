@@ -1,5 +1,5 @@
 use crate::gemini::{ChatTurn, GeminiClient};
-use crate::git_sync::scan_bare_repo;
+use crate::git_sync::{discover_bare_repos, scan_bare_repo};
 use crate::storage::pb::cluster_service_client::ClusterServiceClient;
 use crate::storage::pb::{ContextEntry, EntryType, NodeTaskRequest, SessionMessage};
 use crate::storage::Storage;
@@ -14,6 +14,7 @@ pub struct WebState {
     pub hmac_key: [u8; 32],
     pub bare_repos_root: Option<String>,
     pub default_model: String,
+    pub status: Arc<RwLock<IndexStatus>>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +44,18 @@ use crate::storage::MemoryItem;
 #[derive(Deserialize)] pub struct MemListQuery { pub channel: String }
 #[derive(Deserialize)] pub struct MemDelQuery { pub id: String }
 
+use tokio::sync::RwLock;
+
+#[derive(Clone, Serialize, Default)]
+pub struct IndexStatus {
+    pub busy: bool,
+    pub phase: String,      // "idle" | "indexing"
+    pub current_repo: String,
+    pub done_repos: usize,
+    pub total_repos: usize,
+    pub indexed_files: usize,
+}
+
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("../assets/index.html")) }))
@@ -57,6 +70,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         }))
         .route("/api/threads/fork", post(handle_fork_thread))
         .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))
+        .route("/api/channels", get(|State(st): State<Arc<WebState>>| async move {
+            st.db.list_channels().await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        }))
+        .route("/api/status", get(|State(st): State<Arc<WebState>>| async move {
+            Json(st.status.read().await.clone())
+        }))
         .route("/v1/chat/completions", post(handle_oai_compat))
         .with_state(state)
 }
@@ -134,12 +153,24 @@ async fn handle_approve(State(st): State<Arc<WebState>>, Json(req): Json<Approve
     Ok(Json(serde_json::json!({ "success": res.success, "code": res.exit_code, "out": res.stdout_log, "err": res.stderr_log })))
 }
 
-async fn handle_reindex(State(st): State<Arc<WebState>>, Query(q): Query<ReindexQuery>) -> Result<StatusCode, StatusCode> {
-    let Some(root) = &st.bare_repos_root else { return Ok(StatusCode::NO_CONTENT); };
-    let repo_path = Path::new(root).join(format!("{}.git", q.namespace));
+async fn handle_reindex(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<ReindexQuery>,
+) -> Result<StatusCode, StatusCode> {
+    let Some(root) = &st.bare_repos_root else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let repos = discover_bare_repos(Path::new(root));
+    let Some((_, repo_path)) = repos.into_iter().find(|(ns, _)| ns == &q.namespace) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
     if let Ok(entries) = scan_bare_repo(&repo_path, &q.namespace) {
         for mut e in entries {
-            if let Ok(emb) = st.gemini.embed_text(&e.content).await { e.embedding = emb; }
+            if let Ok(emb) = st.gemini.embed_text(&e.content).await {
+                e.embedding = emb;
+            }
             let _ = st.db.upsert_proto(&e, false).await;
         }
     }

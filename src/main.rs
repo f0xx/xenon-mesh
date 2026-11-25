@@ -71,32 +71,54 @@ async fn main() -> Result<()> {
 
     match cfg.node.mode {
         NodeMode::Master => {
-            if let Some(root) = &cfg.git.bare_repos_root {
-                if let Ok(rd) = std::fs::read_dir(root) {
-                    for ent in rd.flatten() {
-                        if ent.path().extension().and_then(|s| s.to_str()) == Some("git") {
-                            let ns = ent.path().file_stem().unwrap().to_string_lossy().into_owned();
-                            if let Ok(entries) = git_sync::scan_bare_repo(&ent.path(), &ns) {
-                                for mut e in entries {
-                                    if let Ok(emb) = gemini.embed_text(&e.content).await { e.embedding = emb; }
-                                    let _ = db.upsert_proto(&e, false).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let status = Arc::new(tokio::sync::RwLock::new(web_ui::IndexStatus::default()));
             let st = Arc::new(web_ui::WebState {
                 db: db.clone(),
-                gemini,
+                gemini: gemini.clone(),
                 hmac_key,
                 bare_repos_root: cfg.git.bare_repos_root.clone(),
                 default_model: cfg.gemini.chat_model.clone(),
+                status: status.clone(),
             });
+
             let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
             tokio::spawn(async move { axum::serve(listener, web_ui::router(st)).await.unwrap(); });
-            info!("Master Web UI listening on http://0.0.0");
+            info!("Master Web UI listening on http://0.0.0.0");
+
+            if let Some(root) = cfg.git.bare_repos_root.clone() {
+                let (db_bg, gem_bg, st_bg) = (db.clone(), gemini.clone(), status);
+                tokio::spawn(async move {
+                    let repos = git_sync::discover_bare_repos(std::path::Path::new(&root));
+                    let total = repos.len();
+                    {
+                        let mut s = st_bg.write().await;
+                        s.busy = true; s.phase = "indexing".into(); s.total_repos = total;
+                    }
+                    for (idx, (ns, path)) in repos.into_iter().enumerate() {
+                        {
+                            let mut s = st_bg.write().await;
+                            s.done_repos = idx; s.current_repo = ns.clone();
+                        }
+                        if let Ok(entries) = git_sync::scan_bare_repo(&path, &ns) {
+                            for mut e in entries {
+                                if db_bg.is_unchanged(&e.id, &e.content_hash).await.unwrap_or(false) {
+                                    continue;
+                                }
+                                if let Ok(emb) = gem_bg.embed_text(&e.content).await { e.embedding = emb; }
+                                if db_bg.upsert_proto(&e, false).await.unwrap_or(false) {
+                                    st_bg.write().await.indexed_files += 1;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                    let mut s = st_bg.write().await;
+                    s.busy = false; s.phase = "ready".into(); s.done_repos = total; s.current_repo.clear();
+                    info!("Background indexing complete ({total} repos)");
+                });
+            }
         }
+
         NodeMode::Node => {
             let (c, d, g) = (cfg.clone(), db.clone(), gemini.clone());
             tokio::spawn(async move { if let Err(e) = watcher::run_node_watcher(c, d, g).await { error!("Watcher: {e}"); } });
