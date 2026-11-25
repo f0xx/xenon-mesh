@@ -12,7 +12,7 @@ use crate::storage::{
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
     Json, Router,
@@ -37,6 +37,8 @@ pub struct WebState {
     pub db: Arc<Storage>,
     pub models: Arc<ModelHub>,
     pub hmac_key: [u8; 32],
+    pub node_key: Option<[u8; 32]>,
+    pub peer_keys: HashMap<String, [u8; 32]>,
     pub status: Arc<RwLock<IndexStatus>>,
     pub presence: Arc<std::sync::Mutex<Presence>>,
 }
@@ -146,6 +148,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/channel-state", post(handle_channel_state))
         .route("/api/presence", post(handle_presence))
         .route("/api/share", post(handle_share))
+        .route("/api/join", post(handle_join))
+        .route("/api/inspect", post(handle_inspect))
         .route("/api/audit", get(handle_audit).post(handle_audit_post))
         .route("/api/mesh/channels", get(handle_mesh_channels))
         .route("/api/mesh/activity", get(handle_mesh_activity))
@@ -206,6 +210,15 @@ async fn handle_config(State(st): State<Arc<WebState>>) -> Json<serde_json::Valu
                 if !models.iter().any(|m| m.id == choice.id) {
                     models.push(choice);
                 }
+            }
+        }
+    }
+    if master_http(&st.cfg).is_none() {
+        for choice in models.iter_mut() {
+            if choice.kind == "gemini" {
+                choice.host = st.cfg.node.id.clone();
+                choice.label = format!("{} : {}", choice.model, choice.host);
+                choice.proxied = true;
             }
         }
     }
@@ -448,7 +461,7 @@ async fn channel_is_public(st: &WebState, name: &str) -> bool {
 async fn handle_history(
     State(st): State<Arc<WebState>>,
     Query(q): Query<HistoryQuery>,
-) -> Result<Json<Vec<ChatTurn>>, StatusCode> {
+) -> Result<Json<Vec<HistoryItem>>, StatusCode> {
     if channel_is_public(&st, &q.channel).await
         && st
             .db
@@ -483,13 +496,20 @@ async fn handle_history(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         msgs.into_iter()
-            .map(|m| ChatTurn {
+            .map(|m| HistoryItem {
                 role: m.author,
                 text: m.content,
-                attachments: vec![],
+                created_at_ms: m.created_at_ms,
             })
             .collect(),
     ))
+}
+
+#[derive(Serialize)]
+struct HistoryItem {
+    role: String,
+    text: String,
+    created_at_ms: i64,
 }
 
 async fn handle_list_threads(
@@ -583,7 +603,7 @@ async fn handle_approve(
         .await
         .map_err(|_| StatusCode::FORBIDDEN)?
         .into_inner();
-    let action = if pipeline_name.contains("--force") || pipeline_name.contains("force-with-lease")
+    let mut action = if pipeline_name.contains("--force") || pipeline_name.contains("force-with-lease")
     {
         "git.force_push"
     } else if pipeline_name.contains("push") {
@@ -591,14 +611,25 @@ async fn handle_approve(
     } else {
         "task.execute"
     };
-    publish_audit(
-        &st,
-        action,
-        &repo_name,
-        "",
-        &serde_json::json!({"pipeline": pipeline_name, "exit": res.exit_code}).to_string(),
-    )
-    .await;
+    let mut detail = serde_json::json!({"pipeline": pipeline_name, "exit": res.exit_code});
+    if let Some(line) = res.stdout_log.lines().find(|line| line.starts_with("XMESH_GIT ")) {
+        if let Ok(git) = serde_json::from_str::<serde_json::Value>(line.trim_start_matches("XMESH_GIT ")) {
+            action = if git.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "git.force_push"
+            } else {
+                "git.push"
+            };
+            detail = serde_json::json!({
+                "pipeline": pipeline_name,
+                "exit": res.exit_code,
+                "force": git.get("force").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                "ref": git.get("ref").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                "old": git.get("old").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                "new": git.get("new").cloned().unwrap_or(serde_json::Value::String(String::new()))
+            });
+        }
+    }
+    publish_audit(&st, action, &repo_name, "", &detail.to_string()).await;
     Ok(Json(
         serde_json::json!({ "success": res.success, "code": res.exit_code, "out": res.stdout_log, "err": res.stderr_log }),
     ))
@@ -779,7 +810,7 @@ async fn prompt_for(
 async fn store_message(st: &WebState, msg: SessionMessage, sync_hub: bool) -> SessionMessage {
     let stored = if sync_hub {
         if let Some(url) = master_url(&st.cfg) {
-            match hub::append_public(url, msg.clone(), &st.cfg.node.id).await {
+            match hub::append_public(url, msg.clone(), &st.cfg.node.id, st.node_key.as_ref()).await {
                 Ok(stored) => {
                     let _ = st.db.append_message(&stored).await;
                     stored
@@ -1109,7 +1140,7 @@ async fn handle_persistent_chat(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct NodeQuery {
     #[serde(default)]
     node_id: String,
@@ -1117,6 +1148,8 @@ struct NodeQuery {
     channel: String,
     #[serde(default)]
     thread: String,
+    #[serde(default)]
+    token: String,
 }
 
 #[derive(Deserialize)]
@@ -1169,6 +1202,8 @@ struct ShareBody {
     members: Vec<String>,
     messages: Vec<ShareMsg>,
     entries: Vec<ShareEntry>,
+    #[serde(default)]
+    token_hash: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1184,24 +1219,69 @@ struct AuditBody {
     detail: String,
 }
 
+fn authorize(st: &WebState, headers: &HeaderMap, body: &[u8]) -> Result<String, StatusCode> {
+    let node = headers
+        .get("x-xmesh-node")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let ts = headers
+        .get("x-xmesh-ts")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0);
+    let sig = headers
+        .get("x-xmesh-sig")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    crate::identity::resolve_peer(&st.peer_keys, &node, ts, sig, body).map_err(|_| StatusCode::FORBIDDEN)
+}
+
+async fn signed_post(
+    st: &WebState,
+    url: &str,
+    kind: &str,
+    parts: &[&str],
+    payload: &impl Serialize,
+) -> Result<reqwest::Response, StatusCode> {
+    let body = serde_json::to_vec(payload).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let canon = crate::identity::canonical(kind, parts);
+    let ts = now_ms();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("x-xmesh-node", &st.cfg.node.id)
+        .body(body);
+    if let Some(key) = &st.node_key {
+        let sig = crate::identity::sign(key, &st.cfg.node.id, ts, &canon);
+        req = req
+            .header("x-xmesh-ts", ts.to_string())
+            .header("x-xmesh-sig", sig);
+    }
+    req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
 async fn publish_audit(st: &WebState, action: &str, channel: &str, thread: &str, detail: &str) {
     if let Some(base) = master_http(&st.cfg) {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
-            .build();
-        if let Ok(client) = client {
-            let _ = client
-                .post(format!("{}/api/audit", base.trim_end_matches('/')))
-                .json(&AuditBody {
-                    node_id: st.cfg.node.id.clone(),
-                    action: action.to_string(),
-                    channel: channel.to_string(),
-                    thread: thread.to_string(),
-                    detail: detail.to_string(),
-                })
-                .send()
-                .await;
-        }
+        let payload = AuditBody {
+            node_id: st.cfg.node.id.clone(),
+            action: action.to_string(),
+            channel: channel.to_string(),
+            thread: thread.to_string(),
+            detail: detail.to_string(),
+        };
+        let _ = signed_post(
+            st,
+            &format!("{}/api/audit", base.trim_end_matches('/')),
+            "audit",
+            &[action, channel, thread, detail],
+            &payload,
+        )
+        .await;
         return;
     }
     let _ = st
@@ -1296,15 +1376,25 @@ async fn handle_audit(
 
 async fn handle_audit_post(
     State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(body): Json<AuditBody>,
 ) -> Result<StatusCode, StatusCode> {
     if master_http(&st.cfg).is_some() {
         return Err(StatusCode::FORBIDDEN);
     }
-    let node = if body.node_id.is_empty() {
-        st.cfg.node.id.clone()
+    let canon = crate::identity::canonical(
+        "audit",
+        &[&body.action, &body.channel, &body.thread, &body.detail],
+    );
+    let verified = authorize(&st, &headers, &canon)?;
+    let node = if st.peer_keys.is_empty() {
+        if body.node_id.is_empty() {
+            st.cfg.node.id.clone()
+        } else {
+            body.node_id
+        }
     } else {
-        body.node_id
+        verified
     };
     st.db
         .record_audit(
@@ -1516,40 +1606,61 @@ async fn apply_share(st: &WebState, body: ShareBody) -> Result<(), StatusCode> {
                 .join(","),
         )
         .await;
+    if !body.token_hash.is_empty() {
+        let _ = st.db.put_invite(&body.channel, &body.token_hash).await;
+    }
     Ok(())
 }
 
 async fn handle_mesh_share(
     State(st): State<Arc<WebState>>,
-    Json(body): Json<ShareBody>,
+    headers: HeaderMap,
+    Json(mut body): Json<ShareBody>,
 ) -> Result<StatusCode, StatusCode> {
+    let listed = body.members.join(",");
+    let canon = crate::identity::canonical(
+        "share",
+        &[&body.channel, &body.origin_node, &listed, &body.token_hash],
+    );
+    if !st.peer_keys.is_empty() {
+        body.origin_node = authorize(&st, &headers, &canon)?;
+    }
     apply_share(&st, body).await?;
     Ok(StatusCode::OK)
 }
 
-async fn handle_mesh_join(
-    State(st): State<Arc<WebState>>,
-    Json(body): Json<NodeQuery>,
-) -> Result<StatusCode, StatusCode> {
+async fn apply_join(st: &WebState, node_id: &str, channel: &str, token: &str) -> Result<(), StatusCode> {
     let member = st
         .db
-        .member_state(&body.channel, &body.node_id)
+        .member_state(channel, node_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if member.is_none() {
-        return Err(StatusCode::FORBIDDEN);
+        let hash = blake3::hash(token.as_bytes()).to_hex().to_string();
+        let invited = !token.is_empty()
+            && st
+                .db
+                .invite_matches(channel, &hash)
+                .await
+                .unwrap_or(false);
+        if !invited {
+            return Err(StatusCode::FORBIDDEN);
+        }
     }
     let ch = st
         .db
-        .get_channel(&body.channel)
+        .get_channel(channel)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let names = st
+    let mut names = st
         .db
-        .list_members(&body.channel)
+        .list_members(channel)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !names.iter().any(|name| name == node_id) {
+        names.push(node_id.to_string());
+    }
     let members = names
         .into_iter()
         .map(|name| {
@@ -1562,20 +1673,114 @@ async fn handle_mesh_join(
         })
         .collect::<Vec<_>>();
     st.db
-        .set_members(&body.channel, &members)
+        .set_members(channel, &members)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let _ = st
         .db
-        .record_audit(&body.node_id, "channel.join", &body.channel, "main", "")
+        .record_audit(node_id, "channel.join", channel, "main", "")
         .await;
+    Ok(())
+}
+
+async fn handle_mesh_join(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(body): Json<NodeQuery>,
+) -> Result<StatusCode, StatusCode> {
+    let canon = crate::identity::canonical("join", &[&body.channel, &body.node_id, &body.token]);
+    let node = if st.peer_keys.is_empty() {
+        body.node_id.clone()
+    } else {
+        authorize(&st, &headers, &canon)?
+    };
+    apply_join(&st, &node, &body.channel, &body.token).await?;
     Ok(StatusCode::OK)
+}
+
+async fn handle_join(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<NodeQuery>,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(base) = master_http(&st.cfg) {
+        let payload = NodeQuery {
+            node_id: st.cfg.node.id.clone(),
+            channel: body.channel.clone(),
+            thread: String::new(),
+            token: body.token.clone(),
+        };
+        let resp = signed_post(
+            &st,
+            &format!("{}/api/mesh/join", base.trim_end_matches('/')),
+            "join",
+            &[&payload.channel, &payload.node_id, &payload.token],
+            &payload,
+        )
+        .await?;
+        return if resp.status().is_success() {
+            Ok(StatusCode::OK)
+        } else if resp.status() == StatusCode::FORBIDDEN {
+            Err(StatusCode::FORBIDDEN)
+        } else {
+            Err(StatusCode::BAD_GATEWAY)
+        };
+    }
+    apply_join(&st, &st.cfg.node.id, &body.channel, &body.token).await?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct InspectBody {
+    #[serde(default)]
+    diff: String,
+}
+
+async fn handle_inspect(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<InspectBody>,
+) -> Json<serde_json::Value> {
+    let mut findings = crate::executor::inspect_diff(&body.diff);
+    if let Some(bin) = st.cfg.git.inspect_command.first() {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(st.cfg.git.inspect_command.iter().skip(1));
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(body.diff.as_bytes()).await;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    child.wait_with_output(),
+                )
+                .await
+                {
+                    Ok(Ok(out)) => {
+                        for line in String::from_utf8_lossy(&out.stdout).lines().take(20) {
+                            if !line.trim().is_empty() {
+                                findings.push(line.trim().to_string());
+                            }
+                        }
+                        if !out.status.success() {
+                            findings.push("external inspector reported a problem".into());
+                        }
+                    }
+                    _ => findings.push("external inspector timed out".into()),
+                }
+            }
+            Err(_) => findings.push("external inspector could not start".into()),
+        }
+    }
+    Json(serde_json::json!({ "findings": findings }))
 }
 
 async fn handle_share(
     State(st): State<Arc<WebState>>,
     Json(body): Json<ShareBody>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let origin = st.cfg.node.id.clone();
     let channel = body.channel.clone();
     let mut members = body.members;
@@ -1622,23 +1827,25 @@ async fn handle_share(
         members: members.split_off(0),
         messages,
         entries,
+        token_hash: String::new(),
     };
+    let (token, token_hash) = crate::identity::new_token();
+    let mut payload = payload;
+    payload.token_hash = token_hash.clone();
+    let listed = payload.members.join(",");
     if let Some(base) = master_http(&st.cfg) {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
-        let status = client
-            .post(format!("{}/api/mesh/share", base.trim_end_matches('/')))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?
-            .status();
-        if !status.is_success() {
+        let resp = signed_post(
+            &st,
+            &format!("{}/api/mesh/share", base.trim_end_matches('/')),
+            "share",
+            &[&payload.channel, &payload.origin_node, &listed, &token_hash],
+            &payload,
+        )
+        .await?;
+        if !resp.status().is_success() {
             return Err(StatusCode::BAD_GATEWAY);
         }
     }
     apply_share(&st, payload).await?;
-    Ok(StatusCode::OK)
+    Ok(Json(serde_json::json!({ "token": token })))
 }

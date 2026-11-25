@@ -53,6 +53,12 @@ pub struct NodeSection {
     #[serde(default)]
     pub master_http: Option<String>,
     pub hmac_secret_path: String,
+    /// This node's own identity key. The hub checks it on mutating calls.
+    #[serde(default)]
+    pub node_key_path: Option<String>,
+    /// Hub only. Directory of `<node-id>.key` files, one per peer.
+    #[serde(default)]
+    pub peer_keys_dir: Option<String>,
     #[serde(default)]
     pub allowed_workspaces: Vec<String>,
 }
@@ -72,6 +78,18 @@ pub struct GitSection {
     /// Each immediate child directory is one project.
     #[serde(default)]
     pub project_roots: Vec<ProjectRoot>,
+    /// inotify watch of project roots and bare repos. On by default.
+    /// Turn it off when a tree is too noisy to rescan on every save.
+    #[serde(default = "default_true")]
+    pub watch_changes: bool,
+    /// Optional argv. The unified diff is written to its stdin.
+    /// Findings are appended to the built-in diff inspection.
+    #[serde(default)]
+    pub inspect_command: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +117,12 @@ pub struct DeployPipeline {
     pub command: Vec<String>,
     pub use_bwrap: bool,
     pub allow_network: bool,
+    /// Declared destination ref when this pipeline pushes. Recorded in the hub audit.
+    #[serde(default)]
+    pub git_ref: String,
+    /// The operator marked this pipeline as rewriting remote history.
+    #[serde(default)]
+    pub git_force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

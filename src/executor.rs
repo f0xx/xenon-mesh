@@ -128,20 +128,143 @@ async fn exec_pipeline(task_id: &str, pipe: &DeployPipeline) -> Result<NodeTaskR
         c
     };
 
+    let mut push = classify_push(&pipe.command, pipe.git_force, &pipe.git_ref);
+    if let Some(rec) = push.as_mut() {
+        rec.old_sha = git_rev(&pipe.workdir, &rec.refspec);
+    }
     let out = cmd.output().await?;
+    if let Some(rec) = push.as_mut() {
+        rec.new_sha = git_rev(&pipe.workdir, "HEAD");
+    }
+    let mut stdout_log = String::from_utf8_lossy(&out.stdout).into_owned();
+    if let Some(rec) = push {
+        let line = serde_json::json!({
+            "force": rec.force,
+            "ref": rec.refspec,
+            "old": rec.old_sha,
+            "new": rec.new_sha
+        });
+        stdout_log = format!("XMESH_GIT {line}\n{stdout_log}");
+    }
     Ok(NodeTaskResponse {
         task_id: task_id.to_string(),
         success: out.status.success(),
         exit_code: out.status.code().unwrap_or(-1),
-        stdout_log: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stdout_log,
         stderr_log: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitPushRecord {
+    pub force: bool,
+    pub refspec: String,
+    pub old_sha: String,
+    pub new_sha: String,
+}
+
+pub fn classify_push(argv: &[String], declared_force: bool, declared_ref: &str) -> Option<GitPushRecord> {
+    let is_git = argv
+        .first()
+        .map(|bin| bin == "git" || bin.ends_with("/git"))
+        .unwrap_or(false);
+    if !is_git || !argv.iter().any(|arg| arg == "push") {
+        return None;
+    }
+    let force = declared_force
+        || argv.iter().any(|arg| {
+            arg == "--force"
+                || arg == "--force-with-lease"
+                || (arg.starts_with('+') && arg.contains(':'))
+        });
+    let refspec = if !declared_ref.is_empty() {
+        declared_ref.to_string()
+    } else {
+        argv.iter()
+            .find(|arg| arg.contains(':') && !arg.starts_with('-'))
+            .cloned()
+            .unwrap_or_default()
+    };
+    Some(GitPushRecord {
+        force,
+        refspec,
+        old_sha: String::new(),
+        new_sha: String::new(),
+    })
+}
+
+fn git_rev(workdir: &str, rev: &str) -> String {
+    if rev.is_empty() || workdir.is_empty() {
+        return String::new();
+    }
+    let spec = rev.split(':').next_back().unwrap_or(rev);
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", spec])
+        .current_dir(workdir)
+        .output();
+    match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+pub fn inspect_diff(diff: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    if diff.trim().is_empty() {
+        notes.push("diff is empty".into());
+        return notes;
+    }
+    let files = diff
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    let adds = diff
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let dels = diff
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    notes.push(format!("{files} files, +{adds} / -{dels}"));
+    if diff.contains("<<<<<<<") || diff.contains(">>>>>>>") {
+        notes.push("conflict markers in the diff".into());
+    }
+    if adds + dels > 2000 {
+        notes.push("large diff; review it before approving".into());
+    }
+    notes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::pb::NodeTaskRequest;
+
+    #[test]
+    fn push_classification_records_force_and_ref() {
+        let argv = vec![
+            "git".into(),
+            "push".into(),
+            "--force-with-lease".into(),
+            "origin".into(),
+            "HEAD:main".into(),
+        ];
+        let rec = classify_push(&argv, false, "").unwrap();
+        assert!(rec.force);
+        assert_eq!(rec.refspec, "HEAD:main");
+        let plain = classify_push(&["git".into(), "push".into(), "origin".into()], false, "main").unwrap();
+        assert!(!plain.force);
+        assert_eq!(plain.refspec, "main");
+        assert!(classify_push(&["cargo".into(), "test".into()], false, "").is_none());
+    }
+
+    #[test]
+    fn diff_inspection_flags_conflict_markers() {
+        let notes = inspect_diff("diff --git a/a.rs b/a.rs\n+<<<<<<< ours\n+ok\n");
+        assert!(notes.iter().any(|n| n.contains("conflict")));
+        assert!(inspect_diff("").iter().any(|n| n.contains("empty")));
+    }
 
     fn signed(req: &mut NodeTaskRequest, key: &[u8; 32]) {
         let payload = format!(

@@ -40,11 +40,20 @@
   .md th { background:#2d3748; }
   .md blockquote { border-left:3px solid #718096; margin:6px 0; padding-left:10px; color:#a0aec0; }
   .code-hdr { display:flex; justify-content:space-between; font-size:11px; color:#a0aec0; border-bottom:1px solid #2d3748; padding-bottom:4px; margin-bottom:6px; }
+  .msghead { display:flex; justify-content:space-between; align-items:baseline; gap:12px; font-weight:bold; color:#63b3ed; margin-bottom:4px; }
+  .mtime { color:#a0aec0; font-weight:normal; font-size:12px; }
+  .dayline { display:flex; align-items:center; gap:10px; color:#718096; font-size:12px; margin:14px 4px; }
+  .dayline:before, .dayline:after { content:''; flex:1; border-top:1px solid #2d3748; }
+  #findings { color:#ecc94b; font-size:12px; white-space:pre-wrap; margin:6px 0; }
 </style>
 </head>
 <body>
 <aside id="leftBar">
-  <b data-i18n="channels">CHANNELS</b> <button style="padding:1px 6px;float:right" onclick="newChannel()">+</button>
+  <b data-i18n="channels">CHANNELS</b>
+  <span style="float:right">
+    <button style="padding:1px 6px" onclick="joinToken()" title="Join a shared channel with an invitation token">Join</button>
+    <button style="padding:1px 6px" onclick="newChannel()">+</button>
+  </span>
   <input id="chFilter" placeholder="Filter" oninput="renderChannels()">
   <div id="chList"></div>
   <br><b data-i18n="threads">THREADS</b>
@@ -92,6 +101,7 @@
   <input id="dRepo" placeholder="Target workspace (/srv/projects/app)" onchange="localStorage.dRepo=this.value">
   <input id="dPipe" placeholder="Pipeline name (local.yaml)" onchange="localStorage.dPipe=this.value">
   <div style="display:flex;justify-content:space-between"><span id="diffStats" data-i18n="noDiff">No diff</span><button onclick="pasteDiff()" data-i18n="paste">Paste</button></div>
+  <div id="findings"></div>
   <div id="diffView" data-i18n="awaitDiff">Awaiting diff...</div>
   <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()" data-i18n="approve">Approve & Execute</button>
 </div>
@@ -217,11 +227,22 @@ async function pref(patch) {
   await refreshChannels();
 }
 async function shareChannel(name) {
-  const raw = window.prompt('Invite node ids, comma separated');
-  if (!raw) return;
+  const raw = window.prompt('Invite node ids, comma separated. An invitation token is created either way.');
+  if (raw === null) return;
   const members = raw.split(',').map(s => s.trim()).filter(Boolean);
   const r = await fetch('/api/share', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel:name, origin_node:'', members, messages:[], entries:[]}) });
   if (!r.ok) { window.alert('Share failed'); return; }
+  const body = await r.json().catch(() => ({}));
+  if (body.token) window.alert('Invitation token (shown once):\n' + body.token);
+  await refreshChannels();
+}
+async function joinToken() {
+  const channel = window.prompt('Channel name');
+  if (!channel) return;
+  const token = window.prompt('Invitation token');
+  if (!token) return;
+  const r = await fetch('/api/join', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel: channel.trim(), token: token.trim()}) });
+  if (!r.ok) { window.alert('Join failed'); return; }
   await refreshChannels();
 }
 async function refreshChannels() {
@@ -303,7 +324,44 @@ async function forkThread() {
 async function loadHistory() {
   const vis = (chMeta[ch] && chMeta[ch].visibility) || '';
   headerTitle.textContent = `# ${ch} / ${thread}${vis ? ' · ' + vis : ''}`; log.innerHTML = '';
-  (await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json()).forEach(m => appendBubble(m.role, m.text));
+  let lastDay = '';
+  (await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json()).forEach(m => {
+    if (m.created_at_ms) {
+      const key = dayKey(m.created_at_ms);
+      if (key !== lastDay) { lastDay = key; dayDivider(m.created_at_ms); }
+    }
+    appendBubble(m.role, m.text, m.created_at_ms);
+  });
+}
+function dayKey(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+}
+function dayLabel(ms) {
+  const d = new Date(ms);
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const day = new Date(d); day.setHours(0, 0, 0, 0);
+  const diff = Math.round((start - day) / 86400000);
+  if (diff === 0) return 'today';
+  if (diff === 1) return 'yesterday';
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return d.getDate() + ' ' + months[d.getMonth()] + ' ' + d.getFullYear();
+}
+function clockLabel(ms) {
+  const d = new Date(ms);
+  const h = d.getHours();
+  const m = String(d.getMinutes()).padStart(2, '0');
+  if (lang === 'ru') return String(h).padStart(2, '0') + ':' + m;
+  const hr = h % 12 || 12;
+  return hr + ':' + m + (h < 12 ? 'am' : 'pm');
+}
+function dayDivider(ms) {
+  const line = document.createElement('div');
+  line.className = 'dayline';
+  const label = document.createElement('span');
+  label.textContent = '( ' + dayLabel(ms) + ' )';
+  line.appendChild(label);
+  log.appendChild(line);
 }
 
 function escHtml(s) {
@@ -348,12 +406,20 @@ function renderMarkdown(raw) {
   return txt.replace(/\x00BLK(\d+)\x00/g, (_, i) => blocks[Number(i)]);
 }
 
-function appendBubble(who, txt) {
+function appendBubble(who, txt, ts) {
   const box = document.createElement('div');
   box.className = 'msg md';
   const hdr = document.createElement('div');
-  hdr.style.cssText = 'font-weight:bold;color:#63b3ed;margin-bottom:4px';
-  hdr.textContent = `[${who}]`;
+  hdr.className = 'msghead';
+  const whoEl = document.createElement('span');
+  whoEl.textContent = `[${who}]`;
+  hdr.appendChild(whoEl);
+  if (ts) {
+    const time = document.createElement('span');
+    time.className = 'mtime';
+    time.textContent = clockLabel(ts);
+    hdr.appendChild(time);
+  }
   box.appendChild(hdr);
 
   const body = document.createElement('div');
@@ -422,12 +488,14 @@ async function send() {
   if (!p && !pendingAtts.length) return;
   const atts = pendingAtts; pendingAtts = []; renderAtts();
   box.value = '';
-  appendBubble('user', p + (atts.length ? `\n[Attached: ${atts.map(a=>a.name).join(', ')}]` : ''));
+  const sentAt = Date.now();
+  appendBubble('user', p + (atts.length ? `\n[Attached: ${atts.map(a=>a.name).join(', ')}]` : ''), sentAt);
 
-  // Создаем живую карточку ответа со статусом и блоком thinking
   const card = document.createElement('div'); card.className = 'msg md';
-  const hdr = document.createElement('div'); hdr.style.cssText = 'font-weight:bold;color:#63b3ed;margin-bottom:4px';
-  hdr.textContent = `[${modelSelect.value}]`;
+  const hdr = document.createElement('div'); hdr.className = 'msghead';
+  const whoEl = document.createElement('span'); whoEl.textContent = `[${modelSelect.value}]`;
+  const timeEl = document.createElement('span'); timeEl.className = 'mtime'; timeEl.textContent = clockLabel(sentAt);
+  hdr.append(whoEl, timeEl);
   const statusLine = document.createElement('div'); statusLine.style.cssText = 'color:#ecc94b;font-size:12px;margin-bottom:6px';
   statusLine.textContent = '⏳ Awaiting response...';
   const thoughtBox = document.createElement('details'); thoughtBox.style.cssText = 'display:none;background:#0d0f12;padding:6px;margin-bottom:8px;border-left:2px solid #805ad5;font-size:12px;color:#cbd5e0';
@@ -471,7 +539,8 @@ async function send() {
         fullText += ev.text;
         body.innerHTML = renderMarkdown(fullText);
       } else if (ev.type === 'done') {
-        hdr.textContent = `[${ev.model_used}]`;
+        whoEl.textContent = `[${ev.model_used}]`;
+        timeEl.textContent = clockLabel(Date.now());
         statusLine.style.display = 'none';
         attachDiffButton(card, fullText);
         if (ch !== sentOn || document.visibilityState !== 'visible') notifyAway(sentOn, fullText);
@@ -483,8 +552,8 @@ async function send() {
   await refreshThreads();
 }
 
-function loadDiff(raw) {
-  currentDiff = raw; diffView.innerHTML = ''; let a = 0, d = 0;
+async function loadDiff(raw) {
+  currentDiff = raw; diffView.innerHTML = ''; findings.textContent = ''; let a = 0, d = 0;
   raw.split('\n').forEach(l => {
     const s = document.createElement('span'); s.textContent = l || ' ';
     if (l.startsWith('+++')||l.startsWith('---')) s.className='d-file'; else if (l.startsWith('@@')) s.className='d-hunk';
@@ -492,6 +561,12 @@ function loadDiff(raw) {
     diffView.appendChild(s);
   });
   diffStats.textContent = `+${a} / -${d}`; btnApprove.disabled = false;
+  try {
+    const report = await (await fetch('/api/inspect', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({diff: raw}) })).json();
+    findings.textContent = (report.findings || []).join('\n');
+  } catch (err) {
+    findings.textContent = 'inspection unavailable';
+  }
 }
 function pasteDiff() { const r = window.prompt('Diff:'); if (r) loadDiff(r); }
 async function saveMem(pin) {
@@ -512,11 +587,27 @@ window.onload = async () => {
   const cfg = await (await fetch('/api/config')).json();
   if (cfg.models && cfg.models.length) {
     modelSelect.innerHTML = '';
+    const groups = new Map();
     cfg.models.forEach(m => {
-      const opt = document.createElement('option');
-      if (typeof m === 'string') { opt.value = m; opt.textContent = m; }
-      else { opt.value = m.id; opt.textContent = m.label || `${m.model} : ${m.host || m.provider}`; }
-      modelSelect.appendChild(opt);
+      const host = (typeof m === 'string') ? '' : (m.host || m.provider || '');
+      const proxied = typeof m !== 'string' && m.proxied;
+      const key = (proxied ? '0:' : '1:') + host;
+      if (!groups.has(key)) groups.set(key, { host, proxied, items: [] });
+      groups.get(key).items.push(m);
+    });
+    [...groups.keys()].sort().forEach(key => {
+      const group = groups.get(key);
+      const box = group.host ? document.createElement('optgroup') : modelSelect;
+      if (group.host) {
+        box.label = group.proxied ? group.host + ' (proxy)' : group.host;
+        modelSelect.appendChild(box);
+      }
+      group.items.forEach(m => {
+        const opt = document.createElement('option');
+        if (typeof m === 'string') { opt.value = m; opt.textContent = m; }
+        else { opt.value = m.id; opt.textContent = m.label || `${m.model} : ${m.host || m.provider}`; }
+        box.appendChild(opt);
+      });
     });
   }
   if (cfg.default_model) modelSelect.value = cfg.default_model;

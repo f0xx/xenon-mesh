@@ -75,6 +75,10 @@ pub struct ModelChoice {
     pub label: String,
     pub kind: String,
     pub coding_rank: i32,
+    /// The hub holds the API key and performs the call. Nodes select the model
+    /// and send the completion to the hub.
+    #[serde(default)]
+    pub proxied: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -353,6 +357,7 @@ impl ModelHub {
                     host,
                     kind: p.kind.as_str().into(),
                     coding_rank: coding_rank(&model),
+                    proxied: false,
                     model,
                 });
             }

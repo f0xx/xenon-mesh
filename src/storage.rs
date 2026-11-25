@@ -405,6 +405,15 @@ impl Storage {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_events(created_at_ms)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS channel_invites (
+                channel_name VARCHAR(128) PRIMARY KEY,
+                token_hash VARCHAR(64) NOT NULL,
+                created_at_ms BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -1180,6 +1189,43 @@ impl Storage {
                 created_at_ms: r.get("created_at_ms"),
             })
             .collect())
+    }
+
+    pub async fn delete_channel(&self, name: &str) -> Result<()> {
+        if name == "general" {
+            return Ok(());
+        }
+        let sql = self.q("DELETE FROM channels WHERE name = $1");
+        sqlx::query(&sql).bind(name).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn put_invite(&self, channel: &str, token_hash: &str) -> Result<()> {
+        let sql = self.q("DELETE FROM channel_invites WHERE channel_name = $1");
+        sqlx::query(&sql).bind(channel).execute(&self.pool).await?;
+        let sql = self.q(
+            "INSERT INTO channel_invites (channel_name, token_hash, created_at_ms) VALUES ($1, $2, $3)",
+        );
+        sqlx::query(&sql)
+            .bind(channel)
+            .bind(token_hash)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn invite_matches(&self, channel: &str, token_hash: &str) -> Result<bool> {
+        let sql = self.q(
+            "SELECT token_hash FROM channel_invites WHERE channel_name = $1",
+        );
+        let row = sqlx::query(&sql)
+            .bind(channel)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("token_hash") == token_hash)
+            .unwrap_or(false))
     }
 
     pub async fn namespace_is_public(&self, namespace: &str) -> Result<bool> {

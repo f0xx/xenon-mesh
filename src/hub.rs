@@ -17,11 +17,26 @@ pub async fn append_public(
     master_url: &str,
     msg: SessionMessage,
     node_id: &str,
+    node_key: Option<&[u8; 32]>,
 ) -> Result<SessionMessage> {
     let mut client = ClusterServiceClient::connect(master_url.to_string()).await?;
+    let body = crate::identity::canonical(
+        "append",
+        &[&msg.channel_id, &msg.thread_id, &msg.author, &msg.content],
+    );
+    let ts = crate::storage::now_ms();
     let mut req = tonic::Request::new(msg);
     if let Ok(value) = node_id.parse() {
         req.metadata_mut().insert("x-xmesh-node", value);
+    }
+    if let Some(key) = node_key {
+        let sig = crate::identity::sign(key, node_id, ts, &body);
+        if let Ok(value) = ts.to_string().parse() {
+            req.metadata_mut().insert("x-xmesh-ts", value);
+        }
+        if let Ok(value) = sig.parse() {
+            req.metadata_mut().insert("x-xmesh-sig", value);
+        }
     }
     Ok(client.append_message(req).await?.into_inner())
 }

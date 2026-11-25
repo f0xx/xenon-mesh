@@ -2,6 +2,8 @@
 
 The daemon talks to models over HTTP. A provider is one host plus the model names it serves. Chat requests name a model as `provider/model`. The same model name on two hosts stays two choices, labeled `model : host`. A bare name is used only when exactly one configured host serves it. A node with `node.master_http` takes the hub's catalog and sends each completion to the hub as its own request. The hub drops its provider lock before the HTTP call, so one slow host does not pause chats aimed at another host.
 
+A Gemini provider is announced by the hub under the hub's own node id, with `proxied: true`. The API key stays on the hub. Nodes select `gemini/<model>` and the hub performs the call. The menu groups those models under the hub so they are not sorted to the bottom of a flat list.
+
 ## DR-18. Kinds
 
 | `kind` | Protocol | Discovery | Embeddings |

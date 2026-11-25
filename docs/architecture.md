@@ -19,7 +19,7 @@ Both modes serve the same HTTP UI and the same gRPC `ClusterService`. The mode f
 | `xmeshd` gRPC | Context sync, public channel list, public message append, signed task execution |
 | `xmeshd` HTTP | Chat UI, history, memory, diff approval, OpenAI-compatible `/v1/chat/completions` |
 | Indexer (hub only) | Walks bare repos, skips binaries and files over 64 KiB, stores up to 300 text files per repo |
-| Watcher | On `git.watched_repos`, debounces 10 seconds, stores the worktree diff. Uploads it only when that namespace has a public channel |
+| Watcher | On `git.watched_repos`, debounces 10 seconds, stores the worktree diff, and uploads it only when that namespace has a public channel. A second watch, on by default, follows `git.project_roots` and `git.bare_repos_root` and updates the channel list |
 | Model hub | Discovers models, streams tokens, embeds when the endpoint supports it |
 
 The HTTP listener defaults to `0.0.0.0:8080`. gRPC defaults to whatever `node.listen_addr` says (the examples use `0.0.0.0:8443`). Treat both as trusted-network ports. There is no user login on the UI.

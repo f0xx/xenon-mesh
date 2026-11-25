@@ -49,13 +49,15 @@ The UI is `GET /`. JSON routes:
 | `GET` | `/api/channels` | Sidebar rows. Group, pin, mute, archive, close, read cursor, and unread count are per node. On a hub, each indexed bare repo is a public channel. On a node, each directory under `git.project_roots` is a channel, plus hub channels this node is allowed to see |
 | `POST` | `/api/channel-state` | Update that node's pin, mute, archive, close, or read cursor. `# general` rejects archive and close |
 | `POST` | `/api/presence` | Which channel this node's UI is looking at. A model reply is unread when the UI is elsewhere or the page is hidden |
-| `POST` | `/api/share` | Invite node ids into a private channel. The hub stores the transcript and the membership |
+| `POST` | `/api/share` | Invite node ids into a private channel. Returns an invitation token once. The hub stores the token hash, the transcript, and the membership |
+| `POST` | `/api/join` | `{channel, token}`. The hub adds this node when the token matches or the node is already a member |
 | `GET` | `/api/audit` | Hub log of public and shared activity. A node proxies this from the hub |
 | `POST` | `/api/internal/complete` | One streamed completion. Used by nodes so the hub can reach every configured host. Each call is independent |
 | `POST` | `/api/channels` | `{name, visibility, namespace, context_namespaces}`. `public` is pushed to the hub |
 | `GET` | `/api/threads?channel=` | Thread ids. `main` is always present |
 | `POST` | `/api/threads/fork` | Copies head and tail into a new private thread |
-| `GET` | `/api/history?channel=&thread=` | Pulls a public thread from the hub, then returns local rows |
+| `GET` | `/api/history?channel=&thread=` | Pulls a public thread from the hub, then returns local rows. Each row is `{role, text, created_at_ms}` |
+| `POST` | `/api/inspect` | `{diff}` returns `{findings}` from the built-in inspector and `git.inspect_command` |
 | `POST` | `/api/chat` | SSE. Events are JSON with `type` of `status`, `thought`, `delta`, or `done` |
 | `GET` | `/api/memory?channel=` | Pins and learned notes |
 | `DELETE` | `/api/memory?id=` | Deletes one context row |
@@ -68,4 +70,4 @@ Channel names are 1 to 128 characters from `[A-Za-z0-9_.:/-]`.
 
 ## DR-26. UI bindings
 
-The page loads `/api/config` and fills the model select from `models[].id`, labeled `model · provider`. Strings are still accepted so an older response shape does not blank the list. Ctrl/Cmd+Enter sends. The composer textarea is not named `prompt`, so it does not replace `window.prompt`. Code fences show the fence language, not the UI language. A `diff` fence, including one that arrives at the end of a stream, adds an inspect button. New channels ask for `private` or `public`. Public names are prefixed with `#`, private names with `·`.
+The page loads `/api/config` and fills the model select from `models[].id`, labeled `model : host`, grouped by host. Proxied models, including Gemini, are a group under the hub. Strings are still accepted so an older response shape does not blank the list. Enter sends. Shift+Enter inserts a newline. The composer textarea is not named `prompt`, so it does not replace `window.prompt`. Code fences show the fence language, not the UI language. A `diff` fence, including one that arrives at the end of a stream, adds an inspect button. The side panel then asks `/api/inspect` and shows the findings above the diff. History draws a day divider and a clock without seconds. The stored value stays `created_at_ms`. New channels ask for `private` or `public`. Public names are prefixed with `#`, private names with `·`.

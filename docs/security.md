@@ -4,7 +4,9 @@ This is the trust model for a small lab that shares one HMAC key and does not ha
 
 ## DR-33. Who is trusted
 
-Every machine that has `/etc/xmeshd/hmac.key` is a peer. The daemon hashes that file and uses it to sign task execution. There is no login, password, or per-person nickname. `node.id` is a label the node writes on its own requests. A peer that already has the key can put any label it wants.
+Every machine that has `/etc/xmeshd/hmac.key` is a peer. The daemon hashes that file and uses it to sign task execution. There is no login, password, or per-person nickname.
+
+`node.node_key_path` is a second file, one per machine. The hub reads `node.peer_keys_dir`, a directory of `<node-id>.key` copies. Share, join, audit, and public message append then require a BLAKE3 MAC over a canonical string, with a five-minute timestamp. The audit stores that verified id. If the directory is missing or empty, the hub still accepts the label the caller sends, so keys can be installed after the binary. A peer that has the shared HMAC key and another node's key file can still speak as that node. The key file is what stops a casual relabel.
 
 The practical boundary is the network plus that shared key:
 
@@ -25,7 +27,7 @@ Private chats and private project trees stay in the node's own database. They ar
 
 Sharing is an explicit action from the channel menu. The owner sends the node ids, the transcript, and the retrieved source excerpts. The hub stores the membership. Another node sees the channel only when its `node.id` is on that list. `POST /api/mesh/join` fails with "invitation required" when the id is absent.
 
-This is collaboration among trusted peers, not an access-control system against someone who already has the HMAC key. A peer can claim another node's id. Per-node keys are the follow-up in the roadmap.
+This is collaboration among trusted peers, not an access-control system against someone who already has the HMAC key. With peer keys installed, a join or a share has to be signed by the node that claims the id. An invitation token is a second way in: the hub stores only its hash, the owner sees the token once, and `POST /api/join` with that token adds the caller. Without peer keys, a peer can still claim another node's id.
 
 `# general` cannot be archived or closed. Mute, pin, and read state are rows in `channel_prefs` on that node only. One node marking a channel read does not clear it on another node.
 
@@ -39,7 +41,7 @@ The hub table `audit_events` records public and shared activity:
 | `model.request` | A node asks the hub to run a model for a public or shared channel. The detail is the model id and a short preview of the user text, not the retrieved source |
 | `channel.share` / `channel.join` | Membership changes |
 | `task.execute` | An approved diff or pipeline runs |
-| `git.push` / `git.force_push` | The pipeline name contains `push`, and `git.force_push` when it also contains `--force` or `force-with-lease` |
+| `git.push` / `git.force_push` | A pipeline whose argv is `git push`. The detail stores the ref, the sha before, the sha after, and `force`. Force is `--force`, `--force-with-lease`, a `+refspec`, or `git_force: true` on the pipeline |
 
 Private channel traffic is not written there. The log is how the lab answers "which node asked the hub to do this" after a force-push pipeline or a public chat. It is not a substitute for git reflogs. The node id is the label the caller sent.
 
@@ -54,8 +56,8 @@ SSH local forwards, described in [remote-access.md](remote-access.md), are the s
 ## DR-37. What this model refuses to pretend
 
 - It does not authenticate a human.
-- It does not stop a peer with the HMAC key from impersonating a node id.
+- It does not stop a peer who has both the HMAC key and another node's key file from speaking as that node.
 - It does not encrypt private project text while a node is asking the hub to run a model. The prompt is sent to the configured model host. It is not copied into the audit log.
 - It does not treat a self-signed certificate as a public CA.
 
-The next hardening step is mutual TLS with a key per node, and an audit row that records the certificate identity rather than a self-declared `node.id`.
+Mutual TLS, so the transport itself names the node, is still an open decision. The node key above is an application MAC on the calls that change membership, audit, and public transcripts.

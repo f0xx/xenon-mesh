@@ -1,6 +1,6 @@
 # Company tools around the chat
 
-These are proposed adapters for a small IT company. None of them ship in the daemon today. Each one should be a provider or a side panel, with the hub audit recording that a node asked for the action, and with private channels staying on the node.
+These are adapters for a small IT company. The diff inspector in DR-40 is in the daemon. The rest are still proposals. Each one should be a provider or a side panel, with the hub audit recording that a node asked for the action, and with private channels staying on the node.
 
 ## DR-38. Calendars and reminders
 
@@ -19,9 +19,26 @@ Personal reminders stay on the node. A shared channel can subscribe to a team ca
 
 ## DR-40. Code and automation
 
-External inspectors (a linter service, CodeQL, or a CI status API) belong next to the diff inspector. The daemon asks the inspector about the unified diff the model produced, shows the findings in the side panel, and still requires the operator to approve before a pipeline runs.
+The side panel inspects the unified diff before approve. Built-in findings are the file count, added and removed lines, conflict markers, and a warning when the diff is large. `git.inspect_command` is an optional argv. The daemon writes the diff to its stdin and appends up to twenty stdout lines. A non-zero exit is itself a finding. Nothing is written until the operator approves.
 
-Automation tools (a webhook, a small job runner the company already uses) should be more deploy pipelines: a name in YAML, an argv, a workdir inside `allowed_workspaces`. The chat selects the pipeline name. It does not send a shell string.
+External inspectors (a linter, CodeQL, a CI status API) should use that command, or a small wrapper around it. They do not get a second write path.
+
+Automation stays a named deploy pipeline: a name in YAML, an argv, a workdir inside `allowed_workspaces`. A pipeline whose command is `git push` records the ref, the old sha, the new sha, and whether the update was forced. `git_ref` and `git_force` on the pipeline are the explicit form of that record. The chat selects the pipeline name. It does not send a shell string.
+
+## DR-42. QA
+
+QA belongs on the same two hooks, not in a new service.
+
+| Check | Where it runs | What the operator sees |
+| --- | --- | --- |
+| Unit or integration tests | A pipeline such as `test`, argv only | Audit `task.execute` with the exit code. The transcript can quote stdout |
+| Lint or format on the proposed diff | `git.inspect_command` | Findings in the side panel, before approve |
+| Coverage or a required CI status | A read-only inspector, or a pipeline that prints status and does not deploy | The same findings list, or an audit row |
+| A long or flaky suite | A separate pipeline name | It is not the default approve path |
+
+Failing findings should stay visible and should not disable approve until the lab decides a check is mandatory. A mandatory check is then a pipeline the operator runs on purpose, with the exit code in the audit, rather than a hidden gate.
+
+Private channels can run a local inspector. The hub audit learns about it when the channel is public or shared and the action is an approved task.
 
 ## DR-41. Shape of an adapter
 
@@ -32,4 +49,4 @@ An adapter is configuration, not a new chat product:
 3. Reads can enter the model context. Writes go through the existing approve button and the hub audit.
 4. Private channels may use an adapter locally. The hub learns about it only when the channel is shared or the action is public.
 
-Build the calendar read and the diff inspector first. They pay off in daily chat without taking a second system of record away from the board the company already uses.
+The diff inspector is in place. Calendar read is the remaining daily-chat adapter, and it is waiting on a decision. Neither one should take a second system of record away from the board the company already uses.

@@ -1,5 +1,6 @@
 mod config;
 mod executor;
+mod identity;
 mod git_sync;
 mod hub;
 mod migrate;
@@ -26,6 +27,7 @@ struct NodeRpcServer {
     cfg: Arc<AppConfig>,
     db: Arc<Storage>,
     hmac_key: [u8; 32],
+    peer_keys: std::collections::HashMap<String, [u8; 32]>,
 }
 
 #[tonic::async_trait]
@@ -115,13 +117,31 @@ impl ClusterService for NodeRpcServer {
         &self,
         req: Request<SessionMessage>,
     ) -> Result<Response<SessionMessage>, Status> {
-        let node_id = req
+        let node_claim = req
             .metadata()
             .get("x-xmesh-node")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("unknown")
             .to_string();
+        let ts = req
+            .metadata()
+            .get("x-xmesh-ts")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0);
+        let sig = req
+            .metadata()
+            .get("x-xmesh-sig")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let msg = req.into_inner();
+        let body = identity::canonical(
+            "append",
+            &[&msg.channel_id, &msg.thread_id, &msg.author, &msg.content],
+        );
+        let node_id = identity::resolve_peer(&self.peer_keys, &node_claim, ts, &sig, &body)
+            .map_err(Status::permission_denied)?;
         if let Some(ch) = self
             .db
             .get_channel(&msg.channel_id)
@@ -281,11 +301,29 @@ async fn main() -> Result<()> {
         embeddings: model_hub.embeddings_configured().await,
         ..Default::default()
     }));
+    let node_key = cfg
+        .node
+        .node_key_path
+        .as_deref()
+        .and_then(|path| identity::key_from_file(std::path::Path::new(path)));
+    let peer_keys = cfg
+        .node
+        .peer_keys_dir
+        .as_deref()
+        .map(|path| identity::load_peers(std::path::Path::new(path)))
+        .unwrap_or_default();
+    info!(
+        "node identity key present: {}, peer keys: {}",
+        node_key.is_some(),
+        peer_keys.len()
+    );
     let web = Arc::new(web_ui::WebState {
         cfg: cfg.clone(),
         db: db.clone(),
         models: model_hub.clone(),
         hmac_key,
+        node_key,
+        peer_keys: peer_keys.clone(),
         status: status.clone(),
         presence: Arc::new(std::sync::Mutex::new(web_ui::Presence {
             channel: "general".into(),
@@ -432,6 +470,14 @@ async fn main() -> Result<()> {
             }
         });
     }
+    if cfg.git.watch_changes {
+        let (c, d) = (cfg.clone(), db.clone());
+        tokio::spawn(async move {
+            if let Err(err) = watcher::run_tree_watcher(c, d).await {
+                error!("tree watcher: {err}");
+            }
+        });
+    }
 
     fn spawn_project_scan(
         cfg: Arc<AppConfig>,
@@ -480,7 +526,7 @@ async fn main() -> Result<()> {
                         name: name.clone(),
                         visibility: vis.into(),
                         namespace: name.clone(),
-                        origin_node: cfg.node.id.clone(),
+                        origin_node: "project".into(),
                         context_namespaces: vec![name.clone()],
                         updated_at_ms: 0,
                     })
@@ -516,6 +562,7 @@ async fn main() -> Result<()> {
             cfg,
             db,
             hmac_key,
+            peer_keys,
         }))
         .serve(addr)
         .await?;
