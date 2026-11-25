@@ -137,8 +137,26 @@ function appendBubble(who, txt) {
   const box = document.createElement('div'); box.className = 'msg';
   const body = document.createElement('div'); body.textContent = `[${who}]\n${txt}`; box.appendChild(body);
   const m = txt.match(/```diff\n([\s\(\S\)]*?)```/);
-  if (m) { const b = document.createElement('button'); b.style.marginTop='6px'; b.textContent='Inspect Diff ->'; b.onclick=()=>loadDiff(m[1]); box.appendChild(b); }
+  if (m) {
+    const b = document.createElement('button');
+    b.style.marginTop = '6px'; b.textContent = 'Inspect Diff ->';
+    b.onclick = () => loadDiff(m);
+    box.appendChild(b);
+  }
   log.appendChild(box); log.scrollTop = log.scrollHeight;
+}
+async function send() {
+  const box = document.getElementById('prompt');
+  const p = box.value.trim();
+  if (!p) return;
+  box.value = '';
+  appendBubble('user', p);
+  const d = await (await fetch('/api/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: ch, thread, prompt: p, model: modelSelect.value })
+  })).json();
+  appendBubble(modelSelect.value, d.reply || 'error');
+  await refreshThreads();
 }
 function loadDiff(raw) {
   currentDiff = raw; diffView.innerHTML = ''; let a = 0, d = 0;
@@ -151,11 +169,6 @@ function loadDiff(raw) {
   diffStats.textContent = `+${a} / -${d}`; btnApprove.disabled = false;
 }
 function pasteDiff() { const r = window.prompt('Diff:'); if (r) loadDiff(r); }
-async function send() {
-  const p = prompt.value.trim(); if (!p) return; prompt.value = ''; appendBubble('user', p);
-  const d = await (await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, thread, prompt:p, model:modelSelect.value}) })).json();
-  appendBubble(modelSelect.value, d.reply || 'error'); await refreshThreads();
-}
 async function saveMem(pin) {
   await fetch('/api/memory/learn', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, title:mTitle.value, text:mText.value, pin}) });
   await refreshMemory();
