@@ -1,21 +1,17 @@
-node:
-  id: "router-lab-01"
-  allowed_workspaces:
-    - "/srv/projects/router-fw"
-    - "/etc/nftables"
-
-watched_repos: []
+# Overlay fragment. Merged on top of /etc/xmeshd/cluster.yaml.
+# Do not load this file by itself; it does not repeat required sections.
+models:
+  default: ""
+  providers:
+    - id: local
+      kind: openai
+      base_url: "http://127.0.0.1:11434/v1"
+      discover: true
+      coding_bias: true
 
 deploy_pipelines:
-  reload-nft:
-    workdir: "/srv/projects/router-fw"
+  reload-rules:
+    workdir: "/srv/projects/app"
     command: ["/usr/local/libexec/nft-apply.sh"]
-    use_bwrap: false # access netlink through doas/sudo 
+    use_bwrap: false
     allow_network: false
-
-gemini:
-  chat_model: "gemini-2.5-flash"
-  embed_model: "gemini-embedding-001"
-  api_key_env: "GEMINI_API_KEY"
-
-

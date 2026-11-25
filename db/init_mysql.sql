@@ -1,17 +1,5 @@
--- mysql -u root < init_mysql.sql
-
-CREATE DATABASE IF NOT EXISTS xmesh_lab
-  CHARACTER SET utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-
-CREATE USER IF NOT EXISTS 'xmesh'@'127.0.0.1' IDENTIFIED BY 'labpass';
-CREATE USER IF NOT EXISTS 'xmesh'@'localhost' IDENTIFIED BY 'labpass';
-
-GRANT ALL PRIVILEGES ON xmesh_lab.* TO 'xmesh'@'127.0.0.1';
-GRANT ALL PRIVILEGES ON xmesh_lab.* TO 'xmesh'@'localhost';
-FLUSH PRIVILEGES;
-
-USE xmesh_lab;
+-- Schema only. Create the account from the environment with db/init_mysql.sh.
+-- Apply this file after USE of the target database.
 
 CREATE TABLE IF NOT EXISTS context_entries (
     id VARCHAR(64) PRIMARY KEY,
@@ -31,9 +19,24 @@ CREATE TABLE IF NOT EXISTS session_messages (
     channel_id VARCHAR(128) NOT NULL,
     thread_id VARCHAR(128) NOT NULL,
     seq BIGINT NOT NULL,
-    author VARCHAR(64) NOT NULL,
+    author TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at_ms BIGINT NOT NULL,
     INDEX idx_msg_thread (channel_id, thread_id, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS channels (
+    name VARCHAR(128) PRIMARY KEY,
+    visibility VARCHAR(16) NOT NULL,
+    namespace VARCHAR(128) NOT NULL,
+    origin_node VARCHAR(128) NOT NULL,
+    context_namespaces TEXT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS threads (
+    channel_id VARCHAR(128) NOT NULL,
+    thread_id VARCHAR(128) NOT NULL,
+    visibility VARCHAR(16) NOT NULL,
+    PRIMARY KEY (channel_id, thread_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

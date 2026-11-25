@@ -1,16 +1,27 @@
+# Node example. Copy to /etc/xmeshd/local.yaml on a machine that joins a hub.
 node:
-  id: "unconfigured-node"
+  id: "node-a"
   mode: "node"
   listen_addr: "0.0.0.0:8443"
-  master_url: "http://10.10.0.1:8443"
+  http_addr: "0.0.0.0:8080"
+  master_url: "http://hub.example:8443"
   hmac_secret_path: "/etc/xmeshd/hmac.key"
   allowed_workspaces:
     - "/srv/projects"
 
 storage:
-  # На воркерах primary_url пустой — сразу используется локальный SQLite без ошибок в логах
   primary_url: null
   fallback_sqlite: "/var/lib/xmeshd/cache.db"
+
+models:
+  default: ""
+  providers:
+    - id: local
+      kind: auto
+      base_url: "http://127.0.0.1:11434/v1"
+      discover: true
+      coding_bias: true
+      timeout_secs: 300
 
 git:
   bare_repos_root: null
@@ -18,8 +29,7 @@ git:
 
 deploy_pipelines:
   run-cargo-test:
-    workdir: "/srv/projects/router-fw"
+    workdir: "/srv/projects/app"
     command: ["cargo", "test", "--offline"]
     use_bwrap: true
     allow_network: false
-

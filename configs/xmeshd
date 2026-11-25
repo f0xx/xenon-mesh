@@ -1,3 +1,4 @@
 # /etc/conf.d/xmeshd
-export GEMINI_API_KEY="AIzaSyKeyFrom_AI_Studio"
-
+# Export provider credentials here. Do not commit real values.
+# export GEMINI_API_KEY=
+# export OLLAMA_API_KEY=

@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><title>xmeshd lab</title>
+<meta charset="utf-8"><title>xmeshd</title>
 <style>
   body { margin:0; font:13px/1.45 monospace; background:#111317; color:#e2e8f0; display:flex; height:100vh; overflow:hidden; }
   aside { width:220px; min-width:140px; max-width:450px; background:#181b20; padding:12px; overflow-y:auto; flex-shrink:0; }
@@ -60,7 +60,7 @@
     <div class="bar" style="padding:0;border:0">
       <input type="file" id="fileInput" multiple style="display:none" onchange="handleFiles(this.files)">
       <button style="background:#4a5568" onclick="fileInput.click()" title="Attach images, PDF, logs, code">+ File</button>
-      <textarea id="prompt" data-i18n-ph="promptPh" onpaste="handlePaste(event)"></textarea>
+      <textarea id="composer" data-i18n-ph="promptPh" onpaste="handlePaste(event)"></textarea>
       <button onclick="send()" data-i18n="send">Send</button>
     </div>
   </div>
@@ -74,7 +74,7 @@
   <div id="memList" style="max-height:95px;overflow-y:auto;background:#0b0d10;border:1px solid #2d3748;padding:4px;font-size:12px"></div>
   <hr style="border-color:#2d3748;width:100%">
   <b data-i18n="deployTitle">DIFF INSPECTOR & DEPLOY</b>
-  <input id="dNode" placeholder="Node gRPC URL (http://192.168.200.10:8443)" onchange="localStorage.dNode=this.value">
+  <input id="dNode" placeholder="Node gRPC URL (http://node.example:8443)" onchange="localStorage.dNode=this.value">
   <input id="dRepo" placeholder="Target workspace (/srv/projects/app)" onchange="localStorage.dRepo=this.value">
   <input id="dPipe" placeholder="Pipeline name (local.yaml)" onchange="localStorage.dPipe=this.value">
   <div style="display:flex;justify-content:space-between"><span id="diffStats" data-i18n="noDiff">No diff</span><button onclick="pasteDiff()" data-i18n="paste">Paste</button></div>
@@ -86,13 +86,13 @@ const I18N = {
   en: { channels:'CHANNELS', threads:'THREADS', send:'Send', promptPh:'Message to thread...', memTitle:'CONTEXT & MEMORY',
         keyPh:'Key (e.g. nft-rules)', memPh:'Invariant or thread notes...', pinBtn:'Pin Raw', learnBtn:'Distill Learn',
         deployTitle:'DIFF INSPECTOR & DEPLOY', noDiff:'No diff', paste:'Paste', awaitDiff:'Awaiting diff...',
-        approve:'Approve & Execute', newCh:'New channel name:', newTh:'New thread name:', noMem:'No pinned entries' },
+        approve:'Approve & Execute', newCh:'New channel name:', newTh:'New thread name:', noMem:'No pinned entries', visPh:'Visibility: private or public' },
   ru: { channels:'КАНАЛЫ', threads:'ТРЕДЫ', send:'Отправить', promptPh:'Сообщение в тред...', memTitle:'КОНТЕКСТ И ПАМЯТЬ',
         keyPh:'Ключ (напр. nft-rules)', memPh:'Инвариант или заметка...', pinBtn:'Закрепить', learnBtn:'Сжать опыт',
         deployTitle:'ИНСПЕКТОР DIFF И ДЕПЛОЙ', noDiff:'Нет diff', paste:'Вставить', awaitDiff:'Ожидание патча...',
-        approve:'Утвердить и выполнить', newCh:'Имя нового канала:', newTh:'Имя нового треда:', noMem:'Нет закрепленных записей' }
+        approve:'Утвердить и выполнить', newCh:'Имя нового канала:', newTh:'Имя нового треда:', noMem:'Нет закрепленных записей', visPh:'Видимость: private или public' }
 };
-let lang = localStorage.lang || 'en', ch = 'general', thread = 'main', currentDiff = '';
+let lang = localStorage.lang || 'en', ch = 'general', thread = 'main', currentDiff = '', chMeta = {};
 function t(k) { return (I18N[lang] || I18N.en)[k] || k; }
 function setLang(l) {
   lang = l; localStorage.lang = l;
@@ -108,12 +108,20 @@ function initResize(bar, target, key, invert) {
     document.onmouseup = () => { document.onmousemove = null; };
   };
 }
+function channelOf(raw) {
+  return typeof raw === 'string' ? { name: raw, visibility: 'public' } : raw;
+}
 async function refreshChannels() {
-  const list = await (await fetch('/api/channels')).json();
-  if (!list.includes(ch)) list.push(ch); chList.innerHTML = '';
-  list.forEach(c => {
-    const d = document.createElement('div'); d.className = 'item' + (c === ch ? ' active' : '');
-    d.textContent = `# ${c}`; d.title = c; d.onclick = () => setCh(c); chList.appendChild(d);
+  const list = (await (await fetch('/api/channels')).json()).map(channelOf);
+  chMeta = {};
+  list.forEach(c => { chMeta[c.name] = c; });
+  if (!chMeta[ch]) chMeta[ch] = { name: ch, visibility: 'private' };
+  chList.innerHTML = '';
+  Object.values(chMeta).sort((a, b) => a.name.localeCompare(b.name)).forEach(c => {
+    const d = document.createElement('div'); d.className = 'item' + (c.name === ch ? ' active' : '');
+    d.textContent = `${c.visibility === 'public' ? '# ' : '· '}${c.name}`;
+    d.title = `${c.name} (${c.visibility || 'private'})`;
+    d.onclick = () => setCh(c.name); chList.appendChild(d);
   });
 }
 async function refreshThreads() {
@@ -137,7 +145,16 @@ async function refreshMemory() {
   });
 }
 async function setCh(c) { ch = c; thread = 'main'; await refreshChannels(); await refreshThreads(); await refreshMemory(); await loadHistory(); }
-async function newChannel() { const n = window.prompt(t('newCh')); if (n) await setCh(n.trim().replace(/\s+/g, '-')); }
+async function newChannel() {
+  const n = window.prompt(t('newCh')); if (!n) return;
+  const vis = (window.prompt(t('visPh'), 'private') || 'private').trim().toLowerCase();
+  const name = n.trim().replace(/\s+/g, '-');
+  await fetch('/api/channels', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, visibility: vis === 'public' ? 'public' : 'private', namespace: name })
+  });
+  await setCh(name);
+}
 async function newThread() { const n = window.prompt(t('newTh')); if (n) { thread = n.trim().replace(/\s+/g, '-'); await refreshThreads(); loadHistory(); } }
 async function forkThread() {
   const dst = window.prompt('Fork to:'); if (!dst) return;
@@ -146,7 +163,8 @@ async function forkThread() {
   thread = dst.trim(); await refreshThreads(); await loadHistory();
 }
 async function loadHistory() {
-  headerTitle.textContent = `# ${ch} / ${thread}`; log.innerHTML = '';
+  const vis = (chMeta[ch] && chMeta[ch].visibility) || '';
+  headerTitle.textContent = `# ${ch} / ${thread}${vis ? ' · ' + vis : ''}`; log.innerHTML = '';
   (await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json()).forEach(m => appendBubble(m.role, m.text));
 }
 
@@ -156,12 +174,12 @@ function escHtml(s) {
 
 function renderMarkdown(raw) {
   const blocks = [];
-  let txt = raw.replace(/```([a-zA-Z0-9_-]*)\n([\s\(\S\)]*?)```/g, (_, lang, code) => {
+  let txt = raw.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, fenceLang, code) => {
     const id = blocks.length;
     const clean = code.replace(/\n$/, '');
     const b64 = btoa(unescape(encodeURIComponent(clean)));
     blocks.push(
-      `<pre><div class="code-hdr"><span>${escHtml(lang || 'text')}</span>` +
+      `<pre><div class="code-hdr"><span>${escHtml(fenceLang || 'text')}</span>` +
       `<button style="padding:1px 6px;font-size:11px" onclick="navigator.clipboard.writeText(decodeURIComponent(escape(atob('${b64}'))))">Copy</button></div>` +
       `<code>${escHtml(clean)}</code></pre>`
     );
@@ -205,7 +223,7 @@ function appendBubble(who, txt) {
   box.appendChild(body);
 
   // Перехватываем сырой diff для правой панели инспектора
-  const m = txt.match(/```diff\n([\s\(\S\)]*?)```/);
+  const m = txt.match(/```diff\n([\s\S]*?)```/);
   if (m) {
     const b = document.createElement('button');
     b.style.marginTop = '8px';
@@ -250,8 +268,18 @@ function handlePaste(e) {
   if (files.length) handleFiles(files);
 }
 
+function attachDiffButton(container, txt) {
+  const m = txt.match(/```diff\n([\s\S]*?)```/);
+  if (!m || container.querySelector('.inspect-diff')) return;
+  const b = document.createElement('button');
+  b.className = 'inspect-diff';
+  b.style.marginTop = '8px';
+  b.textContent = 'Inspect Diff ->';
+  b.onclick = () => loadDiff(m[1]);
+  container.appendChild(b);
+}
 async function send() {
-  const box = document.getElementById('prompt');
+  const box = document.getElementById('composer');
   const p = box.value.trim();
   if (!p && !pendingAtts.length) return;
   const atts = pendingAtts; pendingAtts = []; renderAtts();
@@ -274,6 +302,11 @@ async function send() {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ channel: ch, thread, prompt: p || 'Analyze attached files', model: modelSelect.value, attachments: atts })
   });
+  if (!resp.ok || !resp.body) {
+    statusLine.style.display = 'none';
+    body.textContent = await resp.text();
+    return;
+  }
 
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
@@ -301,6 +334,7 @@ async function send() {
       } else if (ev.type === 'done') {
         hdr.textContent = `[${ev.model_used}]`;
         statusLine.style.display = 'none';
+        attachDiffButton(card, fullText);
       }
       log.scrollTop = log.scrollHeight;
     }
@@ -339,11 +373,15 @@ window.onload = async () => {
     modelSelect.innerHTML = '';
     cfg.models.forEach(m => {
       const opt = document.createElement('option');
-      opt.value = m; opt.textContent = m;
+      if (typeof m === 'string') { opt.value = m; opt.textContent = m; }
+      else { opt.value = m.id; opt.textContent = `${m.model} · ${m.provider}`; }
       modelSelect.appendChild(opt);
     });
   }
   if (cfg.default_model) modelSelect.value = cfg.default_model;
+  document.getElementById('composer').addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+  });
   await setCh('general');
 };
 const spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']; let si = 0, lastDone = -1;
@@ -354,7 +392,12 @@ setInterval(async () => {
       statusBadge.style.color = '#ecc94b';
       statusBadge.textContent = `${spin[si++%spin.length]} ${s.done_repos}/${s.total_repos}: ${s.current_repo} (${s.indexed_files})`;
       if (s.done_repos !== lastDone) { lastDone = s.done_repos; refreshChannels(); }
-    } else { statusBadge.style.color = '#68d391'; statusBadge.textContent = `● ready (${s.total_repos})`; if (lastDone !== -2) { lastDone = -2; refreshChannels(); } }
+    } else {
+      const embed = s.embeddings ? '' : ' · lexical';
+      statusBadge.style.color = '#68d391';
+      statusBadge.textContent = `● ready${s.mode ? ' ' + s.mode : ''} (${s.total_repos || 0})${embed}`;
+      if (lastDone !== -2) { lastDone = -2; refreshChannels(); }
+    }
   } catch { statusBadge.style.color = '#fc8181'; statusBadge.textContent = '● offline'; }
 }, 2000);
 </script>

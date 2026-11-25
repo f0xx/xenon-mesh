@@ -4,17 +4,29 @@ use prost::Message;
 use std::fs;
 use tracing::info;
 
-pub async fn export_to_file(db: &Storage, node: &str, ns: Option<&str>, out_path: &str) -> Result<usize> {
+pub async fn export_to_file(
+    db: &Storage,
+    node: &str,
+    ns: Option<&str>,
+    out_path: &str,
+) -> Result<usize> {
     let env = db.export_envelope(node, ns).await?;
     let count = env.entries.len();
     let raw_pb = env.encode_to_vec();
     let compressed = zstd::bulk::compress(&raw_pb, 3)?;
     fs::write(out_path, compressed).context("Failed to write .pb.zst dump")?;
-    info!("Exported {count} entries (schema v{}) to {out_path}", env.schema_version);
+    info!(
+        "Exported {count} entries (schema v{}) to {out_path}",
+        env.schema_version
+    );
     Ok(count)
 }
 
-pub async fn import_from_file(db: &Storage, in_path: &str, overwrite_pinned: bool) -> Result<usize> {
+pub async fn import_from_file(
+    db: &Storage,
+    in_path: &str,
+    overwrite_pinned: bool,
+) -> Result<usize> {
     let compressed = fs::read(in_path).context("Failed to read .pb.zst dump")?;
     let raw_pb = zstd::bulk::decompress(&compressed, 256 * 1024 * 1024)?; // 256mb hardcoded limit
     let env = SyncEnvelope::decode(raw_pb.as_slice()).context("Corrupted Protobuf stream")?;
@@ -28,7 +40,14 @@ pub async fn import_from_file(db: &Storage, in_path: &str, overwrite_pinned: boo
     for msg in &env.messages {
         db.append_message(msg).await?;
     }
-    info!("Imported {applied}/{} entries from {in_path}", env.entries.len());
+    for ch in &env.channels {
+        db.upsert_channel(&crate::storage::ChannelRow::from_proto(ch))
+            .await?;
+    }
+    info!(
+        "Imported {applied}/{} entries from {in_path}",
+        env.entries.len()
+    );
     Ok(applied)
 }
 
@@ -43,7 +62,16 @@ pub async fn direct_migrate(from_url: &str, to_url: &str, overwrite_pinned: bool
             applied += 1;
         }
     }
-    info!("Direct migration complete: {applied} entries moved ({:?} -> {:?})", src.kind, dst.kind);
+    for msg in &env.messages {
+        dst.append_message(msg).await?;
+    }
+    for ch in &env.channels {
+        dst.upsert_channel(&crate::storage::ChannelRow::from_proto(ch))
+            .await?;
+    }
+    info!(
+        "Direct migration complete: {applied} entries moved ({:?} -> {:?})",
+        src.kind, dst.kind
+    );
     Ok(applied)
 }
-

@@ -6,6 +6,8 @@ service ClusterService
   rpc SyncContexts (SyncEnvelope) returns (SyncAck);
   rpc QueryNodeContext (ContextQuery) returns (SyncEnvelope);
   rpc ExecuteTask (NodeTaskRequest) returns (NodeTaskResponse);
+  rpc ListChannels (ListChannelsRequest) returns (ListChannelsResponse);
+  rpc AppendMessage (SessionMessage) returns (SessionMessage);
 }
 
 enum EntryType
@@ -27,8 +29,8 @@ message ContextEntry
   repeated float embedding = 7;
   int64 updated_at_ms = 8;
   string origin_node = 9;
-    map < string, string > meta = 10;
-    reserved 11 to 15;
+  map < string, string > meta = 10;
+  reserved 11 to 15;
 }
 
 message SessionMessage
@@ -41,6 +43,16 @@ message SessionMessage
   int64 created_at_ms = 6;
 }
 
+message ChannelRecord
+{
+  string name = 1;
+  string visibility = 2;
+  string namespace = 3;
+  string origin_node = 4;
+  int64 updated_at_ms = 5;
+  repeated string context_namespaces = 6;
+}
+
 message SyncEnvelope
 {
   uint32 schema_version = 1;
@@ -48,6 +60,7 @@ message SyncEnvelope
   int64 timestamp_ms = 3;
   repeated ContextEntry entries = 4;
   repeated SessionMessage messages = 5;
+  repeated ChannelRecord channels = 6;
 }
 
 message SyncAck
@@ -81,4 +94,11 @@ message NodeTaskResponse
   int32 exit_code = 3;
   string stdout_log = 4;
   string stderr_log = 5;
+}
+
+message ListChannelsRequest {}
+
+message ListChannelsResponse
+{
+  repeated ChannelRecord channels = 1;
 }

@@ -1,4 +1,5 @@
 #!/bin/sh
+# Notify the local hub to re-index the bare repo that was just updated.
 REPO_NAME=$(basename "$(pwd)" .git)
-curl -s -X POST "http://127.0.0{REPO_NAME}" >/dev/null 2>&1 || true
-
+BASE="${XMESHD_HTTP:-http://127.0.0.1:8080}"
+curl -s -X POST "${BASE}/api/internal/reindex?namespace=${REPO_NAME}" >/dev/null 2>&1 || true

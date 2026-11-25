@@ -1,5 +1,3 @@
-
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
@@ -7,4 +5,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&["proto/xmeshd/v1/cluster.proto"], &["proto"])?;
     Ok(())
 }
-

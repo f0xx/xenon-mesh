@@ -1,22 +1,5 @@
--- psql -U postgres -f init_postgres.sql
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'xmesh') THEN
-        CREATE ROLE xmesh WITH LOGIN PASSWORD 'labpass';
-    END IF;
-END
-$$;
-
-SELECT 'CREATE DATABASE xmesh_lab OWNER xmesh ENCODING ''UTF8'''
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'xmesh_lab')\gexec
-
-\c xmesh_lab
-
-GRANT ALL PRIVILEGES ON DATABASE xmesh_lab TO xmesh;
-GRANT ALL ON SCHEMA public TO xmesh;
-
-SET ROLE xmesh;
+-- Schema only. Create the role and database from the environment
+-- with db/init_postgres.sh. This file must not contain passwords.
 
 CREATE TABLE IF NOT EXISTS context_entries (
     id VARCHAR(64) PRIMARY KEY,
@@ -36,8 +19,24 @@ CREATE TABLE IF NOT EXISTS session_messages (
     channel_id VARCHAR(128) NOT NULL,
     thread_id VARCHAR(128) NOT NULL,
     seq BIGINT NOT NULL,
-    author VARCHAR(64) NOT NULL,
+    author TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at_ms BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_msg_thread ON session_messages(channel_id, thread_id, seq);
+
+CREATE TABLE IF NOT EXISTS channels (
+    name VARCHAR(128) PRIMARY KEY,
+    visibility VARCHAR(16) NOT NULL,
+    namespace VARCHAR(128) NOT NULL,
+    origin_node VARCHAR(128) NOT NULL,
+    context_namespaces TEXT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS threads (
+    channel_id VARCHAR(128) NOT NULL,
+    thread_id VARCHAR(128) NOT NULL,
+    visibility VARCHAR(16) NOT NULL,
+    PRIMARY KEY (channel_id, thread_id)
+);

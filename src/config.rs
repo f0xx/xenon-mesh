@@ -22,7 +22,54 @@ pub struct AppConfig {
     #[serde(default)]
     pub gemini: GeminiSection,
     #[serde(default)]
+    pub models: ModelsSection,
+    #[serde(default)]
     pub deploy_pipelines: HashMap<String, DeployPipeline>,
+}
+
+fn default_http_addr() -> String {
+    "0.0.0.0:8080".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSection {
+    pub id: String,
+    pub mode: NodeMode,
+    pub listen_addr: String,
+    #[serde(default = "default_http_addr")]
+    pub http_addr: String,
+    pub master_url: Option<String>,
+    pub hmac_secret_path: String,
+    #[serde(default)]
+    pub allowed_workspaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageSection {
+    pub primary_url: Option<String>,
+    pub fallback_sqlite: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitSection {
+    pub bare_repos_root: Option<String>,
+    #[serde(default)]
+    pub watched_repos: Vec<WatchedRepo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedRepo {
+    pub namespace: String,
+    pub local_path: String,
+    pub base_branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployPipeline {
+    pub workdir: String,
+    pub command: Vec<String>,
+    pub use_bwrap: bool,
+    pub allow_network: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,55 +84,72 @@ pub struct GeminiSection {
 impl Default for GeminiSection {
     fn default() -> Self {
         Self {
-            chat_model: "gemini-3.8-flash".to_string(),
-            embed_model: "gemini-embedding-001".to_string(),
-            api_key_env: "GEMINI_API_KEY".to_string(),
-            available_models: vec![
-                "gemini-3.8-flash".to_string(),
-                "gemini-4-hydrogen".to_string(),
-                "gemini-2.5-pro".to_string(),
-            ],
+            chat_model: "gemini-2.5-flash".into(),
+            embed_model: "gemini-embedding-001".into(),
+            api_key_env: "GEMINI_API_KEY".into(),
+            available_models: vec!["gemini-2.5-flash".into(), "gemini-2.5-pro".into()],
+        }
+    }
+}
+
+/// One remote model endpoint.
+///
+/// `kind` is `openai` (OpenAI-compatible HTTP, including Ollama `/v1`),
+/// `ollama` (native `/api/chat`), `gemini`, or `auto` (probe an OpenAPI
+/// document, then well-known routes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub chat_model: String,
+    pub embed_model: String,
+    pub models: Vec<String>,
+    pub discover: bool,
+    pub coding_bias: bool,
+    pub timeout_secs: u64,
+    pub openapi_url: String,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: "openai".into(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            chat_model: String::new(),
+            embed_model: String::new(),
+            models: Vec::new(),
+            discover: true,
+            coding_bias: true,
+            timeout_secs: 300,
+            openapi_url: String::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeSection {
-    pub id: String,
-    pub mode: NodeMode,
-    pub listen_addr: String,
-    pub master_url: Option<String>,
-    pub hmac_secret_path: String,
-    #[serde(default)]
-    pub allowed_workspaces: Vec<String>,
+#[serde(default)]
+pub struct ModelsSection {
+    /// `provider/model`. Empty means the coding-biased default after discovery.
+    pub default: String,
+    pub embed_provider: String,
+    pub system_prompt: String,
+    pub providers: Vec<ProviderConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageSection {
-    pub primary_url: Option<String>, // postgres://... or mysql://...
-    pub fallback_sqlite: String,     // /var/lib/xmeshd/local.db
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitSection {
-    pub bare_repos_root: Option<String>, // Master: /srv/git
-    #[serde(default)]
-    pub watched_repos: Vec<WatchedRepo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchedRepo {
-    pub namespace: String,
-    pub local_path: String,
-    pub base_branch: String, // local diff vs origin/<base_branch>
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployPipeline {
-    pub workdir: String,
-    pub command: Vec<String>,
-    pub use_bwrap: bool,
-    pub allow_network: bool,
+impl Default for ModelsSection {
+    fn default() -> Self {
+        Self {
+            default: String::new(),
+            embed_provider: String::new(),
+            system_prompt: String::new(),
+            providers: Vec::new(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -106,3 +170,83 @@ impl AppConfig {
     }
 }
 
+/// Hide userinfo passwords in database URLs before they reach logs or stdout.
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_at) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_at + 3..];
+    let Some(at) = rest.find('@') else {
+        return url.to_string();
+    };
+    let userinfo = &rest[..at];
+    let host = &rest[at..];
+    let user = userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo);
+    format!("{}://{user}:***{host}", &url[..scheme_at])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_only_the_password() {
+        assert_eq!(
+            redact_url("postgres://app:s3cret@127.0.0.1:5432/mesh"),
+            "postgres://app:***@127.0.0.1:5432/mesh"
+        );
+        assert_eq!(redact_url("sqlite:///tmp/mesh.db"), "sqlite:///tmp/mesh.db");
+    }
+
+    #[test]
+    fn loads_provider_overlay_and_keeps_legacy_gemini() {
+        let dir = std::env::temp_dir().join(format!("xmesh-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cluster = dir.join("cluster.yaml");
+        let local = dir.join("local.yaml");
+        std::fs::write(
+            &cluster,
+            r#"
+node:
+  id: node-a
+  mode: node
+  listen_addr: "127.0.0.1:8443"
+  hmac_secret_path: "/tmp/hmac.key"
+storage:
+  primary_url: null
+  fallback_sqlite: "/tmp/mesh.db"
+git:
+  bare_repos_root: null
+gemini:
+  chat_model: "gemini-2.5-pro"
+  api_key_env: "GEMINI_API_KEY"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &local,
+            r#"
+models:
+  default: "local/coder"
+  providers:
+    - id: local
+      kind: auto
+      base_url: "http://127.0.0.1:11434/v1"
+      discover: true
+      coding_bias: true
+"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load(cluster.to_str().unwrap(), local.to_str().unwrap()).unwrap();
+        assert!(matches!(cfg.node.mode, NodeMode::Node));
+        assert_eq!(cfg.node.http_addr, "0.0.0.0:8080");
+        assert_eq!(cfg.models.default, "local/coder");
+        assert_eq!(cfg.models.providers.len(), 1);
+        assert_eq!(cfg.models.providers[0].kind, "auto");
+        assert_eq!(cfg.models.providers[0].timeout_secs, 300);
+        assert_eq!(cfg.gemini.chat_model, "gemini-2.5-pro");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

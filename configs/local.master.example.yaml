@@ -1,16 +1,34 @@
+# Hub example. Copy to /etc/xmeshd/local.yaml and replace placeholders.
+# Database passwords and API keys stay in the environment or in this
+# untracked file, never in the source tree.
 node:
-  id: "xen-master"
+  id: "hub"
   mode: "master"
+  listen_addr: "0.0.0.0:8443"
+  http_addr: "0.0.0.0:8080"
+  hmac_secret_path: "/etc/xmeshd/hmac.key"
 
 storage:
-  primary_url: "postgres://xmesh:labpass@127.0.0.1:5432/xmesh_lab"
+  primary_url: "postgres://USER:PASSWORD@127.0.0.1:5432/xmesh"
   fallback_sqlite: "/var/lib/xmeshd/master_fallback.db"
 
+# Used only when models.providers is empty.
 gemini:
   chat_model: "gemini-2.5-flash"
   embed_model: "gemini-embedding-001"
   api_key_env: "GEMINI_API_KEY"
 
+models:
+  # Empty default: after discovery, pick the highest coding rank.
+  default: ""
+  providers:
+    - id: local
+      kind: openai
+      base_url: "http://127.0.0.1:11434/v1"
+      api_key_env: ""
+      discover: true
+      coding_bias: true
+      timeout_secs: 300
+
 git:
   bare_repos_root: "/srv/git"
-
