@@ -5,7 +5,7 @@ BIN_SRC="${1:-./target/release/xmeshd}"
 GIT_ROOT=${GIT_ROOT:-"/svc/git"}
 NODE_ID=${NODE_ID:-"euphoria"}
 INSTALL_PREFIX=${INSTALL_PREFIX:-"/usr/local/bin/"}
-GEMINI_MODEL=${GEMINI_MODEL:-"gemini-2.5-flash"}
+GEMINI_MODEL=${GEMINI_MODEL:-"gemini-3.8-flash"}
 
 getent group xmeshd >/dev/null || groupadd -r xmeshd
 getent passwd xmeshd >/dev/null || useradd -r -g xmeshd -d /var/lib/xmeshd -s /sbin/nologin xmeshd
