@@ -25,6 +25,9 @@ pub async fn import_from_file(db: &Storage, in_path: &str, overwrite_pinned: boo
             applied += 1;
         }
     }
+    for msg in &env.messages {
+        db.append_message(msg).await?;
+    }
     info!("Imported {applied}/{} entries from {in_path}", env.entries.len());
     Ok(applied)
 }

@@ -163,7 +163,7 @@ impl Storage {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis() as i64,
             entries,
-            messages: vec![],
+            messages: if namespace.is_none() { self.export_all_messages().await? } else { vec![] },
         })
     }
 }
@@ -194,31 +194,40 @@ impl Storage {
         Ok(())
     }
 
-    /// Сохраняет одно сообщение треда в БД (идемпотентно по id)
+    /// Сохраняет одно сообщение треда в БД (совместимо с SQLite, Postgres и MariaDB)
     pub async fn append_message(&self, msg: &pb::SessionMessage) -> Result<()> {
-        let now_ms = if msg.created_at_ms > 0 {
+        let ts = if msg.created_at_ms > 0 {
             msg.created_at_ms
         } else {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64
         };
-        let id = blake3::hash(format!("{}:{}:{}:{}", msg.channel_id, msg.thread_id, msg.seq, now_ms).as_bytes())
+        let id = blake3::hash(format!("{}:{}:{}", msg.channel_id, msg.thread_id, msg.seq).as_bytes())
             .to_hex()
             .to_string();
 
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM session_messages WHERE id = $1").bind(&id).execute(&mut *tx).await?;
         sqlx::query(
             "INSERT INTO session_messages (id, channel_id, thread_id, seq, author, content, created_at_ms)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING"
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
         )
-        .bind(&id)
-        .bind(&msg.channel_id)
-        .bind(&msg.thread_id)
-        .bind(msg.seq as i64)
-        .bind(&msg.author)
-        .bind(&msg.content)
-        .bind(now_ms)
-        .execute(&self.pool)
-        .await?;
+        .bind(&id).bind(&msg.channel_id).bind(&msg.thread_id).bind(msg.seq as i64)
+        .bind(&msg.author).bind(&msg.content).bind(ts)
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn export_all_messages(&self) -> Result<Vec<pb::SessionMessage>> {
+        let rows = sqlx::query("SELECT channel_id, thread_id, seq, author, content, created_at_ms FROM session_messages")
+            .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|r| {
+            let seq: i64 = r.get("seq");
+            pb::SessionMessage {
+                channel_id: r.get("channel_id"), thread_id: r.get("thread_id"), seq: seq as u64,
+                author: r.get("author"), content: r.get("content"), created_at_ms: r.get("created_at_ms"),
+            }
+        }).collect())
     }
 
     /// Загружает последние N сообщений треда в хронологическом порядке
