@@ -1,7 +1,7 @@
 use crate::config::{AppConfig, NodeMode};
 use crate::git_sync::{discover_bare_repos, scan_bare_repo, scan_workdir};
 use crate::hub;
-use crate::models::{Attachment, ChatTurn, ModelHub, StreamEvent};
+use crate::models::{Attachment, ChatTurn, ModelChoice, ModelHub, StreamEvent};
 use crate::retrieve::{assemble_context, coding_preamble, map_entries};
 use crate::storage::pb::cluster_service_client::ClusterServiceClient;
 use crate::storage::pb::{ContextEntry, EntryType, NodeTaskRequest, SessionMessage, SyncEnvelope};
@@ -128,6 +128,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/memory/learn", post(handle_learn))
         .route("/api/task/approve", post(handle_approve))
         .route("/api/internal/reindex", post(handle_reindex))
+        .route("/api/internal/complete", post(handle_complete))
         .route("/api/config", get(handle_config))
         .route("/api/threads/fork", post(handle_fork_thread))
         .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))
@@ -154,6 +155,18 @@ fn master_url(cfg: &AppConfig) -> Option<&str> {
     }
 }
 
+fn master_http(cfg: &AppConfig) -> Option<&str> {
+    match cfg.node.mode {
+        NodeMode::Node => cfg
+            .node
+            .master_http
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        NodeMode::Master => None,
+    }
+}
+
 async fn handle_health(State(st): State<Arc<WebState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "ok": true,
@@ -163,13 +176,44 @@ async fn handle_health(State(st): State<Arc<WebState>>) -> Json<serde_json::Valu
 }
 
 async fn handle_config(State(st): State<Arc<WebState>>) -> Json<serde_json::Value> {
+    let mut models = st.models.model_choices().await;
+    let mut default_model = st.models.default_model().await;
+    if let Some(base) = master_http(&st.cfg) {
+        if let Some(remote) = fetch_hub_config(base).await {
+            if default_model.is_empty() {
+                default_model = remote.default_model;
+            }
+            for choice in remote.models {
+                if !models.iter().any(|m| m.id == choice.id) {
+                    models.push(choice);
+                }
+            }
+        }
+    }
     Json(serde_json::json!({
-        "default_model": st.models.default_model().await,
-        "models": st.models.model_choices().await,
+        "default_model": default_model,
+        "models": models,
         "mode": mode_name(&st.cfg.node.mode),
         "node_id": st.cfg.node.id,
         "embeddings": st.models.embeddings_configured().await
     }))
+}
+
+#[derive(Deserialize)]
+struct RemoteCatalog {
+    #[serde(default)]
+    default_model: String,
+    #[serde(default)]
+    models: Vec<ModelChoice>,
+}
+
+async fn fetch_hub_config(base: &str) -> Option<RemoteCatalog> {
+    let url = format!("{}/api/config", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    client.get(url).send().await.ok()?.json().await.ok()
 }
 
 async fn handle_list_channels(
@@ -537,6 +581,17 @@ async fn prompt_for(
                 }
             }
         }
+        if let Some(dir) = project_dir(&st.cfg, ns) {
+            let origin = st.cfg.node.id.clone();
+            let ns = ns.clone();
+            if let Ok(Ok(files)) =
+                tokio::task::spawn_blocking(move || scan_workdir(&dir, &ns, &origin)).await
+            {
+                for e in files {
+                    merged.entry(e.id.clone()).or_insert(e);
+                }
+            }
+        }
         if let Some(repo) = st.cfg.git.watched_repos.iter().find(|r| &r.namespace == ns) {
             let path = repo.local_path.clone();
             let ns = ns.clone();
@@ -580,6 +635,126 @@ async fn store_message(st: &WebState, mut msg: SessionMessage, sync_hub: bool) -
     }
     let _ = st.db.append_message(&msg).await;
     msg
+}
+
+fn project_dir(cfg: &AppConfig, ns: &str) -> Option<std::path::PathBuf> {
+    cfg.git.project_roots.iter().find_map(|root| {
+        let path = std::path::PathBuf::from(&root.path).join(ns);
+        path.is_dir().then_some(path)
+    })
+}
+
+#[derive(Deserialize)]
+struct CompleteReq {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    system: String,
+    #[serde(default)]
+    turns: Vec<ChatTurn>,
+}
+
+async fn handle_complete(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<CompleteReq>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+    tokio::spawn(async move {
+        if let Err(err) = st
+            .models
+            .stream_chat(&req.model, &req.system, &req.turns, tx.clone())
+            .await
+        {
+            let _ = tx
+                .send(StreamEvent::Delta {
+                    text: format!("[ERROR] {err}"),
+                })
+                .await;
+            let _ = tx
+                .send(StreamEvent::Done {
+                    model_used: "error".into(),
+                })
+                .await;
+        }
+    });
+    let stream = ReceiverStream::new(rx)
+        .map(|ev| Ok(Event::default().data(serde_json::to_string(&ev).unwrap_or_default())));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn dispatch_chat(
+    st: &WebState,
+    model: &str,
+    system: &str,
+    turns: &[ChatTurn],
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> anyhow::Result<(String, String)> {
+    if let Some(base) = master_http(&st.cfg) {
+        let prefix = model
+            .split_once('/')
+            .map(|(p, rest)| if rest.is_empty() { "" } else { p })
+            .unwrap_or("");
+        let remote = if prefix.is_empty() {
+            !st.models.has_local_providers().await
+        } else {
+            !st.models.owns_provider(prefix).await
+        };
+        if remote {
+            return relay_complete(base, model, system, turns, tx).await;
+        }
+    }
+    st.models.stream_chat(model, system, turns, tx).await
+}
+
+async fn relay_complete(
+    base: &str,
+    model: &str,
+    system: &str,
+    turns: &[ChatTurn],
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> anyhow::Result<(String, String)> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let url = format!("{}/api/internal/complete", base.trim_end_matches('/'));
+    let mut resp = client
+        .post(url)
+        .json(&serde_json::json!({
+            "model": model,
+            "system": system,
+            "turns": turns
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("hub model route status {}", resp.status());
+    }
+    let mut carry = Vec::new();
+    let mut text = String::new();
+    let mut used = String::new();
+    while let Some(chunk) = resp.chunk().await? {
+        carry.extend_from_slice(&chunk);
+        while let Some(pos) = carry.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = carry.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(ev) = serde_json::from_str::<StreamEvent>(data.trim()) else {
+                continue;
+            };
+            match &ev {
+                StreamEvent::Delta { text: delta } => text.push_str(delta),
+                StreamEvent::Done { model_used } => used = model_used.clone(),
+                _ => {}
+            }
+            let _ = tx.send(ev).await;
+        }
+    }
+    if used.is_empty() {
+        used = model.to_string();
+    }
+    Ok((text, used))
 }
 
 async fn handle_persistent_chat(
@@ -648,22 +823,19 @@ async fn handle_persistent_chat(
         let ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt)
             .await
             .unwrap_or_default();
-        let (author, final_text) = match st_bg
-            .models
-            .stream_chat(&model, &ctx, &turns, tx.clone())
-            .await
-        {
-            Ok((reply, used)) => (used, reply),
-            Err(err) => {
-                let err_txt = format!("[ERROR] {err}");
-                let _ = tx
-                    .send(StreamEvent::Delta {
-                        text: err_txt.clone(),
-                    })
-                    .await;
-                ("error".into(), err_txt)
-            }
-        };
+        let (author, final_text) =
+            match dispatch_chat(&st_bg, &model, &ctx, &turns, tx.clone()).await {
+                Ok((reply, used)) => (used, reply),
+                Err(err) => {
+                    let err_txt = format!("[ERROR] {err}");
+                    let _ = tx
+                        .send(StreamEvent::Delta {
+                            text: err_txt.clone(),
+                        })
+                        .await;
+                    ("error".into(), err_txt)
+                }
+            };
         let author = if author.is_empty() { model } else { author };
         let _ = store_message(
             &st_bg,

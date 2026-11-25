@@ -19,6 +19,7 @@ Examples:
 | `node.listen_addr` | gRPC listen address |
 | `node.http_addr` | HTTP UI. Default `0.0.0.0:8080` |
 | `node.master_url` | Node only. Hub gRPC URL, including the scheme (`http://hub.example:8443`) |
+| `node.master_http` | Node only. Hub HTTP URL. The node lists models from there and sends each chat completion as its own request. The hub does not queue those requests behind one another |
 | `node.hmac_secret_path` | Shared key file. The daemon hashes the file with BLAKE3 and uses that as the HMAC key. Copy the file, not a generated string |
 | `node.allowed_workspaces` | Absolute directories a signed `git apply` may touch |
 
@@ -30,6 +31,7 @@ Examples:
 | `storage.fallback_sqlite` | File path. The parent directory is created on startup |
 | `git.bare_repos_root` | Hub. Directory of bare repos. A repo containing `.xmeshignore` is skipped |
 | `git.watched_repos` | `{namespace, local_path, base_branch}`. Diffs are against that ref. The worktree is also scanned when a chat's namespace matches |
+| `git.project_roots` | `{path, visibility}`. Each immediate child directory becomes a channel and is readable in that chat. `private` keeps the thread on this node. `public` publishes the thread to the hub. A hub also turns each bare repo under `bare_repos_root` into a public channel |
 
 `deploy_pipelines.<name>` is `{workdir, command, use_bwrap, allow_network}`. `command` is an argv list. The UI sends the pipeline name; it does not send a shell string.
 
@@ -44,6 +46,7 @@ models:
   system_prompt: ""            # prepended to the coding preamble's retrieval block
   providers:
     - id: local
+      host: local              # label after the model name; empty uses id
       kind: auto               # openai | ollama | gemini | auto
       base_url: "http://127.0.0.1:11434/v1"
       api_key_env: ""          # name of an environment variable, never the key

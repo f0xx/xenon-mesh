@@ -46,7 +46,8 @@ The UI is `GET /`. JSON routes:
 | `GET` | `/api/health` | `{ok, mode, embeddings}` |
 | `GET` | `/api/config` | `{default_model, models[], mode, node_id, embeddings}` |
 | `GET` | `/api/status` | Index progress. `embeddings: false` means lexical retrieval |
-| `GET` | `/api/channels` | Channel objects. Includes hub public channels on a node, plus `general` |
+| `GET` | `/api/channels` | Channel objects. Includes hub public channels on a node, plus `general`. On a hub, each indexed bare repo is a public channel. On a node, each directory under `git.project_roots` is a channel |
+| `POST` | `/api/internal/complete` | One streamed completion. Used by nodes so the hub can reach every configured host. Each call is independent |
 | `POST` | `/api/channels` | `{name, visibility, namespace, context_namespaces}`. `public` is pushed to the hub |
 | `GET` | `/api/threads?channel=` | Thread ids. `main` is always present |
 | `POST` | `/api/threads/fork` | Copies head and tail into a new private thread |

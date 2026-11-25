@@ -272,6 +272,15 @@ async fn main() -> Result<()> {
                     s.phase = "indexing".into();
                     s.total_repos = total;
                 }
+                for (ns, _) in &repos {
+                    if storage::validate_channel_name(ns).is_err() {
+                        warn!("skipping channel for {ns}: unsupported name");
+                        continue;
+                    }
+                    if let Err(err) = db_bg.ensure_channel(ns, "public", "index").await {
+                        warn!("channel {ns}: {err}");
+                    }
+                }
                 for (idx, (ns, path)) in repos.into_iter().enumerate() {
                     {
                         let mut s = st_bg.write().await;
@@ -334,12 +343,91 @@ async fn main() -> Result<()> {
         }
     }
 
+    spawn_project_scan(cfg.clone(), db.clone(), status.clone());
+
     if !cfg.git.watched_repos.is_empty() {
         let (c, d, m) = (cfg.clone(), db.clone(), model_hub.clone());
         tokio::spawn(async move {
             if let Err(err) = watcher::run_node_watcher(c, d, m).await {
                 error!("watcher: {err}");
             }
+        });
+    }
+
+    fn spawn_project_scan(
+        cfg: Arc<AppConfig>,
+        db: Arc<Storage>,
+        status: Arc<tokio::sync::RwLock<web_ui::IndexStatus>>,
+    ) {
+        if cfg.git.project_roots.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut listed = Vec::new();
+            for root in &cfg.git.project_roots {
+                let path = root.path.clone();
+                let visibility = root.visibility.clone();
+                let dirs = tokio::task::spawn_blocking(move || {
+                    git_sync::discover_project_dirs(std::path::Path::new(&path))
+                })
+                .await
+                .unwrap_or_default();
+                for (name, dir) in dirs {
+                    listed.push((name, dir, visibility.clone()));
+                }
+            }
+            let total = listed.len();
+            {
+                let mut s = status.write().await;
+                s.busy = true;
+                s.phase = "indexing".into();
+                s.total_repos = total;
+                s.done_repos = 0;
+            }
+            info!("scanning {total} project directories");
+            for (idx, (name, dir, visibility)) in listed.into_iter().enumerate() {
+                {
+                    let mut s = status.write().await;
+                    s.done_repos = idx;
+                    s.current_repo = name.clone();
+                }
+                if storage::validate_channel_name(&name).is_err() {
+                    warn!("skipping project {name}: unsupported channel name");
+                    continue;
+                }
+                let vis = storage::normalize_visibility(&visibility).unwrap_or("private");
+                if let Err(err) = db
+                    .upsert_channel(&ChannelRow {
+                        name: name.clone(),
+                        visibility: vis.into(),
+                        namespace: name.clone(),
+                        origin_node: cfg.node.id.clone(),
+                        context_namespaces: vec![name.clone()],
+                        updated_at_ms: 0,
+                    })
+                    .await
+                {
+                    warn!("project channel {name}: {err}");
+                    continue;
+                }
+                let ns = name.clone();
+                let origin = cfg.node.id.clone();
+                let files =
+                    tokio::task::spawn_blocking(move || git_sync::scan_workdir(&dir, &ns, &origin))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                for e in files {
+                    let _ = db.upsert_proto(&e, false).await;
+                }
+            }
+            let mut s = status.write().await;
+            s.busy = false;
+            s.phase = "ready".into();
+            s.done_repos = total;
+            s.current_repo.clear();
+            info!("project scan complete ({total} directories)");
         });
     }
 

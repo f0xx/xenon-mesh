@@ -74,10 +74,13 @@ pub fn validate_channel_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 128 {
         bail!("channel name must be 1..=128 characters");
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
+    if name
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
     {
+        bail!("channel name contains an empty or relative path segment");
+    }
+    if name.chars().any(|c| c.is_control() || c == '\\') {
         bail!("channel name contains unsupported characters");
     }
     Ok(())
@@ -116,7 +119,7 @@ impl Storage {
         sqlx::any::install_default_drivers();
 
         if let Some(url) = primary.filter(|u| !u.trim().is_empty()) {
-            if let Ok(pool) = AnyPoolOptions::new().max_connections(10).connect(url).await {
+            if let Ok(pool) = AnyPoolOptions::new().max_connections(32).connect(url).await {
                 let kind = if url.starts_with("postgres") {
                     DbKind::Postgres
                 } else if url.starts_with("mysql") || url.starts_with("mariadb") {
@@ -125,6 +128,7 @@ impl Storage {
                     DbKind::Sqlite
                 };
                 let st = Self { pool, kind };
+                st.tune_pool().await;
                 st.init_schema().await?;
                 info!("Storage initialized on primary backend: {:?}", kind);
                 return Ok(st);
@@ -139,7 +143,7 @@ impl Storage {
         }
         let url = format!("sqlite://{sqlite_fallback}?mode=rwc");
         let pool = AnyPoolOptions::new()
-            .max_connections(5)
+            .max_connections(32)
             .connect(&url)
             .await
             .context("Failed to initialize fallback SQLite")?;
@@ -147,9 +151,22 @@ impl Storage {
             pool,
             kind: DbKind::Sqlite,
         };
+        st.tune_pool().await;
         st.init_schema().await?;
         info!("Storage initialized on fallback SQLite");
         Ok(st)
+    }
+
+    async fn tune_pool(&self) {
+        if self.kind != DbKind::Sqlite {
+            return;
+        }
+        let _ = sqlx::query("PRAGMA journal_mode=WAL")
+            .fetch_optional(&self.pool)
+            .await;
+        let _ = sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&self.pool)
+            .await;
     }
 
     pub async fn init_schema(&self) -> Result<()> {
@@ -764,6 +781,22 @@ impl Storage {
         }
     }
 
+    /// Insert a channel only when that name is not already stored.
+    pub async fn ensure_channel(&self, name: &str, visibility: &str, origin: &str) -> Result<()> {
+        if self.get_channel(name).await?.is_some() {
+            return Ok(());
+        }
+        self.upsert_channel(&ChannelRow {
+            name: name.to_string(),
+            visibility: visibility.to_string(),
+            namespace: name.to_string(),
+            origin_node: origin.to_string(),
+            context_namespaces: vec![name.to_string()],
+            updated_at_ms: 0,
+        })
+        .await
+    }
+
     pub async fn list_channel_rows(&self) -> Result<Vec<ChannelRow>> {
         let rows = sqlx::query(
             "SELECT name, visibility, namespace, origin_node, context_namespaces, updated_at_ms
@@ -815,7 +848,8 @@ mod tests {
     #[test]
     fn names_and_visibility() {
         assert!(validate_channel_name("proj/api").is_ok());
-        assert!(validate_channel_name("has space").is_err());
+        assert!(validate_channel_name("has space").is_ok());
+        assert!(validate_channel_name("a/../b").is_err());
         assert_eq!(normalize_visibility("Open").unwrap(), "public");
         assert_eq!(normalize_visibility("").unwrap(), "private");
     }

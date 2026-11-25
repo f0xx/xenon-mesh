@@ -374,7 +374,7 @@ window.onload = async () => {
     cfg.models.forEach(m => {
       const opt = document.createElement('option');
       if (typeof m === 'string') { opt.value = m; opt.textContent = m; }
-      else { opt.value = m.id; opt.textContent = `${m.model} · ${m.provider}`; }
+      else { opt.value = m.id; opt.textContent = m.label || `${m.model} : ${m.host || m.provider}`; }
       modelSelect.appendChild(opt);
     });
   }

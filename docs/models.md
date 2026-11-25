@@ -1,6 +1,6 @@
 # Model providers
 
-The daemon talks to models over HTTP. A provider is one endpoint plus the model names it serves. Chat requests name a model as `provider/model`. A bare model name is resolved by searching providers, then by using the first configured provider.
+The daemon talks to models over HTTP. A provider is one host plus the model names it serves. Chat requests name a model as `provider/model`. The same model name on two hosts stays two choices, labeled `model : host`. A bare name is used only when exactly one configured host serves it. A node with `node.master_http` takes the hub's catalog and sends each completion to the hub as its own request. The hub drops its provider lock before the HTTP call, so one slow host does not pause chats aimed at another host.
 
 ## DR-18. Kinds
 

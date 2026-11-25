@@ -57,7 +57,7 @@ pub struct ChatTurn {
 
 use serde::Deserialize;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StreamEvent {
     Status { text: String },
@@ -66,11 +66,13 @@ pub enum StreamEvent {
     Done { model_used: String },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelChoice {
     pub id: String,
     pub provider: String,
+    pub host: String,
     pub model: String,
+    pub label: String,
     pub kind: String,
     pub coding_rank: i32,
 }
@@ -91,6 +93,7 @@ pub struct ProbeModel {
 #[derive(Clone)]
 struct ProviderState {
     id: String,
+    host: String,
     kind: ConcreteKind,
     configured_kind: String,
     base_url: String,
@@ -210,18 +213,31 @@ fn legacy_gemini(g: &GeminiSection) -> ProviderConfig {
 
 pub fn providers_from_config(cfg: &AppConfig) -> Vec<ProviderConfig> {
     if !cfg.models.providers.is_empty() {
-        cfg.models.providers.clone()
-    } else {
-        vec![legacy_gemini(&cfg.gemini)]
+        return cfg.models.providers.clone();
     }
+    let routed = cfg
+        .node
+        .master_http
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty());
+    if routed {
+        return Vec::new();
+    }
+    vec![legacy_gemini(&cfg.gemini)]
 }
 
 impl ProviderState {
     fn from_config(cfg: &ProviderConfig) -> Self {
         let configured = cfg.kind.clone();
         let kind = parse_kind(&configured).unwrap_or(ConcreteKind::OpenAi);
+        let host = if cfg.host.trim().is_empty() {
+            cfg.id.clone()
+        } else {
+            cfg.host.clone()
+        };
         Self {
             id: cfg.id.clone(),
+            host,
             kind,
             configured_kind: configured,
             base_url: cfg.base_url.clone(),
@@ -234,6 +250,14 @@ impl ProviderState {
             openapi_url: cfg.openapi_url.clone(),
             discover: cfg.discover,
         }
+    }
+
+    fn host_label(&self) -> &str {
+        &self.host
+    }
+
+    fn serves(&self, model: &str) -> bool {
+        self.chat_model == model || self.models.iter().any(|m| m == model)
     }
 
     fn key(&self) -> String {
@@ -321,17 +345,33 @@ impl ModelHub {
                 names.insert(0, p.chat_model.clone());
             }
             for model in names {
+                let host = p.host_label().to_string();
                 out.push(ModelChoice {
                     id: format!("{}/{}", p.id, model),
                     provider: p.id.clone(),
+                    label: format!("{model} : {host}"),
+                    host,
                     kind: p.kind.as_str().into(),
                     coding_rank: coding_rank(&model),
                     model,
                 });
             }
         }
-        out.sort_by_key(|m| Reverse(m.coding_rank));
+        out.sort_by(|a, b| {
+            b.coding_rank
+                .cmp(&a.coding_rank)
+                .then_with(|| a.model.cmp(&b.model))
+                .then_with(|| a.host.cmp(&b.host))
+        });
         out
+    }
+
+    pub async fn has_local_providers(&self) -> bool {
+        !self.inner.read().await.providers.is_empty()
+    }
+
+    pub async fn owns_provider(&self, id: &str) -> bool {
+        !id.is_empty() && self.inner.read().await.providers.iter().any(|p| p.id == id)
     }
 
     pub async fn discover(&self) -> Result<()> {
@@ -405,13 +445,23 @@ impl ModelHub {
         }
         let (prov_id, model_name) = split_ref(&state.providers, requested);
         let provider = if prov_id.is_empty() {
-            state
+            let hits: Vec<_> = state
                 .providers
                 .iter()
-                .find(|p| p.chat_model == model_name || p.models.iter().any(|m| m == model_name))
-                .or_else(|| state.providers.first())
-                .context("no model providers configured")?
-                .clone()
+                .filter(|p| p.serves(model_name))
+                .collect();
+            match hits.len() {
+                1 => hits[0].clone(),
+                n if n > 1 => {
+                    let hosts: Vec<_> = hits.iter().map(|p| p.host_label()).collect();
+                    bail!(
+                        "model '{model_name}' is served by more than one host ({}); choose host/model",
+                        hosts.join(", ")
+                    );
+                }
+                _ if state.providers.len() == 1 => state.providers[0].clone(),
+                _ => bail!("no model providers configured"),
+            }
         } else {
             state
                 .providers
@@ -520,6 +570,8 @@ impl ModelHub {
         turns: &[ChatTurn],
         tx: Option<mpsc::Sender<StreamEvent>>,
     ) -> Result<(String, String)> {
+        // Snapshot provider state and drop the lock before any HTTP await.
+        // Concurrent chats must not queue behind each other here.
         let state = self.inner.read().await;
         let (provider, model) = Self::resolve(&state, model_ref)?;
         let extra = state.system_prompt.clone();
@@ -535,7 +587,7 @@ impl ModelHub {
             if let Some(tx) = &tx {
                 let _ = tx
                     .send(StreamEvent::Status {
-                        text: format!("Awaiting {}/{m}...", provider.id),
+                        text: format!("Awaiting {m} : {}...", provider.host_label()),
                     })
                     .await;
             }
@@ -767,6 +819,147 @@ gemini:
         let choices = hub.model_choices().await;
         assert_eq!(choices.len(), 2);
         assert!(choices.iter().all(|c| c.kind == "gemini"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_cfg(body: &str) -> (std::path::PathBuf, AppConfig) {
+        let dir = std::env::temp_dir().join(format!(
+            "xmesh-models-{}-{}",
+            std::process::id(),
+            now_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.yaml");
+        std::fs::write(&path, body).unwrap();
+        let cfg = AppConfig::load(path.to_str().unwrap(), "/no/such/local.yaml").unwrap();
+        (dir, cfg)
+    }
+
+    fn now_token() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    #[tokio::test]
+    async fn same_model_name_on_two_hosts_stays_two_choices() {
+        let (dir, cfg) = write_cfg(
+            r#"
+node:
+  id: hub
+  mode: master
+  listen_addr: "127.0.0.1:1"
+  hmac_secret_path: "/tmp/hmac"
+storage:
+  primary_url: null
+  fallback_sqlite: "/tmp/m.db"
+git:
+  bare_repos_root: null
+models:
+  providers:
+    - id: gpu-a
+      host: gpu-a
+      kind: openai
+      base_url: "http://127.0.0.1:9/v1"
+      chat_model: coder
+      models: ["coder"]
+      discover: false
+    - id: gpu-b
+      host: gpu-b
+      kind: openai
+      base_url: "http://127.0.0.1:9/v1"
+      chat_model: coder
+      models: ["coder"]
+      discover: false
+"#,
+        );
+        let hub = ModelHub::from_config(&cfg).unwrap();
+        let choices = hub.model_choices().await;
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].label, "coder : gpu-a");
+        assert_eq!(choices[1].label, "coder : gpu-b");
+        assert_ne!(choices[0].id, choices[1].id);
+        let err = hub
+            .generate("coder", "", &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gpu-a") && err.contains("gpu-b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_hosts_are_awaited_together() {
+        use axum::extract::State;
+        use axum::Json;
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|State(gate): State<Arc<tokio::sync::Barrier>>| async move {
+                    gate.wait().await;
+                    Json(serde_json::json!({
+                        "choices": [{ "message": { "content": "pong" } }]
+                    }))
+                }),
+            )
+            .with_state(gate);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let body = format!(
+            r#"
+node:
+  id: hub
+  mode: master
+  listen_addr: "127.0.0.1:1"
+  hmac_secret_path: "/tmp/hmac"
+storage:
+  primary_url: null
+  fallback_sqlite: "/tmp/m.db"
+git:
+  bare_repos_root: null
+models:
+  providers:
+    - id: gpu-a
+      host: gpu-a
+      kind: openai
+      base_url: "http://{addr}/v1"
+      chat_model: coder
+      models: ["coder"]
+      discover: false
+      timeout_secs: 2
+    - id: gpu-b
+      host: gpu-b
+      kind: openai
+      base_url: "http://{addr}/v1"
+      chat_model: coder
+      models: ["coder"]
+      discover: false
+      timeout_secs: 2
+"#
+        );
+        let (dir, cfg) = write_cfg(&body);
+        let hub = ModelHub::from_config(&cfg).unwrap();
+        let turns = [ChatTurn {
+            role: "user".into(),
+            text: "ping".into(),
+            attachments: vec![],
+        }];
+        let joined = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                hub.generate("gpu-a/coder", "", &turns),
+                hub.generate("gpu-b/coder", "", &turns),
+            )
+        })
+        .await
+        .expect("hosts were awaited one after another");
+        assert_eq!(joined.0.unwrap(), "pong");
+        assert_eq!(joined.1.unwrap(), "pong");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

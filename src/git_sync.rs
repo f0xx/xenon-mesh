@@ -126,6 +126,27 @@ pub fn extract_local_diff(
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// Immediate child directories of a shared working tree.
+pub fn discover_project_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.is_empty() {
+            continue;
+        }
+        found.push((name, path));
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 pub fn discover_bare_repos(root: &Path) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
     let mut visited = HashSet::new();

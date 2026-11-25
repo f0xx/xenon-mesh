@@ -39,6 +39,10 @@ pub struct NodeSection {
     #[serde(default = "default_http_addr")]
     pub http_addr: String,
     pub master_url: Option<String>,
+    /// Hub HTTP UI, used by a node to list models and to run a completion.
+    /// Inference is a separate request per chat, not a process-wide queue.
+    #[serde(default)]
+    pub master_http: Option<String>,
     pub hmac_secret_path: String,
     #[serde(default)]
     pub allowed_workspaces: Vec<String>,
@@ -55,6 +59,22 @@ pub struct GitSection {
     pub bare_repos_root: Option<String>,
     #[serde(default)]
     pub watched_repos: Vec<WatchedRepo>,
+    /// Working trees to show as channels and to read during chat.
+    /// Each immediate child directory is one project.
+    #[serde(default)]
+    pub project_roots: Vec<ProjectRoot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRoot {
+    pub path: String,
+    /// `public` publishes the chat to the hub. `private` keeps it on this node.
+    #[serde(default = "default_project_visibility")]
+    pub visibility: String,
+}
+
+fn default_project_visibility() -> String {
+    "private".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +121,10 @@ impl Default for GeminiSection {
 #[serde(default)]
 pub struct ProviderConfig {
     pub id: String,
+    /// Shown after the model name when two hosts serve the same name.
+    /// Empty uses `id`.
+    #[serde(default)]
+    pub host: String,
     pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
@@ -117,6 +141,7 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             id: String::new(),
+            host: String::new(),
             kind: "openai".into(),
             base_url: String::new(),
             api_key_env: String::new(),
