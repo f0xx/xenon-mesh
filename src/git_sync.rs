@@ -3,11 +3,28 @@ use anyhow::Result;
 use git2::{DiffOptions, Repository};
 use std::path::Path;
 
+
 pub fn scan_bare_repo(bare_path: &Path, namespace: &str) -> Result<Vec<ContextEntry>> {
     if bare_path.join(".xmeshignore").exists() {
         return Ok(vec![]);
     }
+
+    let check = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(bare_path)
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .output()?;
+
+    if !check.status.success() {
+        let err_msg = String::from_utf8_lossy(&check.stderr);
+        anyhow::bail!(
+            "Skipping corrupt/empty repo '{namespace}' (run `git --git-dir={bare_path:?} fsck --full`): {}",
+            err_msg.trim()
+        );
+    }
+
     let repo = Repository::open_bare(bare_path)?;
+
     let head_tree = repo.head()?.peel_to_tree()?;
     let mut entries = Vec::new();
 

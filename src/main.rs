@@ -116,7 +116,8 @@ async fn main() -> Result<()> {
                         let scan_fut = tokio::task::spawn_blocking(move || git_sync::scan_bare_repo(&path, &ns_c));
                         let entries = match tokio::time::timeout(std::time::Duration::from_secs(20), scan_fut).await {
                             Ok(Ok(Ok(list))) => list,
-                            _ => { warn!("Skipped or timed out repo: {}", ns); continue; }
+                            Ok(Ok(Err(e))) => { warn!("{e}"); continue; }
+                            _ => { warn!("Timed out scanning repo: {}", ns); continue; }
                         };
 
                         let mut embed_ok = true;
