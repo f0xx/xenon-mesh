@@ -18,6 +18,9 @@ Examples:
 | `node.mode` | `master` or `node` |
 | `node.listen_addr` | gRPC listen address |
 | `node.http_addr` | HTTP UI. Default `0.0.0.0:8080` |
+| `node.https_addr` | Optional TLS listener for the same UI, for example `0.0.0.0:8448`. Do not reuse the gRPC port |
+| `node.tls_cert_path` | PEM certificate. A self-signed certificate is enough once the browser is told to allow it |
+| `node.tls_key_path` | PEM private key for that certificate |
 | `node.master_url` | Node only. Hub gRPC URL, including the scheme (`http://hub.example:8443`) |
 | `node.master_http` | Node only. Hub HTTP URL. The node lists models from there and sends each chat completion as its own request. The hub does not queue those requests behind one another |
 | `node.hmac_secret_path` | Shared key file. The daemon hashes the file with BLAKE3 and uses that as the HMAC key. Copy the file, not a generated string |

@@ -14,5 +14,9 @@ This directory is the design and operator specification:
 | [models.md](models.md) | Gemini, OpenAI-compatible endpoints, and Ollama |
 | [data-and-api.md](data-and-api.md) | Tables, gRPC, and HTTP |
 | [operations.md](operations.md) | Build, install, join a hub, back up, test |
+| [security.md](security.md) | Trust boundary, channels, audit, and what the daemon does not authenticate |
+| [integrations.md](integrations.md) | Proposed company tools around the chat, not shipped adapters |
+| [remote-access.md](remote-access.md) | Reach a hub over SSH local forwards |
+| [roadmap.md](roadmap.md) | What is in the tree and what comes later |
 
 Read [purpose.md](purpose.md) first if you are changing behavior. Read [operations.md](operations.md) if you are installing a machine.

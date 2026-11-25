@@ -38,6 +38,15 @@ pub struct NodeSection {
     pub listen_addr: String,
     #[serde(default = "default_http_addr")]
     pub http_addr: String,
+    /// Optional second listener for the same UI over TLS.
+    /// Self-signed certificates are enough for a browser secure context
+    /// after the operator allows the certificate.
+    #[serde(default)]
+    pub https_addr: Option<String>,
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
     pub master_url: Option<String>,
     /// Hub HTTP UI, used by a node to list models and to run a completion.
     /// Inference is a separate request per chat, not a process-wide queue.

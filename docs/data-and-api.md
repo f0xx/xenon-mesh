@@ -46,7 +46,11 @@ The UI is `GET /`. JSON routes:
 | `GET` | `/api/health` | `{ok, mode, embeddings}` |
 | `GET` | `/api/config` | `{default_model, models[], mode, node_id, embeddings}` |
 | `GET` | `/api/status` | Index progress. `embeddings: false` means lexical retrieval |
-| `GET` | `/api/channels` | Channel objects. Includes hub public channels on a node, plus `general`. On a hub, each indexed bare repo is a public channel. On a node, each directory under `git.project_roots` is a channel |
+| `GET` | `/api/channels` | Sidebar rows. Group, pin, mute, archive, close, read cursor, and unread count are per node. On a hub, each indexed bare repo is a public channel. On a node, each directory under `git.project_roots` is a channel, plus hub channels this node is allowed to see |
+| `POST` | `/api/channel-state` | Update that node's pin, mute, archive, close, or read cursor. `# general` rejects archive and close |
+| `POST` | `/api/presence` | Which channel this node's UI is looking at. A model reply is unread when the UI is elsewhere or the page is hidden |
+| `POST` | `/api/share` | Invite node ids into a private channel. The hub stores the transcript and the membership |
+| `GET` | `/api/audit` | Hub log of public and shared activity. A node proxies this from the hub |
 | `POST` | `/api/internal/complete` | One streamed completion. Used by nodes so the hub can reach every configured host. Each call is independent |
 | `POST` | `/api/channels` | `{name, visibility, namespace, context_namespaces}`. `public` is pushed to the hub |
 | `GET` | `/api/threads?channel=` | Thread ids. `main` is always present |

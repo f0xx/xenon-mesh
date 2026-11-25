@@ -5,8 +5,19 @@
 <style>
   body { margin:0; font:13px/1.45 monospace; background:#111317; color:#e2e8f0; display:flex; height:100vh; overflow:hidden; }
   aside { width:220px; min-width:140px; max-width:450px; background:#181b20; padding:12px; overflow-y:auto; flex-shrink:0; }
-  aside .item { padding:5px 8px; cursor:pointer; border-radius:4px; margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  aside .item { padding:5px 8px; cursor:pointer; border-radius:4px; margin-bottom:2px; display:flex; align-items:center; gap:6px; }
   aside .item.active, aside .item:hover { background:#2b6cb0; color:#fff; }
+  aside .item.muted { opacity:.45; }
+  aside .item .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  aside .item .nm.pub { font-weight:700; }
+  aside .item.unread .nm { font-weight:700; }
+  .badge { background:#e53e3e; color:#fff; border-radius:10px; padding:0 6px; font-size:11px; }
+  .sec { color:#a0aec0; font-size:11px; letter-spacing:.04em; margin:10px 4px 4px; cursor:pointer; }
+  #chFilter { width:100%; box-sizing:border-box; margin:6px 0; }
+  #ctx { position:fixed; z-index:20; background:#1a202c; border:1px solid #4a5568; border-radius:6px; min-width:180px; padding:4px; box-shadow:0 8px 24px #0008; }
+  #ctx button { display:block; width:100%; text-align:left; background:transparent; color:#e2e8f0; }
+  #ctx button:hover { background:#2b6cb0; }
+  #audit { display:none; position:fixed; right:16px; bottom:16px; width:420px; max-height:50vh; overflow:auto; background:#0d1117; border:1px solid #2d3748; padding:10px; z-index:15; }
   .resizer { width:4px; background:#2d3748; cursor:col-resize; flex-shrink:0; transition:background .15s; }
   .resizer:hover { background:#4299e1; }
   main { flex:1; display:flex; flex-direction:column; min-width:260px; }
@@ -34,7 +45,8 @@
 <body>
 <aside id="leftBar">
   <b data-i18n="channels">CHANNELS</b> <button style="padding:1px 6px;float:right" onclick="newChannel()">+</button>
-  <hr style="border-color:#2d3748"><div id="chList"></div>
+  <input id="chFilter" placeholder="Filter" oninput="renderChannels()">
+  <div id="chList"></div>
   <br><b data-i18n="threads">THREADS</b>
   <span style="float:right">
     <button style="padding:1px 6px" onclick="forkThread()">Fork</button>
@@ -51,6 +63,8 @@
     </div>
     <div style="display:flex;gap:6px;flex-shrink:0">
       <select id="modelSelect"><option value="gemini-2.5-flash">gemini-2.5-flash</option><option value="gemini-2.5-pro">gemini-2.5-pro</option></select>
+      <button id="bell" style="background:#4a5568" title="Desktop notifications need HTTPS or localhost" onclick="enableNotes()">Bell</button>
+      <button style="background:#4a5568" onclick="toggleAudit()">Log</button>
       <select id="langSelect" onchange="setLang(this.value)"><option value="en">EN</option><option value="ru">RU</option></select>
     </div>
   </div>
@@ -81,6 +95,8 @@
   <div id="diffView" data-i18n="awaitDiff">Awaiting diff...</div>
   <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()" data-i18n="approve">Approve & Execute</button>
 </div>
+<div id="ctx" hidden></div>
+<div id="audit"></div>
 <script>
 const I18N = {
   en: { channels:'CHANNELS', threads:'THREADS', send:'Send', promptPh:'Message to thread...', memTitle:'CONTEXT & MEMORY',
@@ -92,7 +108,8 @@ const I18N = {
         deployTitle:'ИНСПЕКТОР DIFF И ДЕПЛОЙ', noDiff:'Нет diff', paste:'Вставить', awaitDiff:'Ожидание патча...',
         approve:'Утвердить и выполнить', newCh:'Имя нового канала:', newTh:'Имя нового треда:', noMem:'Нет закрепленных записей', visPh:'Видимость: private или public' }
 };
-let lang = localStorage.lang || 'en', ch = 'general', thread = 'main', currentDiff = '', chMeta = {};
+let lang = localStorage.lang || 'en', ch = 'general', thread = 'main', currentDiff = '', chMeta = {}, channelRows = [];
+let showArchived = false, showClosed = false, ctxName = '';
 function t(k) { return (I18N[lang] || I18N.en)[k] || k; }
 function setLang(l) {
   lang = l; localStorage.lang = l;
@@ -111,18 +128,109 @@ function initResize(bar, target, key, invert) {
 function channelOf(raw) {
   return typeof raw === 'string' ? { name: raw, visibility: 'public' } : raw;
 }
+function prefix(c) {
+  if (c.group === 'general' || c.visibility === 'public') return '# ';
+  if (c.visibility === 'shared') return '~ ';
+  return '· ';
+}
+function renderChannels() {
+  const q = (chFilter.value || '').trim().toLowerCase();
+  chList.innerHTML = '';
+  const groups = [
+    ['', rows => rows.filter(c => c.group === 'general')],
+    ['Channels', rows => rows.filter(c => c.group === 'public' && !c.archived && !c.closed)],
+    ['Private', rows => rows.filter(c => c.group === 'private' && !c.archived && !c.closed)],
+    ['Shared', rows => rows.filter(c => c.group === 'other' && !c.archived && !c.closed)],
+  ];
+  const draw = (title, rows) => {
+    const shown = rows.filter(c => !q || c.name.toLowerCase().includes(q));
+    if (!shown.length) return;
+    if (title) {
+      const h = document.createElement('div');
+      h.className = 'sec';
+      h.textContent = title;
+      chList.appendChild(h);
+    }
+    shown.forEach(c => chList.appendChild(channelRow(c)));
+  };
+  groups.forEach(([title, pick]) => draw(title, pick(channelRows)));
+  const arch = channelRows.filter(c => c.archived);
+  const closed = channelRows.filter(c => c.closed && !c.archived);
+  const fold = (title, rows, open, toggle) => {
+    if (!rows.length) return;
+    const h = document.createElement('div');
+    h.className = 'sec';
+    h.textContent = `${open ? '▾' : '▸'} ${title} (${rows.length})`;
+    h.onclick = toggle;
+    chList.appendChild(h);
+    if (open) rows.filter(c => !q || c.name.toLowerCase().includes(q)).forEach(c => chList.appendChild(channelRow(c)));
+  };
+  fold('Archived', arch, showArchived, () => { showArchived = !showArchived; renderChannels(); });
+  fold('Closed', closed, showClosed, () => { showClosed = !showClosed; renderChannels(); });
+}
+function channelRow(c) {
+  const d = document.createElement('div');
+  d.className = 'item' + (c.name === ch ? ' active' : '') + (c.muted ? ' muted' : '') + (!c.muted && c.unread_count > 0 ? ' unread' : '');
+  const nm = document.createElement('span');
+  nm.className = 'nm' + ((c.group === 'general' || c.visibility === 'public') ? ' pub' : '');
+  nm.textContent = prefix(c) + c.name;
+  d.appendChild(nm);
+  if (!c.muted && c.unread_count > 0) {
+    const b = document.createElement('span');
+    b.className = 'badge';
+    b.textContent = c.unread_count > 99 ? '99+' : String(c.unread_count);
+    d.appendChild(b);
+  }
+  d.title = `${c.name} (${c.visibility || 'private'})\nread ${c.read_count || 0} · unread ${c.unread_count || 0}`;
+  d.onclick = () => setCh(c.name);
+  d.oncontextmenu = ev => openMenu(ev, c);
+  return d;
+}
+function openMenu(ev, c) {
+  ev.preventDefault();
+  ctxName = c.name;
+  const general = c.name === 'general';
+  const items = [
+    [c.pinned ? 'Unpin' : 'Pin', () => pref({pinned: !c.pinned})],
+    [c.muted ? 'Unmute' : 'Mute', () => pref({muted: !c.muted})],
+    ['Mark read', () => pref({mark_read: true})],
+  ];
+  if (!general) {
+    items.push([c.archived ? 'Unarchive' : 'Archive', () => pref({archived: !c.archived})]);
+    items.push([c.closed ? 'Reopen' : 'Close', () => pref({closed: !c.closed})]);
+    if (c.visibility !== 'public') items.push(['Invite nodes…', () => shareChannel(c.name)]);
+  }
+  ctx.innerHTML = '';
+  items.forEach(([label, fn]) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { ctx.hidden = true; fn(); };
+    ctx.appendChild(b);
+  });
+  ctx.hidden = false;
+  ctx.style.left = Math.min(ev.clientX, window.innerWidth - 200) + 'px';
+  ctx.style.top = Math.min(ev.clientY, window.innerHeight - 220) + 'px';
+}
+document.addEventListener('click', () => { ctx.hidden = true; });
+async function pref(patch) {
+  await fetch('/api/channel-state', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: ctxName, ...patch}) });
+  await refreshChannels();
+}
+async function shareChannel(name) {
+  const raw = window.prompt('Invite node ids, comma separated');
+  if (!raw) return;
+  const members = raw.split(',').map(s => s.trim()).filter(Boolean);
+  const r = await fetch('/api/share', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel:name, origin_node:'', members, messages:[], entries:[]}) });
+  if (!r.ok) { window.alert('Share failed'); return; }
+  await refreshChannels();
+}
 async function refreshChannels() {
   const list = (await (await fetch('/api/channels')).json()).map(channelOf);
+  channelRows = list;
   chMeta = {};
   list.forEach(c => { chMeta[c.name] = c; });
-  if (!chMeta[ch]) chMeta[ch] = { name: ch, visibility: 'private' };
-  chList.innerHTML = '';
-  Object.values(chMeta).sort((a, b) => a.name.localeCompare(b.name)).forEach(c => {
-    const d = document.createElement('div'); d.className = 'item' + (c.name === ch ? ' active' : '');
-    d.textContent = `${c.visibility === 'public' ? '# ' : '· '}${c.name}`;
-    d.title = `${c.name} (${c.visibility || 'private'})`;
-    d.onclick = () => setCh(c.name); chList.appendChild(d);
-  });
+  if (!chMeta[ch]) chMeta[ch] = { name: ch, visibility: 'private', group: 'private' };
+  if (ctx.hidden) renderChannels();
 }
 async function refreshThreads() {
   const list = await (await fetch(`/api/threads?channel=${encodeURIComponent(ch)}`)).json(); threadList.innerHTML = '';
@@ -144,7 +252,37 @@ async function refreshMemory() {
     r.append(l, x); memList.appendChild(r);
   });
 }
-async function setCh(c) { ch = c; thread = 'main'; await refreshChannels(); await refreshThreads(); await refreshMemory(); await loadHistory(); }
+async function setPresence(viewing) {
+  await fetch('/api/presence', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel: ch, viewing}) });
+}
+async function setCh(c) {
+  ch = c; thread = 'main';
+  await setPresence(document.visibilityState === 'visible');
+  await fetch('/api/channel-state', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:c, mark_read:true, bump_use:true}) });
+  await refreshChannels(); await refreshThreads(); await refreshMemory(); await loadHistory();
+}
+function notifyAway(channel, text) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  if (document.visibilityState === 'visible' && ch === channel) return;
+  const body = (text || 'New reply').slice(0, 180);
+  new Notification('#' + channel, { body });
+}
+async function enableNotes() {
+  if (!window.isSecureContext) {
+    window.alert('Notifications need a secure page. Open the https:// address and allow the certificate, or use localhost.');
+    return;
+  }
+  if (!('Notification' in window)) return;
+  await Notification.requestPermission();
+}
+async function toggleAudit() {
+  if (audit.style.display === 'block') { audit.style.display = 'none'; return; }
+  const rows = await (await fetch('/api/audit')).json();
+  audit.innerHTML = '<b>Hub log</b><div style="color:#a0aec0;margin:4px 0 8px">Public and shared activity stored on the hub.</div>' +
+    (rows || []).map(r => `<div style="margin-bottom:6px"><b>${escHtml(r.action)}</b> ${escHtml(r.node_id)} · ${escHtml(r.channel)}<br><span style="color:#a0aec0">${escHtml((r.detail || '').slice(0, 220))}</span></div>`).join('');
+  audit.style.display = 'block';
+}
+document.addEventListener('visibilitychange', () => { setPresence(document.visibilityState === 'visible'); });
 async function newChannel() {
   const n = window.prompt(t('newCh')); if (!n) return;
   const vis = (window.prompt(t('visPh'), 'private') || 'private').trim().toLowerCase();
@@ -298,9 +436,10 @@ async function send() {
   card.append(hdr, statusLine, thoughtBox, body);
   log.appendChild(card); log.scrollTop = log.scrollHeight;
 
+  const sentOn = ch;
   const resp = await fetch('/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ channel: ch, thread, prompt: p || 'Analyze attached files', model: modelSelect.value, attachments: atts })
+    body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: modelSelect.value, attachments: atts })
   });
   if (!resp.ok || !resp.body) {
     statusLine.style.display = 'none';
@@ -335,6 +474,8 @@ async function send() {
         hdr.textContent = `[${ev.model_used}]`;
         statusLine.style.display = 'none';
         attachDiffButton(card, fullText);
+        if (ch !== sentOn || document.visibilityState !== 'visible') notifyAway(sentOn, fullText);
+        refreshChannels();
       }
       log.scrollTop = log.scrollHeight;
     }
@@ -380,7 +521,8 @@ window.onload = async () => {
   }
   if (cfg.default_model) modelSelect.value = cfg.default_model;
   document.getElementById('composer').addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
   });
   await setCh('general');
 };
@@ -391,12 +533,12 @@ setInterval(async () => {
     if (s.busy) {
       statusBadge.style.color = '#ecc94b';
       statusBadge.textContent = `${spin[si++%spin.length]} ${s.done_repos}/${s.total_repos}: ${s.current_repo} (${s.indexed_files})`;
-      if (s.done_repos !== lastDone) { lastDone = s.done_repos; refreshChannels(); }
+      refreshChannels();
     } else {
       const embed = s.embeddings ? '' : ' · lexical';
       statusBadge.style.color = '#68d391';
       statusBadge.textContent = `● ready${s.mode ? ' ' + s.mode : ''} (${s.total_repos || 0})${embed}`;
-      if (lastDone !== -2) { lastDone = -2; refreshChannels(); }
+      refreshChannels();
     }
   } catch { statusBadge.style.color = '#fc8181'; statusBadge.textContent = '● offline'; }
 }, 2000);

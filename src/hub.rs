@@ -13,9 +13,17 @@ pub async fn list_public(master_url: &str) -> Result<Vec<ChannelRecord>> {
         .channels)
 }
 
-pub async fn append_public(master_url: &str, msg: SessionMessage) -> Result<SessionMessage> {
+pub async fn append_public(
+    master_url: &str,
+    msg: SessionMessage,
+    node_id: &str,
+) -> Result<SessionMessage> {
     let mut client = ClusterServiceClient::connect(master_url.to_string()).await?;
-    Ok(client.append_message(msg).await?.into_inner())
+    let mut req = tonic::Request::new(msg);
+    if let Ok(value) = node_id.parse() {
+        req.metadata_mut().insert("x-xmesh-node", value);
+    }
+    Ok(client.append_message(req).await?.into_inner())
 }
 
 pub async fn query_namespace(master_url: &str, namespace: &str) -> Result<SyncEnvelope> {

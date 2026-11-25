@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{any::AnyPoolOptions, AnyPool, Row};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -28,7 +28,67 @@ pub struct MemoryItem {
     pub content: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
+pub struct ChannelPref {
+    pub channel_name: String,
+    pub pinned: bool,
+    pub muted: bool,
+    pub archived: bool,
+    pub closed: bool,
+    pub last_read_seq: i64,
+    pub use_count: i64,
+}
+
+impl ChannelPref {
+    pub fn bare(name: &str) -> Self {
+        Self {
+            channel_name: name.to_string(),
+            pinned: false,
+            muted: false,
+            archived: false,
+            closed: false,
+            last_read_seq: 0,
+            use_count: 0,
+        }
+    }
+}
+
+fn sql_flag(row: &sqlx::any::AnyRow, name: &str) -> bool {
+    row.try_get::<i64, _>(name)
+        .or_else(|_| row.try_get::<i32, _>(name).map(|v| v as i64))
+        .unwrap_or(0)
+        != 0
+}
+
+fn sql_i64(row: &sqlx::any::AnyRow, name: &str) -> i64 {
+    row.try_get::<i64, _>(name)
+        .or_else(|_| row.try_get::<i32, _>(name).map(|v| v as i64))
+        .unwrap_or(0)
+}
+
+fn pref_from_row(row: &sqlx::any::AnyRow) -> ChannelPref {
+    ChannelPref {
+        channel_name: row.get("channel_name"),
+        pinned: sql_flag(row, "pinned"),
+        muted: sql_flag(row, "muted"),
+        archived: sql_flag(row, "archived"),
+        closed: sql_flag(row, "closed"),
+        last_read_seq: sql_i64(row, "last_read_seq"),
+        use_count: sql_i64(row, "use_count"),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub node_id: String,
+    pub action: String,
+    pub channel: String,
+    pub thread: String,
+    pub detail: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelRow {
     pub name: String,
     pub visibility: String,
@@ -89,9 +149,61 @@ pub fn validate_channel_name(name: &str) -> Result<()> {
 pub fn normalize_visibility(value: &str) -> Result<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "public" | "open" => Ok("public"),
+        "shared" => Ok("shared"),
         "" | "private" => Ok("private"),
-        _ => bail!("visibility must be public or private"),
+        _ => bail!("visibility must be public, private, or shared"),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelGroup {
+    General,
+    Public,
+    Private,
+    Other,
+}
+
+pub fn channel_group(name: &str, visibility: &str) -> ChannelGroup {
+    if name == "general" {
+        ChannelGroup::General
+    } else if visibility == "public" {
+        ChannelGroup::Public
+    } else if visibility == "private" {
+        ChannelGroup::Private
+    } else {
+        ChannelGroup::Other
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SidebarKey {
+    pub group: ChannelGroup,
+    pub pinned: bool,
+    pub use_count: i64,
+    pub name: String,
+}
+
+/// Pinned channels stay at the top of their group and are ordered Z to A.
+/// Everything else is most-used first, then Z to A.
+pub fn cmp_sidebar(a: &SidebarKey, b: &SidebarKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let group = a.group.cmp(&b.group);
+    if group != Equal {
+        return group;
+    }
+    let pin = b.pinned.cmp(&a.pinned);
+    if pin != Equal {
+        return pin;
+    }
+    if a.pinned {
+        return b.name.to_lowercase().cmp(&a.name.to_lowercase());
+    }
+    let used = b.use_count.cmp(&a.use_count);
+    if used != Equal {
+        return used;
+    }
+    b.name.to_lowercase().cmp(&a.name.to_lowercase())
 }
 
 fn message_id(channel: &str, thread: &str, seq: u64) -> String {
@@ -252,6 +364,47 @@ impl Storage {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS channel_prefs (
+                channel_name VARCHAR(128) PRIMARY KEY,
+                pinned INTEGER NOT NULL,
+                muted INTEGER NOT NULL,
+                archived INTEGER NOT NULL,
+                closed INTEGER NOT NULL,
+                last_read_seq BIGINT NOT NULL,
+                use_count BIGINT NOT NULL,
+                updated_at_ms BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS channel_members (
+                channel_name VARCHAR(128) NOT NULL,
+                node_id VARCHAR(128) NOT NULL,
+                role VARCHAR(16) NOT NULL,
+                state VARCHAR(16) NOT NULL,
+                PRIMARY KEY (channel_name, node_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS audit_events (
+                id VARCHAR(64) PRIMARY KEY,
+                node_id VARCHAR(128) NOT NULL,
+                action VARCHAR(64) NOT NULL,
+                channel_name VARCHAR(128) NOT NULL,
+                thread_id VARCHAR(128) NOT NULL,
+                detail TEXT NOT NULL,
+                created_at_ms BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_events(created_at_ms)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -390,6 +543,20 @@ impl Storage {
         namespace: Option<&str>,
         include_private: bool,
     ) -> Result<pb::SyncEnvelope> {
+        if !include_private {
+            if let Some(ns) = namespace {
+                if let Some(ch) = self.get_channel(ns).await? {
+                    if ch.visibility != "public" {
+                        return Ok(pb::SyncEnvelope {
+                            schema_version: 2,
+                            source_node: node_name.to_string(),
+                            timestamp_ms: now_ms(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
         Ok(pb::SyncEnvelope {
             schema_version: 2,
             source_node: node_name.to_string(),
@@ -816,6 +983,205 @@ impl Storage {
             .collect())
     }
 
+    pub async fn load_channel_messages(&self, channel: &str) -> Result<Vec<pb::SessionMessage>> {
+        self.load_messages(Some(channel), true).await
+    }
+
+    pub async fn max_seq(&self, channel: &str) -> Result<i64> {
+        let sql =
+            self.q("SELECT COALESCE(MAX(seq), 0) AS s FROM session_messages WHERE channel_id = $1");
+        let row = sqlx::query(&sql)
+            .bind(channel)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("s").unwrap_or(0))
+    }
+
+    pub async fn get_pref(&self, name: &str) -> Result<ChannelPref> {
+        let sql = self.q(
+            "SELECT channel_name, pinned, muted, archived, closed, last_read_seq, use_count
+             FROM channel_prefs WHERE channel_name = $1",
+        );
+        if let Some(row) = sqlx::query(&sql)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            return Ok(pref_from_row(&row));
+        }
+        Ok(ChannelPref::bare(name))
+    }
+
+    pub async fn save_pref(&self, pref: &ChannelPref) -> Result<()> {
+        if pref.channel_name == "general" && (pref.archived || pref.closed) {
+            bail!("general cannot be archived or closed");
+        }
+        let sql = self.q("DELETE FROM channel_prefs WHERE channel_name = $1");
+        sqlx::query(&sql)
+            .bind(&pref.channel_name)
+            .execute(&self.pool)
+            .await?;
+        let sql = self.q(
+            "INSERT INTO channel_prefs
+             (channel_name, pinned, muted, archived, closed, last_read_seq, use_count, updated_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        );
+        sqlx::query(&sql)
+            .bind(&pref.channel_name)
+            .bind(i32::from(pref.pinned))
+            .bind(i32::from(pref.muted))
+            .bind(i32::from(pref.archived))
+            .bind(i32::from(pref.closed))
+            .bind(pref.last_read_seq)
+            .bind(pref.use_count)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_read(&self, name: &str, seq: i64) -> Result<()> {
+        let mut pref = self.get_pref(name).await?;
+        if seq > pref.last_read_seq {
+            pref.last_read_seq = seq;
+        }
+        self.save_pref(&pref).await
+    }
+
+    pub async fn set_members(
+        &self,
+        channel: &str,
+        members: &[(String, String, String)],
+    ) -> Result<()> {
+        let sql = self.q("DELETE FROM channel_members WHERE channel_name = $1");
+        sqlx::query(&sql).bind(channel).execute(&self.pool).await?;
+        for (node_id, role, state) in members {
+            let sql = self.q(
+                "INSERT INTO channel_members (channel_name, node_id, role, state) VALUES ($1, $2, $3, $4)",
+            );
+            sqlx::query(&sql)
+                .bind(channel)
+                .bind(node_id)
+                .bind(role)
+                .bind(state)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_members(&self, channel: &str) -> Result<Vec<String>> {
+        let sql =
+            self.q("SELECT node_id FROM channel_members WHERE channel_name = $1 ORDER BY node_id");
+        let rows = sqlx::query(&sql)
+            .bind(channel)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get("node_id")).collect())
+    }
+
+    pub async fn member_state(&self, channel: &str, node_id: &str) -> Result<Option<String>> {
+        let sql =
+            self.q("SELECT state FROM channel_members WHERE channel_name = $1 AND node_id = $2");
+        let row = sqlx::query(&sql)
+            .bind(channel)
+            .bind(node_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("state")))
+    }
+
+    pub async fn channels_visible_to(&self, node_id: &str) -> Result<Vec<ChannelRow>> {
+        let mut rows = self.list_public_channels().await?;
+        let sql = self.q(
+            "SELECT c.name, c.visibility, c.namespace, c.origin_node, c.context_namespaces, c.updated_at_ms
+             FROM channels c
+             JOIN channel_members m ON m.channel_name = c.name
+             WHERE c.visibility = 'shared' AND m.node_id = $1
+             ORDER BY c.name",
+        );
+        let shared = sqlx::query(&sql)
+            .bind(node_id)
+            .fetch_all(&self.pool)
+            .await?;
+        for row in &shared {
+            let ch = self.channel_from_row(row);
+            if !rows.iter().any(|r| r.name == ch.name) {
+                rows.push(ch);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub async fn activity(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT channel_id, COALESCE(MAX(seq), 0) AS s FROM session_messages GROUP BY channel_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("channel_id"), r.try_get("s").unwrap_or(0)))
+            .collect())
+    }
+
+    pub async fn record_audit(
+        &self,
+        node_id: &str,
+        action: &str,
+        channel: &str,
+        thread: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let detail: String = detail.chars().take(1500).collect();
+        let id = blake3::hash(
+            format!(
+                "{node_id}:{action}:{channel}:{thread}:{detail}:{}",
+                now_ms()
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let sql = self.q(
+            "INSERT INTO audit_events (id, node_id, action, channel_name, thread_id, detail, created_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        );
+        sqlx::query(&sql)
+            .bind(&id)
+            .bind(node_id)
+            .bind(action)
+            .bind(channel)
+            .bind(thread)
+            .bind(&detail)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_audit(&self, limit: i64) -> Result<Vec<AuditEvent>> {
+        let sql = self.q(
+            "SELECT node_id, action, channel_name, thread_id, detail, created_at_ms
+             FROM audit_events ORDER BY created_at_ms DESC LIMIT $1",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| AuditEvent {
+                node_id: r.get("node_id"),
+                action: r.get("action"),
+                channel: r.get("channel_name"),
+                thread: r.get("thread_id"),
+                detail: r.get("detail"),
+                created_at_ms: r.get("created_at_ms"),
+            })
+            .collect())
+    }
+
     pub async fn namespace_is_public(&self, namespace: &str) -> Result<bool> {
         Ok(self
             .list_channel_rows()
@@ -852,6 +1218,91 @@ mod tests {
         assert!(validate_channel_name("a/../b").is_err());
         assert_eq!(normalize_visibility("Open").unwrap(), "public");
         assert_eq!(normalize_visibility("").unwrap(), "private");
+        assert_eq!(normalize_visibility("shared").unwrap(), "shared");
+    }
+
+    #[test]
+    fn sidebar_puts_general_first_then_pins_then_use() {
+        let mut rows = vec![
+            SidebarKey {
+                group: channel_group("zeta", "public"),
+                pinned: false,
+                use_count: 1,
+                name: "zeta".into(),
+            },
+            SidebarKey {
+                group: channel_group("general", "public"),
+                pinned: false,
+                use_count: 0,
+                name: "general".into(),
+            },
+            SidebarKey {
+                group: channel_group("alpha", "public"),
+                pinned: true,
+                use_count: 0,
+                name: "alpha".into(),
+            },
+            SidebarKey {
+                group: channel_group("mu", "public"),
+                pinned: true,
+                use_count: 9,
+                name: "mu".into(),
+            },
+            SidebarKey {
+                group: channel_group("mid", "public"),
+                pinned: false,
+                use_count: 5,
+                name: "mid".into(),
+            },
+            SidebarKey {
+                group: channel_group("local", "private"),
+                pinned: false,
+                use_count: 100,
+                name: "local".into(),
+            },
+            SidebarKey {
+                group: channel_group("team", "shared"),
+                pinned: false,
+                use_count: 3,
+                name: "team".into(),
+            },
+        ];
+        rows.sort_by(cmp_sidebar);
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["general", "mu", "alpha", "mid", "zeta", "local", "team"]
+        );
+    }
+
+    #[tokio::test]
+    async fn prefs_stay_on_this_node_and_general_cannot_close() {
+        let db = temp_db().await;
+        let mut pref = ChannelPref::bare("demo");
+        pref.pinned = true;
+        pref.muted = true;
+        db.save_pref(&pref).await.unwrap();
+        let loaded = db.get_pref("demo").await.unwrap();
+        assert!(loaded.pinned && loaded.muted);
+        db.mark_read("demo", 4).await.unwrap();
+        assert_eq!(db.get_pref("demo").await.unwrap().last_read_seq, 4);
+        let mut general = ChannelPref::bare("general");
+        general.closed = true;
+        assert!(db.save_pref(&general).await.is_err());
+        db.record_audit("node-a", "chat.request", "general", "main", "hello")
+            .await
+            .unwrap();
+        assert_eq!(db.list_audit(10).await.unwrap().len(), 1);
+        db.set_members(
+            "demo",
+            &[("node-b".into(), "member".into(), "active".into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.list_members("demo").await.unwrap(),
+            vec!["node-b".to_string()]
+        );
     }
 
     async fn temp_db() -> Storage {

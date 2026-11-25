@@ -115,11 +115,54 @@ impl ClusterService for NodeRpcServer {
         &self,
         req: Request<SessionMessage>,
     ) -> Result<Response<SessionMessage>, Status> {
-        self.db
-            .append_public_message(&req.into_inner())
+        let node_id = req
+            .metadata()
+            .get("x-xmesh-node")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let msg = req.into_inner();
+        if let Some(ch) = self
+            .db
+            .get_channel(&msg.channel_id)
             .await
-            .map(Response::new)
-            .map_err(|e| Status::invalid_argument(e.to_string()))
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            if ch.visibility == "private" {
+                return Err(Status::permission_denied("channel is private"));
+            }
+            if ch.visibility == "shared" {
+                let member = self
+                    .db
+                    .member_state(&ch.name, &node_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if member.is_none() {
+                    return Err(Status::permission_denied("invitation required"));
+                }
+            }
+        }
+        let stored = self
+            .db
+            .append_public_message(&msg)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let action = if stored.author == "user" {
+            "chat.request"
+        } else {
+            "chat.reply"
+        };
+        let _ = self
+            .db
+            .record_audit(
+                &node_id,
+                action,
+                &stored.channel_id,
+                &stored.thread_id,
+                &stored.content,
+            )
+            .await;
+        Ok(Response::new(stored))
     }
 }
 
@@ -244,15 +287,50 @@ async fn main() -> Result<()> {
         models: model_hub.clone(),
         hmac_key,
         status: status.clone(),
+        presence: Arc::new(std::sync::Mutex::new(web_ui::Presence {
+            channel: "general".into(),
+            viewing: false,
+        })),
     });
+    let app = web_ui::router(web);
     let listener = tokio::net::TcpListener::bind(&cfg.node.http_addr).await?;
     let http_addr = listener.local_addr()?;
+    let http_app = app.clone();
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, web_ui::router(web)).await {
+        if let Err(err) = axum::serve(listener, http_app).await {
             error!("HTTP server stopped: {err}");
         }
     });
     info!("HTTP UI listening on http://{http_addr}");
+    if let (Some(addr), Some(cert), Some(key)) = (
+        cfg.node.https_addr.clone().filter(|s| !s.trim().is_empty()),
+        cfg.node
+            .tls_cert_path
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+        cfg.node
+            .tls_key_path
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+    ) {
+        match axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await {
+            Ok(tls) => match addr.parse::<std::net::SocketAddr>() {
+                Ok(https) => {
+                    info!("HTTPS UI listening on https://{https}");
+                    let https_app = app.into_make_service();
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            axum_server::bind_rustls(https, tls).serve(https_app).await
+                        {
+                            error!("HTTPS server stopped: {err}");
+                        }
+                    });
+                }
+                Err(err) => warn!("HTTPS address {addr} is invalid: {err}"),
+            },
+            Err(err) => warn!("HTTPS disabled, certificate was not loaded: {err}"),
+        }
+    }
 
     if matches!(cfg.node.mode, NodeMode::Master) {
         if let Some(root) = cfg.git.bare_repos_root.clone() {

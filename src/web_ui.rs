@@ -5,7 +5,10 @@ use crate::models::{Attachment, ChatTurn, ModelChoice, ModelHub, StreamEvent};
 use crate::retrieve::{assemble_context, coding_preamble, map_entries};
 use crate::storage::pb::cluster_service_client::ClusterServiceClient;
 use crate::storage::pb::{ContextEntry, EntryType, NodeTaskRequest, SessionMessage, SyncEnvelope};
-use crate::storage::{now_ms, ChannelRow, Storage};
+use crate::storage::{
+    channel_group, cmp_sidebar, now_ms, AuditEvent, ChannelGroup, ChannelPref, ChannelRow,
+    SidebarKey, Storage,
+};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{
     extract::{Query, State},
@@ -23,12 +26,19 @@ use tokio::sync::RwLock;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::warn;
 
+#[derive(Clone)]
+pub struct Presence {
+    pub channel: String,
+    pub viewing: bool,
+}
+
 pub struct WebState {
     pub cfg: Arc<AppConfig>,
     pub db: Arc<Storage>,
     pub models: Arc<ModelHub>,
     pub hmac_key: [u8; 32],
     pub status: Arc<RwLock<IndexStatus>>,
+    pub presence: Arc<std::sync::Mutex<Presence>>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -133,6 +143,15 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/threads/fork", post(handle_fork_thread))
         .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))
         .route("/api/channels", get(handle_list_channels).post(handle_upsert_channel))
+        .route("/api/channel-state", post(handle_channel_state))
+        .route("/api/presence", post(handle_presence))
+        .route("/api/share", post(handle_share))
+        .route("/api/audit", get(handle_audit).post(handle_audit_post))
+        .route("/api/mesh/channels", get(handle_mesh_channels))
+        .route("/api/mesh/activity", get(handle_mesh_activity))
+        .route("/api/mesh/share", post(handle_mesh_share))
+        .route("/api/mesh/join", post(handle_mesh_join))
+        .route("/api/mesh/history", get(handle_mesh_history))
         .route("/api/status", get(|State(st): State<Arc<WebState>>| async move {
             Json(st.status.read().await.clone())
         }))
@@ -218,19 +237,36 @@ async fn fetch_hub_config(base: &str) -> Option<RemoteCatalog> {
 
 async fn handle_list_channels(
     State(st): State<Arc<WebState>>,
-) -> Result<Json<Vec<ChannelRow>>, StatusCode> {
+) -> Result<Json<Vec<SidebarChannel>>, StatusCode> {
     let mut rows = st
         .db
         .list_channel_rows()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if let Some(url) = master_url(&st.cfg) {
+    let mut remote_seq = std::collections::HashMap::new();
+    if let Some(base) = master_http(&st.cfg) {
+        if let Some(mesh) = fetch_mesh(base, &st.cfg.node.id).await {
+            remote_seq = mesh.activity;
+            for ch in mesh.channels {
+                if !rows.iter().any(|r| r.name == ch.name) {
+                    rows.push(ch);
+                }
+            }
+        }
+    } else if let Some(url) = master_url(&st.cfg) {
         if let Ok(remote) = hub::list_public(url).await {
             for ch in remote {
                 let row = ChannelRow::from_proto(&ch);
                 if !rows.iter().any(|r| r.name == row.name) {
                     rows.push(row);
                 }
+            }
+        }
+    }
+    if matches!(st.cfg.node.mode, NodeMode::Master) {
+        if let Ok(local_seq) = st.db.activity().await {
+            for (name, seq) in local_seq {
+                remote_seq.insert(name, seq);
             }
         }
     }
@@ -247,8 +283,102 @@ async fn handle_list_channels(
             },
         );
     }
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(Json(rows))
+    let mut sidebar = Vec::with_capacity(rows.len());
+    for row in rows {
+        let pref = st
+            .db
+            .get_pref(&row.name)
+            .await
+            .unwrap_or_else(|_| ChannelPref::bare(&row.name));
+        let local_max = st.db.max_seq(&row.name).await.unwrap_or(0);
+        let max_seq = local_max.max(*remote_seq.get(&row.name).unwrap_or(&0));
+        let unread = (max_seq - pref.last_read_seq).max(0);
+        let members = st.db.list_members(&row.name).await.unwrap_or_default();
+        sidebar.push(SidebarChannel {
+            group: channel_group(&row.name, &row.visibility),
+            pinned: pref.pinned,
+            muted: pref.muted,
+            archived: pref.archived && row.name != "general",
+            closed: pref.closed && row.name != "general",
+            read_count: pref.last_read_seq.max(0),
+            unread_count: unread,
+            use_count: pref.use_count,
+            members,
+            name: row.name,
+            visibility: row.visibility,
+            namespace: row.namespace,
+            origin_node: row.origin_node,
+        });
+    }
+    sidebar.sort_by(|a, b| {
+        cmp_sidebar(
+            &SidebarKey {
+                group: a.group,
+                pinned: a.pinned,
+                use_count: a.use_count,
+                name: a.name.clone(),
+            },
+            &SidebarKey {
+                group: b.group,
+                pinned: b.pinned,
+                use_count: b.use_count,
+                name: b.name.clone(),
+            },
+        )
+    });
+    Ok(Json(sidebar))
+}
+
+#[derive(Clone, Serialize)]
+struct SidebarChannel {
+    name: String,
+    visibility: String,
+    namespace: String,
+    origin_node: String,
+    group: ChannelGroup,
+    pinned: bool,
+    muted: bool,
+    archived: bool,
+    closed: bool,
+    read_count: i64,
+    unread_count: i64,
+    use_count: i64,
+    members: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct MeshView {
+    #[serde(default)]
+    channels: Vec<ChannelRow>,
+    #[serde(default)]
+    activity: std::collections::HashMap<String, i64>,
+}
+
+async fn fetch_mesh(base: &str, node_id: &str) -> Option<MeshView> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let root = base.trim_end_matches('/');
+    let channels: Vec<ChannelRow> = client
+        .get(format!("{root}/api/mesh/channels"))
+        .query(&[("node_id", node_id)])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let activity: std::collections::HashMap<String, i64> = client
+        .get(format!("{root}/api/mesh/activity"))
+        .query(&[("node_id", node_id)])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(MeshView { channels, activity })
 }
 
 async fn handle_upsert_channel(
@@ -303,11 +433,16 @@ async fn handle_upsert_channel(
     Ok(Json(stored))
 }
 
-async fn channel_is_public(st: &WebState, name: &str) -> bool {
+async fn channel_visibility(st: &WebState, name: &str) -> String {
     match st.db.get_channel(name).await.ok().flatten() {
-        Some(ch) => ch.visibility == "public",
-        None => name == "general",
+        Some(ch) => ch.visibility,
+        None if name == "general" => "public".into(),
+        None => "private".into(),
     }
+}
+
+async fn channel_is_public(st: &WebState, name: &str) -> bool {
+    channel_visibility(st, name).await == "public"
 }
 
 async fn handle_history(
@@ -325,6 +460,17 @@ async fn handle_history(
         if let Some(url) = master_url(&st.cfg) {
             if let Ok(env) = hub::query_namespace(url, &q.channel).await {
                 for msg in env.messages.into_iter().filter(|m| m.thread_id == q.thread) {
+                    let _ = st.db.append_message(&msg).await;
+                }
+            }
+        }
+    }
+    if channel_visibility(&st, &q.channel).await == "shared" {
+        if let Some(base) = master_http(&st.cfg) {
+            if let Some(msgs) =
+                fetch_shared_history(base, &st.cfg.node.id, &q.channel, &q.thread).await
+            {
+                for msg in msgs {
                     let _ = st.db.append_message(&msg).await;
                 }
             }
@@ -411,6 +557,8 @@ async fn handle_approve(
     State(st): State<Arc<WebState>>,
     Json(req): Json<ApproveReq>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let pipeline_name = req.deploy_pipeline.clone();
+    let repo_name = req.target_repo.clone();
     let task_id = blake3::hash(req.unified_diff.as_bytes()).to_hex()[..16].to_string();
     let exp = now_ms() + 30_000;
     let payload = format!(
@@ -435,6 +583,22 @@ async fn handle_approve(
         .await
         .map_err(|_| StatusCode::FORBIDDEN)?
         .into_inner();
+    let action = if pipeline_name.contains("--force") || pipeline_name.contains("force-with-lease")
+    {
+        "git.force_push"
+    } else if pipeline_name.contains("push") {
+        "git.push"
+    } else {
+        "task.execute"
+    };
+    publish_audit(
+        &st,
+        action,
+        &repo_name,
+        "",
+        &serde_json::json!({"pipeline": pipeline_name, "exit": res.exit_code}).to_string(),
+    )
+    .await;
     Ok(Json(
         serde_json::json!({ "success": res.success, "code": res.exit_code, "out": res.stdout_log, "err": res.stderr_log }),
     ))
@@ -612,20 +776,55 @@ async fn prompt_for(
     Ok(format!("{}\n\n{retrieved}", coding_preamble(channel)))
 }
 
-async fn store_message(st: &WebState, mut msg: SessionMessage, sync_hub: bool) -> SessionMessage {
-    if sync_hub {
+async fn store_message(st: &WebState, msg: SessionMessage, sync_hub: bool) -> SessionMessage {
+    let stored = if sync_hub {
         if let Some(url) = master_url(&st.cfg) {
-            match hub::append_public(url, msg.clone()).await {
+            match hub::append_public(url, msg.clone(), &st.cfg.node.id).await {
                 Ok(stored) => {
                     let _ = st.db.append_message(&stored).await;
-                    return stored;
+                    stored
                 }
-                Err(err) => warn!("hub append failed, keeping the message locally: {err}"),
+                Err(err) => {
+                    warn!("hub append failed, keeping the message locally: {err}");
+                    local_append(st, msg).await
+                }
             }
         } else if let Ok(stored) = st.db.append_public_message(&msg).await {
-            return stored;
+            let action = if stored.author == "user" {
+                "chat.request"
+            } else {
+                "chat.reply"
+            };
+            let _ = st
+                .db
+                .record_audit(
+                    &st.cfg.node.id,
+                    action,
+                    &stored.channel_id,
+                    &stored.thread_id,
+                    &stored.content,
+                )
+                .await;
+            stored
+        } else {
+            local_append(st, msg).await
         }
+    } else {
+        local_append(st, msg).await
+    };
+    let viewing = st
+        .presence
+        .lock()
+        .ok()
+        .map(|p| p.viewing && p.channel == stored.channel_id)
+        .unwrap_or(false);
+    if stored.author == "user" || viewing {
+        let _ = st.db.mark_read(&stored.channel_id, stored.seq as i64).await;
     }
+    stored
+}
+
+async fn local_append(st: &WebState, mut msg: SessionMessage) -> SessionMessage {
     if msg.seq == 0 {
         msg.seq = st
             .db
@@ -652,12 +851,52 @@ struct CompleteReq {
     system: String,
     #[serde(default)]
     turns: Vec<ChatTurn>,
+    #[serde(default)]
+    audit: Option<AuditHint>,
+}
+
+#[derive(Clone, Deserialize)]
+struct AuditHint {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    thread: String,
 }
 
 async fn handle_complete(
     State(st): State<Arc<WebState>>,
     Json(req): Json<CompleteReq>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    if let Some(hint) = req.audit.clone() {
+        let preview = req
+            .turns
+            .iter()
+            .rev()
+            .find(|t| t.role == "user")
+            .map(|t| t.text.chars().take(400).collect::<String>())
+            .unwrap_or_default();
+        let detail = serde_json::json!({
+            "model": req.model,
+            "preview": preview
+        })
+        .to_string();
+        let _ = st
+            .db
+            .record_audit(
+                if hint.node_id.is_empty() {
+                    &st.cfg.node.id
+                } else {
+                    &hint.node_id
+                },
+                "model.request",
+                &hint.channel,
+                &hint.thread,
+                &detail,
+            )
+            .await;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
     tokio::spawn(async move {
         if let Err(err) = st
@@ -688,6 +927,7 @@ async fn dispatch_chat(
     system: &str,
     turns: &[ChatTurn],
     tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    audit: Option<serde_json::Value>,
 ) -> anyhow::Result<(String, String)> {
     if let Some(base) = master_http(&st.cfg) {
         let prefix = model
@@ -700,7 +940,7 @@ async fn dispatch_chat(
             !st.models.owns_provider(prefix).await
         };
         if remote {
-            return relay_complete(base, model, system, turns, tx).await;
+            return relay_complete(base, model, system, turns, tx, audit).await;
         }
     }
     st.models.stream_chat(model, system, turns, tx).await
@@ -712,6 +952,7 @@ async fn relay_complete(
     system: &str,
     turns: &[ChatTurn],
     tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    audit: Option<serde_json::Value>,
 ) -> anyhow::Result<(String, String)> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -722,7 +963,8 @@ async fn relay_complete(
         .json(&serde_json::json!({
             "model": model,
             "system": system,
-            "turns": turns
+            "turns": turns,
+            "audit": audit
         }))
         .send()
         .await?;
@@ -766,7 +1008,8 @@ async fn handle_persistent_chat(
         .load_thread(&req.channel, &req.thread, 100)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let public = channel_is_public(&st, &req.channel).await;
+    let visibility = channel_visibility(&st, &req.channel).await;
+    let public = visibility == "public" || visibility == "shared";
     let private_thread = st
         .db
         .thread_visibility(&req.channel, &req.thread)
@@ -823,8 +1066,17 @@ async fn handle_persistent_chat(
         let ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt)
             .await
             .unwrap_or_default();
+        let audit = if sync_hub {
+            Some(serde_json::json!({
+                "node_id": st_bg.cfg.node.id,
+                "channel": req.channel,
+                "thread": req.thread
+            }))
+        } else {
+            None
+        };
         let (author, final_text) =
-            match dispatch_chat(&st_bg, &model, &ctx, &turns, tx.clone()).await {
+            match dispatch_chat(&st_bg, &model, &ctx, &turns, tx.clone(), audit).await {
                 Ok((reply, used)) => (used, reply),
                 Err(err) => {
                     let err_txt = format!("[ERROR] {err}");
@@ -855,4 +1107,538 @@ async fn handle_persistent_chat(
     let stream = ReceiverStream::new(rx)
         .map(|ev| Ok(Event::default().data(serde_json::to_string(&ev).unwrap_or_default())));
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Deserialize)]
+struct NodeQuery {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    thread: String,
+}
+
+#[derive(Deserialize)]
+struct PrefBody {
+    name: String,
+    #[serde(default)]
+    pinned: Option<bool>,
+    #[serde(default)]
+    muted: Option<bool>,
+    #[serde(default)]
+    archived: Option<bool>,
+    #[serde(default)]
+    closed: Option<bool>,
+    #[serde(default)]
+    mark_read: bool,
+    #[serde(default)]
+    bump_use: bool,
+}
+
+#[derive(Deserialize)]
+struct PresenceBody {
+    channel: String,
+    #[serde(default)]
+    viewing: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShareMsg {
+    thread_id: String,
+    seq: u64,
+    author: String,
+    content: String,
+    created_at_ms: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShareEntry {
+    id: String,
+    namespace: String,
+    source_path: String,
+    content: String,
+    content_hash: String,
+    entry_type: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShareBody {
+    channel: String,
+    origin_node: String,
+    members: Vec<String>,
+    messages: Vec<ShareMsg>,
+    entries: Vec<ShareEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuditBody {
+    #[serde(default)]
+    node_id: String,
+    action: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    #[serde(default)]
+    detail: String,
+}
+
+async fn publish_audit(st: &WebState, action: &str, channel: &str, thread: &str, detail: &str) {
+    if let Some(base) = master_http(&st.cfg) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build();
+        if let Ok(client) = client {
+            let _ = client
+                .post(format!("{}/api/audit", base.trim_end_matches('/')))
+                .json(&AuditBody {
+                    node_id: st.cfg.node.id.clone(),
+                    action: action.to_string(),
+                    channel: channel.to_string(),
+                    thread: thread.to_string(),
+                    detail: detail.to_string(),
+                })
+                .send()
+                .await;
+        }
+        return;
+    }
+    let _ = st
+        .db
+        .record_audit(&st.cfg.node.id, action, channel, thread, detail)
+        .await;
+}
+
+async fn handle_channel_state(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<PrefBody>,
+) -> Result<StatusCode, StatusCode> {
+    if storage_name(&body.name).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut pref = st
+        .db
+        .get_pref(&body.name)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(v) = body.pinned {
+        pref.pinned = v;
+    }
+    if let Some(v) = body.muted {
+        pref.muted = v;
+    }
+    if body.name != "general" {
+        if let Some(v) = body.archived {
+            pref.archived = v;
+        }
+        if let Some(v) = body.closed {
+            pref.closed = v;
+        }
+    }
+    if body.bump_use {
+        pref.use_count = pref.use_count.saturating_add(1);
+    }
+    if body.mark_read {
+        let seq = st
+            .db
+            .max_seq(&body.name)
+            .await
+            .unwrap_or(pref.last_read_seq);
+        pref.last_read_seq = pref.last_read_seq.max(seq);
+    }
+    st.db
+        .save_pref(&pref)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(StatusCode::OK)
+}
+
+fn storage_name(name: &str) -> Result<(), ()> {
+    crate::storage::validate_channel_name(name).map_err(|_| ())
+}
+
+async fn handle_presence(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<PresenceBody>,
+) -> StatusCode {
+    if let Ok(mut presence) = st.presence.lock() {
+        presence.channel = body.channel;
+        presence.viewing = body.viewing;
+    }
+    StatusCode::OK
+}
+
+async fn handle_audit(
+    State(st): State<Arc<WebState>>,
+) -> Result<Json<Vec<AuditEvent>>, StatusCode> {
+    if let Some(base) = master_http(&st.cfg) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let rows = client
+            .get(format!("{}/api/audit", base.trim_end_matches('/')))
+            .send()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?
+            .json()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        return Ok(Json(rows));
+    }
+    st.db
+        .list_audit(80)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn handle_audit_post(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<AuditBody>,
+) -> Result<StatusCode, StatusCode> {
+    if master_http(&st.cfg).is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let node = if body.node_id.is_empty() {
+        st.cfg.node.id.clone()
+    } else {
+        body.node_id
+    };
+    st.db
+        .record_audit(
+            &node,
+            &body.action,
+            &body.channel,
+            &body.thread,
+            &body.detail,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_mesh_channels(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<NodeQuery>,
+) -> Result<Json<Vec<ChannelRow>>, StatusCode> {
+    st.db
+        .channels_visible_to(&q.node_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn handle_mesh_activity(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<NodeQuery>,
+) -> Result<Json<std::collections::HashMap<String, i64>>, StatusCode> {
+    let visible = st
+        .db
+        .channels_visible_to(&q.node_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let allowed: std::collections::HashSet<_> = visible.into_iter().map(|c| c.name).collect();
+    let rows = st
+        .db
+        .activity()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        rows.into_iter()
+            .filter(|(name, _)| allowed.contains(name))
+            .collect(),
+    ))
+}
+
+async fn handle_mesh_history(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<NodeQuery>,
+) -> Result<Json<Vec<ShareMsg>>, StatusCode> {
+    let Some(ch) = st
+        .db
+        .get_channel(&q.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if ch.visibility == "private" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if ch.visibility == "shared" {
+        let member = st
+            .db
+            .member_state(&q.channel, &q.node_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if member.is_none() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    let thread = if q.thread.is_empty() {
+        "main"
+    } else {
+        &q.thread
+    };
+    let msgs = st
+        .db
+        .load_thread(&q.channel, thread, 400)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        msgs.into_iter()
+            .map(|m| ShareMsg {
+                thread_id: m.thread_id,
+                seq: m.seq,
+                author: m.author,
+                content: m.content,
+                created_at_ms: m.created_at_ms,
+            })
+            .collect(),
+    ))
+}
+
+async fn fetch_shared_history(
+    base: &str,
+    node_id: &str,
+    channel: &str,
+    thread: &str,
+) -> Option<Vec<SessionMessage>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let msgs: Vec<ShareMsg> = client
+        .get(format!("{}/api/mesh/history", base.trim_end_matches('/')))
+        .query(&[
+            ("node_id", node_id),
+            ("channel", channel),
+            ("thread", thread),
+        ])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(
+        msgs.into_iter()
+            .map(|m| SessionMessage {
+                channel_id: channel.to_string(),
+                thread_id: m.thread_id,
+                seq: m.seq,
+                author: m.author,
+                content: m.content,
+                created_at_ms: m.created_at_ms,
+            })
+            .collect(),
+    )
+}
+
+async fn apply_share(st: &WebState, body: ShareBody) -> Result<(), StatusCode> {
+    if storage_name(&body.channel).is_err() || body.channel == "general" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    st.db
+        .upsert_channel(&ChannelRow {
+            name: body.channel.clone(),
+            visibility: "shared".into(),
+            namespace: body.channel.clone(),
+            origin_node: body.origin_node.clone(),
+            context_namespaces: vec![body.channel.clone()],
+            updated_at_ms: 0,
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut members = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in std::iter::once(body.origin_node.clone()).chain(body.members.into_iter()) {
+        if node.is_empty() || !seen.insert(node.clone()) {
+            continue;
+        }
+        let role = if node == body.origin_node {
+            "owner"
+        } else {
+            "member"
+        };
+        members.push((node, role.to_string(), "active".to_string()));
+    }
+    st.db
+        .set_members(&body.channel, &members)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for msg in body.messages.into_iter().take(400) {
+        let _ = st
+            .db
+            .append_message(&SessionMessage {
+                channel_id: body.channel.clone(),
+                thread_id: msg.thread_id,
+                seq: msg.seq,
+                author: msg.author,
+                content: msg.content,
+                created_at_ms: msg.created_at_ms,
+            })
+            .await;
+    }
+    for entry in body.entries.into_iter().take(200) {
+        let _ = st
+            .db
+            .upsert_proto(
+                &ContextEntry {
+                    id: entry.id,
+                    namespace: entry.namespace,
+                    entry_type: entry.entry_type,
+                    source_path: entry.source_path,
+                    content: entry.content,
+                    content_hash: entry.content_hash,
+                    embedding: vec![],
+                    updated_at_ms: now_ms(),
+                    origin_node: body.origin_node.clone(),
+                    meta: Default::default(),
+                },
+                false,
+            )
+            .await;
+    }
+    let _ = st
+        .db
+        .record_audit(
+            &body.origin_node,
+            "channel.share",
+            &body.channel,
+            "main",
+            &members
+                .iter()
+                .map(|(n, _, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .await;
+    Ok(())
+}
+
+async fn handle_mesh_share(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<ShareBody>,
+) -> Result<StatusCode, StatusCode> {
+    apply_share(&st, body).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_mesh_join(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<NodeQuery>,
+) -> Result<StatusCode, StatusCode> {
+    let member = st
+        .db
+        .member_state(&body.channel, &body.node_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if member.is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let ch = st
+        .db
+        .get_channel(&body.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let names = st
+        .db
+        .list_members(&body.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let members = names
+        .into_iter()
+        .map(|name| {
+            let role = if name == ch.origin_node {
+                "owner"
+            } else {
+                "member"
+            };
+            (name, role.to_string(), "active".to_string())
+        })
+        .collect::<Vec<_>>();
+    st.db
+        .set_members(&body.channel, &members)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = st
+        .db
+        .record_audit(&body.node_id, "channel.join", &body.channel, "main", "")
+        .await;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_share(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<ShareBody>,
+) -> Result<StatusCode, StatusCode> {
+    let origin = st.cfg.node.id.clone();
+    let channel = body.channel.clone();
+    let mut members = body.members;
+    let messages = if body.messages.is_empty() {
+        st.db
+            .load_channel_messages(&channel)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .take(400)
+            .map(|m| ShareMsg {
+                thread_id: m.thread_id,
+                seq: m.seq,
+                author: m.author,
+                content: m.content,
+                created_at_ms: m.created_at_ms,
+            })
+            .collect()
+    } else {
+        body.messages
+    };
+    let entries = if body.entries.is_empty() {
+        st.db
+            .load_entries(Some(&channel))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .take(200)
+            .map(|e| ShareEntry {
+                id: e.id,
+                namespace: e.namespace,
+                source_path: e.source_path,
+                content: e.content,
+                content_hash: e.content_hash,
+                entry_type: e.entry_type,
+            })
+            .collect()
+    } else {
+        body.entries
+    };
+    let payload = ShareBody {
+        channel: channel.clone(),
+        origin_node: origin,
+        members: members.split_off(0),
+        messages,
+        entries,
+    };
+    if let Some(base) = master_http(&st.cfg) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let status = client
+            .post(format!("{}/api/mesh/share", base.trim_end_matches('/')))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?
+            .status();
+        if !status.is_success() {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    }
+    apply_share(&st, payload).await?;
+    Ok(StatusCode::OK)
 }
