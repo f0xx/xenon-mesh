@@ -15,9 +15,14 @@ pub fn scan_bare_repo(bare_path: &Path, namespace: &str) -> Result<Vec<ContextEn
         let Ok(obj) = entry.to_object(&repo) else { return git2::TreeWalkResult::Ok; };
         let Some(blob) = obj.as_blob() else { return git2::TreeWalkResult::Ok; };
 
-        if blob.is_binary() || blob.size() > 256 * 1024 {
+        if blob.is_binary() || blob.size() > 64 * 1024 {
             return git2::TreeWalkResult::Ok;
         }
+        let name = entry.name().unwrap_or_default();
+        if name.ends_with(".lock") || name.ends_with("-lock.json") || name.ends_with(".min.js") || name.ends_with(".map") {
+            return git2::TreeWalkResult::Ok;
+        }
+
         if let Ok(text) = std::str::from_utf8(blob.content()) {
             let rel_path = format!("{}{}", root, entry.name().unwrap_or_default());
             let id = blake3::hash(format!("master:{namespace}:{rel_path}").as_bytes()).to_hex().to_string();

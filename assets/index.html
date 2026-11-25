@@ -1,90 +1,137 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8"><title>xmeshd lab</title>
 <style>
-  body { margin:0; font:13px/1.45 monospace; background:#111317; color:#e2e8f0; display:flex; height:100vh; }
-  aside { width:200px; background:#181b20; border-right:1px solid #2d3748; padding:12px; overflow-y:auto; }
-  aside .item { padding:5px 8px; cursor:pointer; border-radius:4px; margin-bottom:2px; }
+  body { margin:0; font:13px/1.45 monospace; background:#111317; color:#e2e8f0; display:flex; height:100vh; overflow:hidden; }
+  aside { width:220px; min-width:140px; max-width:450px; background:#181b20; padding:12px; overflow-y:auto; flex-shrink:0; }
+  aside .item { padding:5px 8px; cursor:pointer; border-radius:4px; margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   aside .item.active, aside .item:hover { background:#2b6cb0; color:#fff; }
-  main { flex:1; display:flex; flex-direction:column; min-width:0; }
-  #log { flex:1; overflow-y:auto; padding:16px; white-space:pre-wrap; }
+  .resizer { width:4px; background:#2d3748; cursor:col-resize; flex-shrink:0; transition:background .15s; }
+  .resizer:hover { background:#4299e1; }
+  main { flex:1; display:flex; flex-direction:column; min-width:260px; }
+  #log { flex:1; overflow-y:auto; padding:16px; white-space:pre-wrap; word-break:break-word; }
   .msg { margin-bottom:12px; padding:10px; background:#1a202c; border-left:3px solid #4299e1; }
   .bar { display:flex; gap:8px; padding:12px; background:#181b20; border-top:1px solid #2d3748; }
-  textarea, input { background:#0d0f12; color:#fff; border:1px solid #2d3748; padding:7px; font:inherit; }
+  textarea, input, select { background:#0d0f12; color:#fff; border:1px solid #2d3748; padding:6px; font:inherit; }
   textarea { flex:1; height:52px; resize:none; }
   button { background:#2b6cb0; color:#fff; border:0; padding:6px 10px; cursor:pointer; border-radius:3px; }
   button:disabled { background:#2d3748; color:#718096; cursor:not-allowed; }
-  #panel { width:360px; background:#181b20; border-left:1px solid #2d3748; padding:12px; display:flex; flex-direction:column; gap:8px; }
+  #panel { width:340px; min-width:240px; max-width:600px; background:#181b20; padding:12px; display:flex; flex-direction:column; gap:8px; flex-shrink:0; }
   #diffView { flex:1; overflow:auto; background:#0b0d10; border:1px solid #2d3748; padding:8px; font-size:12px; white-space:pre; }
   .d-add { background:#132e21; color:#68d391; display:block; } .d-del { background:#33181b; color:#fc8181; display:block; }
   .d-hunk { color:#63b3ed; font-weight:bold; display:block; } .d-file { color:#f6e05e; font-weight:bold; display:block; }
 </style>
 </head>
 <body>
-<aside>
-  <b>CHANNELS</b> <button style="padding:1px 6px;float:right" title="Создать канал" onclick="newChannel()">+</button>
+<aside id="leftBar">
+  <b data-i18n="channels">CHANNELS</b> <button style="padding:1px 6px;float:right" onclick="newChannel()">+</button>
   <hr style="border-color:#2d3748"><div id="chList"></div>
-  <br><b>THREADS</b>
+  <br><b data-i18n="threads">THREADS</b>
   <span style="float:right">
     <button style="padding:1px 6px" onclick="forkThread()">Fork</button>
     <button style="padding:1px 6px" onclick="newThread()">+</button>
   </span>
   <hr style="border-color:#2d3748"><div id="threadList"></div>
 </aside>
-
+<div class="resizer" id="resizerL"></div>
 <main>
-  <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;background:#181b20;border-bottom:1px solid #2d3748">
-    <div style="display:flex;align-items:center;gap:12px">
-      <b id="headerTitle"># general / main</b>
-      <span id="statusBadge" style="font-size:12px;color:#ecc94b">● connecting...</span>
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;background:#181b20;border-bottom:1px solid #2d3748;gap:8px">
+    <div style="display:flex;align-items:center;gap:10px;min-width:0">
+      <b id="headerTitle" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"># general / main</b>
+      <span id="statusBadge" style="font-size:12px;color:#ecc94b;white-space:nowrap">● connecting...</span>
     </div>
-    <select id="modelSelect" style="background:#0d0f12;color:#fff;border:1px solid #2d3748;padding:4px 8px;font:inherit">
-      <option value="gemini-2.5-flash">gemini-2.5-flash (fast / high quota)</option>
-      <option value="gemini-2.5-pro">gemini-2.5-pro (deep reasoning)</option>
-    </select>
+    <div style="display:flex;gap:6px;flex-shrink:0">
+      <select id="modelSelect"><option value="gemini-2.5-flash">gemini-2.5-flash</option><option value="gemini-2.5-pro">gemini-2.5-pro</option></select>
+      <select id="langSelect" onchange="setLang(this.value)"><option value="en">EN</option><option value="ru">RU</option></select>
+    </div>
   </div>
   <div id="log"></div>
-  <div class="bar"><textarea id="prompt" placeholder="Message to thread..."></textarea><button onclick="send()">Send</button></div>
+  <div class="bar"><textarea id="prompt" data-i18n-ph="promptPh"></textarea><button onclick="send()" data-i18n="send">Send</button></div>
 </main>
+<div class="resizer" id="resizerR"></div>
 <div id="panel">
-  <b>CONTEXT & MEMORY</b>
-  <input id="mTitle" placeholder="Key (f.ex. nft-rules)">
-  <textarea id="mText" style="flex:none;height:60px" placeholder="Text or short..."></textarea>
-  <div style="display:flex;gap:6px"><button onclick="saveMem(true)">Pin Raw</button><button onclick="saveMem(false)">Distill Learn</button></div>
+  <b data-i18n="memTitle">CONTEXT & MEMORY</b>
+  <input id="mTitle" data-i18n-ph="keyPh">
+  <textarea id="mText" style="flex:none;height:54px" data-i18n-ph="memPh"></textarea>
+  <div style="display:flex;gap:6px"><button onclick="saveMem(true)" data-i18n="pinBtn">Pin Raw</button><button onclick="saveMem(false)" data-i18n="learnBtn">Distill Learn</button></div>
+  <div id="memList" style="max-height:95px;overflow-y:auto;background:#0b0d10;border:1px solid #2d3748;padding:4px;font-size:12px"></div>
   <hr style="border-color:#2d3748;width:100%">
-  <b>DIFF INSPECTOR & DEPLOY</b>
-  <input id="dNode" placeholder="Node gRPC URL (ex. http://192.168.200.10:8443)" onchange="localStorage.dNode=this.value">
-  <input id="dRepo" placeholder="Target workspace (ex. /srv/projects/app)" onchange="localStorage.dRepo=this.value">
-  <input id="dPipe" placeholder="Pipeline name (from node's local.yaml)" onchange="localStorage.dPipe=this.value">
-  <div style="display:flex;justify-content:space-between"><span id="diffStats">No diff</span><button onclick="pasteDiff()">Paste</button></div>
-  <div id="diffView">Awaiting diff...</div>
-  <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()">Approve & Execute</button>
+  <b data-i18n="deployTitle">DIFF INSPECTOR & DEPLOY</b>
+  <input id="dNode" placeholder="Node gRPC URL (http://192.168.200.10:8443)" onchange="localStorage.dNode=this.value">
+  <input id="dRepo" placeholder="Target workspace (/srv/projects/app)" onchange="localStorage.dRepo=this.value">
+  <input id="dPipe" placeholder="Pipeline name (local.yaml)" onchange="localStorage.dPipe=this.value">
+  <div style="display:flex;justify-content:space-between"><span id="diffStats" data-i18n="noDiff">No diff</span><button onclick="pasteDiff()" data-i18n="paste">Paste</button></div>
+  <div id="diffView" data-i18n="awaitDiff">Awaiting diff...</div>
+  <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()" data-i18n="approve">Approve & Execute</button>
 </div>
 <script>
-let ch = 'general', thread = 'main', currentDiff = '';
-async function setCh(el, c) {
-  ch = c; thread = 'main';
-  if (el) { document.querySelectorAll('#chList .item').forEach(d => d.classList.remove('active')); el.classList.add('active'); }
-  await refreshThreads(); await loadHistory();
+const I18N = {
+  en: { channels:'CHANNELS', threads:'THREADS', send:'Send', promptPh:'Message to thread...', memTitle:'CONTEXT & MEMORY',
+        keyPh:'Key (e.g. nft-rules)', memPh:'Invariant or thread notes...', pinBtn:'Pin Raw', learnBtn:'Distill Learn',
+        deployTitle:'DIFF INSPECTOR & DEPLOY', noDiff:'No diff', paste:'Paste', awaitDiff:'Awaiting diff...',
+        approve:'Approve & Execute', newCh:'New channel name:', newTh:'New thread name:', noMem:'No pinned entries' },
+  ru: { channels:'КАНАЛЫ', threads:'ТРЕДЫ', send:'Отправить', promptPh:'Сообщение в тред...', memTitle:'КОНТЕКСТ И ПАМЯТЬ',
+        keyPh:'Ключ (напр. nft-rules)', memPh:'Инвариант или заметка...', pinBtn:'Закрепить', learnBtn:'Сжать опыт',
+        deployTitle:'ИНСПЕКТОР DIFF И ДЕПЛОЙ', noDiff:'Нет diff', paste:'Вставить', awaitDiff:'Ожидание патча...',
+        approve:'Утвердить и выполнить', newCh:'Имя нового канала:', newTh:'Имя нового треда:', noMem:'Нет закрепленных записей' }
+};
+let lang = localStorage.lang || 'en', ch = 'general', thread = 'main', currentDiff = '';
+function t(k) { return (I18N[lang] || I18N.en)[k] || k; }
+function setLang(l) {
+  lang = l; localStorage.lang = l;
+  document.querySelectorAll('[data-i18n]').forEach(el => el.textContent = t(el.dataset.i18n));
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => el.placeholder = t(el.dataset.i18nPh));
 }
-async function refreshThreads() {
-  const list = await (await fetch(`/api/threads?channel=${encodeURIComponent(ch)}`)).json();
-  threadList.innerHTML = '';
-  list.forEach(t => {
-    const d = document.createElement('div'); d.className = 'item' + (t === thread ? ' active' : ''); d.textContent = `↳ ${t}`;
-    d.onclick = () => { thread = t; refreshThreads(); loadHistory(); }; threadList.appendChild(d);
+function initResize(bar, target, key, invert) {
+  bar.onmousedown = () => {
+    document.onmousemove = e => {
+      const w = invert ? (window.innerWidth - e.clientX) : e.clientX;
+      target.style.width = w + 'px'; localStorage[key] = w;
+    };
+    document.onmouseup = () => { document.onmousemove = null; };
+  };
+}
+async function refreshChannels() {
+  const list = await (await fetch('/api/channels')).json();
+  if (!list.includes(ch)) list.push(ch); chList.innerHTML = '';
+  list.forEach(c => {
+    const d = document.createElement('div'); d.className = 'item' + (c === ch ? ' active' : '');
+    d.textContent = `# ${c}`; d.title = c; d.onclick = () => setCh(c); chList.appendChild(d);
   });
 }
-async function newThread() {
-  const n = window.prompt('Thread name:'); if (!n) return;
-  thread = n.trim().replace(/\s+/g, '-'); await refreshThreads(); log.innerHTML = '';
+async function refreshThreads() {
+  const list = await (await fetch(`/api/threads?channel=${encodeURIComponent(ch)}`)).json(); threadList.innerHTML = '';
+  list.forEach(th => {
+    const d = document.createElement('div'); d.className = 'item' + (th === thread ? ' active' : '');
+    d.textContent = `↳ ${th}`; d.title = th; d.onclick = () => { thread = th; refreshThreads(); loadHistory(); }; threadList.appendChild(d);
+  });
+}
+async function refreshMemory() {
+  const items = await (await fetch(`/api/memory?channel=${encodeURIComponent(ch)}`)).json();
+  memList.innerHTML = items.length ? '' : `<span style="color:#718096">${t('noMem')}</span>`;
+  items.forEach(it => {
+    const r = document.createElement('div'); r.style.cssText = 'display:flex;justify-content:space-between;padding:2px 4px';
+    const l = document.createElement('span'); l.style.cssText = 'cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    l.textContent = `[${it.kind}] ${it.source_path.replace('memory/','')}`;
+    l.onclick = () => { mTitle.value = it.source_path.replace('memory/',''); mText.value = it.content; appendBubble(it.kind, it.content); };
+    const x = document.createElement('button'); x.textContent = 'x'; x.style.cssText = 'background:#9b2c2c;padding:0 5px';
+    x.onclick = async () => { await fetch(`/api/memory?id=${encodeURIComponent(it.id)}`, {method:'DELETE'}); refreshMemory(); };
+    r.append(l, x); memList.appendChild(r);
+  });
+}
+async function setCh(c) { ch = c; thread = 'main'; await refreshChannels(); await refreshThreads(); await refreshMemory(); await loadHistory(); }
+async function newChannel() { const n = window.prompt(t('newCh')); if (n) await setCh(n.trim().replace(/\s+/g, '-')); }
+async function newThread() { const n = window.prompt(t('newTh')); if (n) { thread = n.trim().replace(/\s+/g, '-'); await refreshThreads(); loadHistory(); } }
+async function forkThread() {
+  const dst = window.prompt('Fork to:'); if (!dst) return;
+  const [h, tl] = (window.prompt('head,tail:', '2,6') || '2,6').split(',').map(x => parseInt(x, 10) || 0);
+  await fetch('/api/threads/fork', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, src_thread:thread, dst_thread:dst.trim(), keep_head:h, keep_tail:tl}) });
+  thread = dst.trim(); await refreshThreads(); await loadHistory();
 }
 async function loadHistory() {
-  headerTitle.textContent = `# ${ch} / ${thread}`;
-  log.innerHTML = '';
-  const msgs = await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json();
-  msgs.forEach(m => appendBubble(m.role, m.text));
+  headerTitle.textContent = `# ${ch} / ${thread}`; log.innerHTML = '';
+  (await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json()).forEach(m => appendBubble(m.role, m.text));
 }
 function appendBubble(who, txt) {
   const box = document.createElement('div'); box.className = 'msg';
@@ -97,104 +144,46 @@ function loadDiff(raw) {
   currentDiff = raw; diffView.innerHTML = ''; let a = 0, d = 0;
   raw.split('\n').forEach(l => {
     const s = document.createElement('span'); s.textContent = l || ' ';
-    if (l.startsWith('+++')||l.startsWith('---')) s.className='d-file';
-    else if (l.startsWith('@@')) s.className='d-hunk';
+    if (l.startsWith('+++')||l.startsWith('---')) s.className='d-file'; else if (l.startsWith('@@')) s.className='d-hunk';
     else if (l.startsWith('+')) { s.className='d-add'; a++; } else if (l.startsWith('-')) { s.className='d-del'; d++; }
     diffView.appendChild(s);
   });
   diffStats.textContent = `+${a} / -${d}`; btnApprove.disabled = false;
 }
-function pasteDiff() { const r = window.prompt('Unified diff:'); if (r) loadDiff(r); }
+function pasteDiff() { const r = window.prompt('Diff:'); if (r) loadDiff(r); }
 async function send() {
   const p = prompt.value.trim(); if (!p) return; prompt.value = ''; appendBubble('user', p);
-  const d = await (await fetch('/api/chat', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ channel: ch, thread, prompt: p, model: modelSelect.value })
-  })).json();
+  const d = await (await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, thread, prompt:p, model:modelSelect.value}) })).json();
   appendBubble(modelSelect.value, d.reply || 'error'); await refreshThreads();
 }
 async function saveMem(pin) {
   await fetch('/api/memory/learn', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, title:mTitle.value, text:mText.value, pin}) });
-  appendBubble('system', pin ? 'Pinned' : 'Learned');
+  await refreshMemory();
 }
 async function approveTask() {
   btnApprove.disabled = true;
   const r = await (await fetch('/api/task/approve', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node_grpc_url:dNode.value, target_repo:dRepo.value, deploy_pipeline:dPipe.value, unified_diff:currentDiff}) })).json();
   appendBubble('deploy', JSON.stringify(r, null, 2));
 }
-async function forkThread() {
-  const dst = window.prompt(`Clone thread "${thread}" into new:`);
-  if (!dst) return;
-  const spec = window.prompt('How many messages to clone? Format: <first>,<last> (f.ex. 2,6 or 0,10):', '2,6');
-  if (!spec) return;
-  const [h, t] = spec.split(',').map(x => parseInt(x.trim(), 10) || 0);
-  const cleanDst = dst.trim().replace(/\s+/g, '-');
-
-  const res = await (await fetch('/api/threads/fork', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ channel: ch, src_thread: thread, dst_thread: cleanDst, keep_head: h, keep_tail: t })
-  })).json();
-
-  thread = cleanDst;
-  await refreshThreads();
-  await loadHistory();
-  appendBubble('system', `Forked from "${thread}": moved ${res.copied} messages (head=${h}, tail=${t}).`);
-}
-async function refreshChannels() {
-  const list = await (await fetch('/api/channels')).json();
-  if (!list.includes(ch)) list.push(ch);
-  chList.innerHTML = '';
-  list.forEach(c => {
-    const d = document.createElement('div');
-    d.className = 'item' + (c === ch ? ' active' : '');
-    d.textContent = `# ${c}`;
-    d.onclick = () => setCh(c);
-    chList.appendChild(d);
-  });
-}
-
-async function newChannel() {
-  const n = window.prompt('New channel / project:');
-  if (!n) return;
-  await setCh(n.trim().replace(/\s+/g, '-'));
-}
-
-async function setCh(c) {
-  ch = c; thread = 'main';
-  await refreshChannels();
-  await refreshThreads();
-  await refreshMemory();
-  await loadHistory();
-}
 window.onload = async () => {
-  dNode.value = localStorage.dNode || '';
-  dRepo.value = localStorage.dRepo || '';
-  dPipe.value = localStorage.dPipe || '';
-  const cfg = await (await fetch('/api/config')).json();
-  if (cfg.default_model) modelSelect.value = cfg.default_model;
+  if (localStorage.wLeft) leftBar.style.width = localStorage.wLeft + 'px';
+  if (localStorage.wRight) panel.style.width = localStorage.wRight + 'px';
+  initResize(resizerL, leftBar, 'wLeft', false); initResize(resizerR, panel, 'wRight', true);
+  dNode.value = localStorage.dNode || ''; dRepo.value = localStorage.dRepo || ''; dPipe.value = localStorage.dPipe || '';
+  langSelect.value = lang; setLang(lang);
+  const cfg = await (await fetch('/api/config')).json(); if (cfg.default_model) modelSelect.value = cfg.default_model;
   await setCh('general');
 };
-
-const spinFrames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-let spinIdx = 0, lastDone = -1;
-
+const spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']; let si = 0, lastDone = -1;
 setInterval(async () => {
   try {
     const s = await (await fetch('/api/status')).json();
     if (s.busy) {
-      const f = spinFrames[spinIdx++ % spinFrames.length];
       statusBadge.style.color = '#ecc94b';
-      statusBadge.textContent = `${f} indexing ${s.done_repos}/${s.total_repos}: ${s.current_repo} (${s.indexed_files} files)`;
-      if (s.done_repos !== lastDone) { lastDone = s.done_repos; await refreshChannels(); }
-    } else {
-      statusBadge.style.color = '#68d391';
-      statusBadge.textContent = `● ready (${s.total_repos} repos)`;
-      if (lastDone !== -2) { lastDone = -2; await refreshChannels(); }
-    }
-  } catch {
-    statusBadge.style.color = '#fc8181';
-    statusBadge.textContent = '● offline / reconnecting...';
-  }
+      statusBadge.textContent = `${spin[si++%spin.length]} ${s.done_repos}/${s.total_repos}: ${s.current_repo} (${s.indexed_files})`;
+      if (s.done_repos !== lastDone) { lastDone = s.done_repos; refreshChannels(); }
+    } else { statusBadge.style.color = '#68d391'; statusBadge.textContent = `● ready (${s.total_repos})`; if (lastDone !== -2) { lastDone = -2; refreshChannels(); } }
+  } catch { statusBadge.style.color = '#fc8181'; statusBadge.textContent = '● offline'; }
 }, 2000);
 </script>
 </body></html>

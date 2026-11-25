@@ -18,7 +18,11 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     pub fn new(api_key: String, chat_model: &str, embed_model: &str) -> Self {
-        Self { http: Client::new(), api_key, chat_model: chat_model.into(), embed_model: embed_model.into() }
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { http, api_key, chat_model: chat_model.into(), embed_model: embed_model.into() }
     }
 
     fn endpoint(&self, model: &str, action: &str) -> String {
