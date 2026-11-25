@@ -1,4 +1,11 @@
-mod config; mod executor; mod gemini; mod git_sync; mod migrate; mod storage; mod watcher; mod web_ui;
+mod config;
+mod executor;
+mod gemini;
+mod git_sync;
+mod migrate;
+mod storage;
+mod watcher;
+mod web_ui;
 
 use anyhow::Result;
 use config::{AppConfig, NodeMode};
@@ -8,9 +15,13 @@ use storage::pb::cluster_service_server::{ClusterService, ClusterServiceServer};
 use storage::pb::{ContextQuery, NodeTaskRequest, NodeTaskResponse, SyncAck, SyncEnvelope};
 use storage::Storage;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-struct NodeRpcServer { cfg: Arc<AppConfig>, db: Arc<Storage>, hmac_key: [u8; 32] }
+struct NodeRpcServer {
+    cfg: Arc<AppConfig>,
+    db: Arc<Storage>,
+    hmac_key: [u8; 32],
+}
 
 #[tonic::async_trait]
 impl ClusterService for NodeRpcServer {
@@ -18,18 +29,27 @@ impl ClusterService for NodeRpcServer {
         let (mut ok, mut skip) = (0, 0);
         for e in &req.into_inner().entries {
             match self.db.upsert_proto(e, false).await {
-                Ok(true) => ok += 1, Ok(false) => skip += 1, Err(err) => return Err(Status::internal(err.to_string())),
+                Ok(true) => ok += 1,
+                Ok(false) => skip += 1,
+                Err(err) => return Err(Status::internal(err.to_string())),
             }
         }
         Ok(Response::new(SyncAck { accepted_entries: ok, skipped_unchanged: skip }))
     }
+
     async fn query_node_context(&self, req: Request<ContextQuery>) -> Result<Response<SyncEnvelope>, Status> {
-        self.db.export_envelope(&self.cfg.node.id, Some(&req.into_inner().namespace)).await
-            .map(Response::new).map_err(|e| Status::internal(e.to_string()))
+        self.db
+            .export_envelope(&self.cfg.node.id, Some(&req.into_inner().namespace))
+            .await
+            .map(Response::new)
+            .map_err(|e| Status::internal(e.to_string()))
     }
+
     async fn execute_task(&self, req: Request<NodeTaskRequest>) -> Result<Response<NodeTaskResponse>, Status> {
-        executor::run_node_task(&self.cfg, &req.into_inner(), &self.hmac_key).await
-            .map(Response::new).map_err(|e| Status::permission_denied(e.to_string()))
+        executor::run_node_task(&self.cfg, &req.into_inner(), &self.hmac_key)
+            .await
+            .map(Response::new)
+            .map_err(|e| Status::permission_denied(e.to_string()))
     }
 }
 
@@ -55,19 +75,13 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-
     let cfg = Arc::new(AppConfig::load("/etc/xmeshd/cluster.yaml", "/etc/xmeshd/local.yaml")?);
     let db = Arc::new(Storage::connect(cfg.storage.primary_url.as_deref(), &cfg.storage.fallback_sqlite).await?);
     db.init_messages_schema().await?;
 
     let hmac_key = *blake3::hash(&std::fs::read(&cfg.node.hmac_secret_path)?).as_bytes();
-
     let api_key = std::env::var(&cfg.gemini.api_key_env).unwrap_or_default();
-    let gemini = Arc::new(GeminiClient::new(
-        api_key,
-        &cfg.gemini.chat_model,
-        &cfg.gemini.embed_model,
-    ));
+    let gemini = Arc::new(GeminiClient::new(api_key, &cfg.gemini.chat_model, &cfg.gemini.embed_model));
 
     match cfg.node.mode {
         NodeMode::Master => {
@@ -83,12 +97,11 @@ async fn main() -> Result<()> {
 
             let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
             tokio::spawn(async move { axum::serve(listener, web_ui::router(st)).await.unwrap(); });
-            info!("Master Web UI listening on http://0.0.0.0");
+            info!("Master Web UI listening on http://0.0.0");
 
             if let Some(root) = cfg.git.bare_repos_root.clone() {
                 let (db_bg, gem_bg, st_bg) = (db.clone(), gemini.clone(), status);
                 tokio::spawn(async move {
-                    // Даем Web UI 1 секунду гарантированно подняться до начала сканирования
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let r_clone = root.clone();
                     let repos = tokio::task::spawn_blocking(move || git_sync::discover_bare_repos(std::path::Path::new(&r_clone)))
@@ -98,15 +111,25 @@ async fn main() -> Result<()> {
 
                     for (idx, (ns, path)) in repos.into_iter().enumerate() {
                         { let mut s = st_bg.write().await; s.done_repos = idx; s.current_repo = ns.clone(); }
+                        info!("Scanning repo [{}/{}]: {}", idx + 1, total, ns);
                         let ns_c = ns.clone();
-                        let entries = tokio::task::spawn_blocking(move || git_sync::scan_bare_repo(&path, &ns_c))
-                            .await.unwrap_or(Ok(vec![])).unwrap_or_default();
+                        let scan_fut = tokio::task::spawn_blocking(move || git_sync::scan_bare_repo(&path, &ns_c));
+                        let entries = match tokio::time::timeout(std::time::Duration::from_secs(20), scan_fut).await {
+                            Ok(Ok(Ok(list))) => list,
+                            _ => { warn!("Skipped or timed out repo: {}", ns); continue; }
+                        };
 
-                        for mut e in entries {
+                        let mut embed_ok = true;
+                        for mut e in entries.into_iter().take(300) {
                             if db_bg.is_unchanged(&e.id, &e.content_hash).await.unwrap_or(false) { continue; }
-                            if let Ok(emb) = gem_bg.embed_text(&e.content).await { e.embedding = emb; }
+                            if embed_ok {
+                                match gem_bg.embed_text(&e.content).await {
+                                    Ok(emb) => e.embedding = emb,
+                                    Err(err) => { warn!("Embedding paused ({err}), saving raw text"); embed_ok = false; }
+                                }
+                            }
                             if db_bg.upsert_proto(&e, false).await.unwrap_or(false) { st_bg.write().await.indexed_files += 1; }
-                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            if embed_ok { tokio::time::sleep(std::time::Duration::from_millis(60)).await; }
                         }
                     }
                     let mut s = st_bg.write().await;
@@ -115,7 +138,6 @@ async fn main() -> Result<()> {
                 });
             }
         }
-
         NodeMode::Node => {
             let (c, d, g) = (cfg.clone(), db.clone(), gemini.clone());
             tokio::spawn(async move { if let Err(e) = watcher::run_node_watcher(c, d, g).await { error!("Watcher: {e}"); } });
