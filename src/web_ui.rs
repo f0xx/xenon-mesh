@@ -14,6 +14,7 @@ pub struct WebState {
     pub hmac_key: [u8; 32],
     pub bare_repos_root: Option<String>,
     pub default_model: String,
+    pub available_models: Vec<String>,
     pub status: Arc<RwLock<IndexStatus>>,
 }
 
@@ -68,7 +69,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/task/approve", post(handle_approve))
         .route("/api/internal/reindex", post(handle_reindex))
         .route("/api/config", get(|State(st): State<Arc<WebState>>| async move {
-            Json(serde_json::json!({ "default_model": st.default_model }))
+            Json(serde_json::json!({
+                "default_model": st.default_model,
+                "models": st.available_models
+            }))
         }))
         .route("/api/threads/fork", post(handle_fork_thread))
         .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))

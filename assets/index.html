@@ -21,6 +21,14 @@
   #diffView { flex:1; overflow:auto; background:#0b0d10; border:1px solid #2d3748; padding:8px; font-size:12px; white-space:pre; }
   .d-add { background:#132e21; color:#68d391; display:block; } .d-del { background:#33181b; color:#fc8181; display:block; }
   .d-hunk { color:#63b3ed; font-weight:bold; display:block; } .d-file { color:#f6e05e; font-weight:bold; display:block; }
+  .md pre { background:#0b0d10; border:1px solid #2d3748; padding:10px; border-radius:4px; overflow-x:auto; margin:8px 0; position:relative; }
+  .md code.inline { background:#2d3748; padding:1px 5px; border-radius:3px; color:#fbd38d; }
+  .md h1, .md h2, .md h3 { margin:10px 0 6px; color:#63b3ed; border-bottom:1px solid #2d3748; padding-bottom:2px; }
+  .md table { border-collapse:collapse; margin:8px 0; width:100%; font-size:12px; }
+  .md th, .md td { border:1px solid #2d3748; padding:5px 8px; text-align:left; }
+  .md th { background:#2d3748; }
+  .md blockquote { border-left:3px solid #718096; margin:6px 0; padding-left:10px; color:#a0aec0; }
+  .code-hdr { display:flex; justify-content:space-between; font-size:11px; color:#a0aec0; border-bottom:1px solid #2d3748; padding-bottom:4px; margin-bottom:6px; }
 </style>
 </head>
 <body>
@@ -141,18 +149,74 @@ async function loadHistory() {
   headerTitle.textContent = `# ${ch} / ${thread}`; log.innerHTML = '';
   (await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json()).forEach(m => appendBubble(m.role, m.text));
 }
+
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderMarkdown(raw) {
+  const blocks = [];
+  let txt = raw.replace(/```([a-zA-Z0-9_-]*)\n([\s\(\S\)]*?)```/g, (_, lang, code) => {
+    const id = blocks.length;
+    const clean = code.replace(/\n$/, '');
+    const b64 = btoa(unescape(encodeURIComponent(clean)));
+    blocks.push(
+      `<pre><div class="code-hdr"><span>${escHtml(lang || 'text')}</span>` +
+      `<button style="padding:1px 6px;font-size:11px" onclick="navigator.clipboard.writeText(decodeURIComponent(escape(atob('${b64}'))))">Copy</button></div>` +
+      `<code>${escHtml(clean)}</code></pre>`
+    );
+    return `\x00BLK${id}\x00`;
+  });
+
+  txt = escHtml(txt);
+
+  txt = txt.replace(/((?:^\|.+\|\n?)+)/gm, tbl => {
+    const rows = tbl.trim().split('\n').filter(r => !/^\|[\s:-]+\|$/.test(r.trim()));
+    const htmlRows = rows.map((r, i) => {
+      const tag = i === 0 ? 'th' : 'td';
+      const cells = r.trim().replace(/^\||\|$/g, '').split('|').map(c => `<${tag}>${c.trim()}</${tag}>`).join('');
+      return `<tr>${cells}</tr>`;
+    }).join('');
+    return `<table>${htmlRows}</table>`;
+  });
+
+  txt = txt
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
+    .replace(/`([^`\n]+)`/g, '<code class="inline">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\*([^*]+)\*/g, '<i>$1</i>');
+
+  return txt.replace(/\x00BLK(\d+)\x00/g, (_, i) => blocks[Number(i)]);
+}
+
 function appendBubble(who, txt) {
-  const box = document.createElement('div'); box.className = 'msg';
-  const body = document.createElement('div'); body.textContent = `[${who}]\n${txt}`; box.appendChild(body);
+  const box = document.createElement('div');
+  box.className = 'msg md';
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'font-weight:bold;color:#63b3ed;margin-bottom:4px';
+  hdr.textContent = `[${who}]`;
+  box.appendChild(hdr);
+
+  const body = document.createElement('div');
+  body.innerHTML = renderMarkdown(txt);
+  box.appendChild(body);
+
+  // Перехватываем сырой diff для правой панели инспектора
   const m = txt.match(/```diff\n([\s\(\S\)]*?)```/);
   if (m) {
     const b = document.createElement('button');
-    b.style.marginTop = '6px'; b.textContent = 'Inspect Diff ->';
-    b.onclick = () => loadDiff(m);
+    b.style.marginTop = '8px';
+    b.textContent = 'Inspect Diff ->';
+    b.onclick = () => loadDiff(m[1]);
     box.appendChild(b);
   }
-  log.appendChild(box); log.scrollTop = log.scrollHeight;
+  log.appendChild(box);
+  log.scrollTop = log.scrollHeight;
 }
+
 let pendingAtts = [];
 
 function renderAtts() {
@@ -226,7 +290,16 @@ window.onload = async () => {
   initResize(resizerL, leftBar, 'wLeft', false); initResize(resizerR, panel, 'wRight', true);
   dNode.value = localStorage.dNode || ''; dRepo.value = localStorage.dRepo || ''; dPipe.value = localStorage.dPipe || '';
   langSelect.value = lang; setLang(lang);
-  const cfg = await (await fetch('/api/config')).json(); if (cfg.default_model) modelSelect.value = cfg.default_model;
+  const cfg = await (await fetch('/api/config')).json();
+  if (cfg.models && cfg.models.length) {
+    modelSelect.innerHTML = '';
+    cfg.models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m; opt.textContent = m;
+      modelSelect.appendChild(opt);
+    });
+  }
+  if (cfg.default_model) modelSelect.value = cfg.default_model;
   await setCh('general');
 };
 const spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']; let si = 0, lastDone = -1;

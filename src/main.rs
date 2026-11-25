@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
                 bare_repos_root: cfg.git.bare_repos_root.clone(),
                 default_model: cfg.gemini.chat_model.clone(),
                 status: status.clone(),
+                available_models: cfg.gemini.available_models.clone(),
             });
 
             let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
