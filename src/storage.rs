@@ -18,6 +18,14 @@ pub struct Storage {
     pub kind: DbKind,
 }
 
+#[derive(serde::Serialize)]
+pub struct MemoryItem {
+    pub id: String,
+    pub kind: String,
+    pub source_path: String,
+    pub content: String,
+}
+
 impl Storage {
     pub async fn connect(primary: Option<&str>, sqlite_fallback: &str) -> Result<Self> {
         sqlx::any::install_default_drivers();
@@ -172,7 +180,6 @@ impl Storage {
 
 
 impl Storage {
-    /// Вызывать внутри init_schema() вслед за созданием context_entries
     pub async fn init_messages_schema(&self) -> Result<()> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS session_messages (
@@ -194,7 +201,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Сохраняет одно сообщение треда в БД (совместимо с SQLite, Postgres и MariaDB)
     pub async fn append_message(&self, msg: &pb::SessionMessage) -> Result<()> {
         let ts = if msg.created_at_ms > 0 {
             msg.created_at_ms
@@ -275,6 +281,66 @@ impl Storage {
             threads.insert(0, "main".to_string());
         }
         Ok(threads)
+    }
+
+    pub async fn fork_thread(
+        &self,
+        channel_id: &str,
+        src_thread: &str,
+        dst_thread: &str,
+        keep_head: usize,
+        keep_tail: usize,
+    ) -> Result<usize> {
+        let all = self.load_thread(channel_id, src_thread, 10_000).await?;
+        if all.is_empty() {
+            return Ok(0);
+        }
+
+        let total = all.len();
+        let mut selected = Vec::new();
+
+        for (idx, msg) in all.into_iter().enumerate() {
+            let in_head = idx < keep_head;
+            let in_tail = keep_tail > 0 && idx >= total.saturating_sub(keep_tail);
+            if in_head || in_tail {
+                selected.push(msg);
+            }
+        }
+
+        let count = selected.len();
+        for (new_seq, mut msg) in selected.into_iter().enumerate() {
+            msg.thread_id = dst_thread.to_string();
+            msg.seq = (new_seq + 1) as u64;
+            self.append_message(&msg).await?;
+        }
+        Ok(count)
+    }
+}
+
+impl Storage {
+    pub async fn list_channel_memory(&self, namespace: &str) -> Result<Vec<MemoryItem>> {
+        let rows = sqlx::query(
+            "SELECT id, entry_type, source_path, content FROM context_entries
+             WHERE namespace = $1 AND entry_type IN (2, 3) ORDER BY source_path ASC"
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| {
+            let et: i32 = r.get("entry_type");
+            MemoryItem {
+                id: r.get("id"),
+                kind: if et == 2 { "PIN".into() } else { "LEARN".into() },
+                source_path: r.get("source_path"),
+                content: r.get("content"),
+            }
+        }).collect())
+    }
+
+    pub async fn delete_entry(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM context_entries WHERE id = $1").bind(id).execute(&self.pool).await?;
+        Ok(())
     }
 }
 

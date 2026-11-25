@@ -24,10 +24,24 @@ pub struct ChatReq {
     pub model: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ForkThreadReq {
+    pub channel: String,
+    pub src_thread: String,
+    pub dst_thread: String,
+    pub keep_head: usize,
+    pub keep_tail: usize,
+}
+
 #[derive(Serialize)] pub struct ChatRes { pub reply: String }
 #[derive(Deserialize)] pub struct HistoryQuery { pub channel: String, pub thread: String }
 #[derive(Deserialize)] pub struct ThreadsQuery { pub channel: String }
 #[derive(Deserialize)] pub struct ReindexQuery { pub namespace: String }
+
+use crate::storage::MemoryItem;
+
+#[derive(Deserialize)] pub struct MemListQuery { pub channel: String }
+#[derive(Deserialize)] pub struct MemDelQuery { pub id: String }
 
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
@@ -41,6 +55,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/config", get(|State(st): State<Arc<WebState>>| async move {
             Json(serde_json::json!({ "default_model": st.default_model }))
         }))
+        .route("/api/threads/fork", post(handle_fork_thread))
+        .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))
         .route("/v1/chat/completions", post(handle_oai_compat))
         .with_state(state)
 }
@@ -145,4 +161,30 @@ async fn handle_oai_compat(State(st): State<Arc<WebState>>, Json(req): Json<OaiC
         "choices": [{ "index": 0, "message": { "role": "assistant", "content": reply }, "finish_reason": "stop" }]
     })))
 }
+
+async fn handle_fork_thread(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<ForkThreadReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let copied = st.db
+        .fork_thread(&req.channel, &req.src_thread, &req.dst_thread, req.keep_head, req.keep_tail)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "copied": copied, "thread": req.dst_thread })))
+}
+
+async fn handle_list_memory(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<MemListQuery>,
+) -> Result<Json<Vec<MemoryItem>>, StatusCode> {
+    st.db.list_channel_memory(&q.channel).await.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn handle_delete_memory(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<MemDelQuery>,
+) -> Result<StatusCode, StatusCode> {
+    st.db.delete_entry(&q.id).await.map(|_| StatusCode::OK).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 

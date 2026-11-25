@@ -29,7 +29,11 @@
     <div class="item" onclick="setCh(this,'router-fw')"># router-fw</div>
     <div class="item" onclick="setCh(this,'xen-kernel')"># xen-kernel</div>
   </div>
-  <br><b>THREADS</b> <button style="padding:1px 6px;float:right" onclick="newThread()">+</button>
+  <br><b>THREADS</b>
+    <span style="float:right">
+    <button style="padding:1px 6px" title="Clone thread with context" onclick="forkThread()">Fork</button>
+    <button style="padding:1px 6px" title="New thread" onclick="newThread()">+</button>
+  </span>
   <hr style="border-color:#2d3748"><div id="threadList"></div>
 </aside>
 <main>
@@ -45,14 +49,14 @@
 </main>
 <div id="panel">
   <b>CONTEXT & MEMORY</b>
-  <input id="mTitle" placeholder="Ключ (напр. nft-rules)">
-  <textarea id="mText" style="flex:none;height:60px" placeholder="Текст или выжимка..."></textarea>
+  <input id="mTitle" placeholder="Key (f.ex. nft-rules)">
+  <textarea id="mText" style="flex:none;height:60px" placeholder="Text or short..."></textarea>
   <div style="display:flex;gap:6px"><button onclick="saveMem(true)">Pin Raw</button><button onclick="saveMem(false)">Distill Learn</button></div>
   <hr style="border-color:#2d3748;width:100%">
   <b>DIFF INSPECTOR & DEPLOY</b>
   <input id="dNode" value="http://10.10.0.12:8443"><input id="dRepo" value="/srv/projects/router-fw"><input id="dPipe" value="reload-nft">
   <div style="display:flex;justify-content:space-between"><span id="diffStats">No diff</span><button onclick="pasteDiff()">Paste</button></div>
-  <div id="diffView">Ожидание патча...</div>
+  <div id="diffView">Awaiting diff...</div>
   <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()">Approve & Execute</button>
 </div>
 <script>
@@ -71,10 +75,11 @@ async function refreshThreads() {
   });
 }
 async function newThread() {
-  const n = window.prompt('Имя треда:'); if (!n) return;
+  const n = window.prompt('Thread name:'); if (!n) return;
   thread = n.trim().replace(/\s+/g, '-'); await refreshThreads(); log.innerHTML = '';
 }
 async function loadHistory() {
+  headerTitle.textContent = `# ${ch} / ${thread}`;
   log.innerHTML = '';
   const msgs = await (await fetch(`/api/history?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}`)).json();
   msgs.forEach(m => appendBubble(m.role, m.text));
@@ -83,7 +88,7 @@ function appendBubble(who, txt) {
   const box = document.createElement('div'); box.className = 'msg';
   const body = document.createElement('div'); body.textContent = `[${who}]\n${txt}`; box.appendChild(body);
   const m = txt.match(/```diff\n([\s\(\S\)]*?)```/);
-  if (m) { const b = document.createElement('button'); b.style.marginTop='6px'; b.textContent='Inspect Diff ->'; b.onclick=()=>loadDiff(m); box.appendChild(b); }
+  if (m) { const b = document.createElement('button'); b.style.marginTop='6px'; b.textContent='Inspect Diff ->'; b.onclick=()=>loadDiff(m[1]); box.appendChild(b); }
   log.appendChild(box); log.scrollTop = log.scrollHeight;
 }
 function loadDiff(raw) {
@@ -114,6 +119,24 @@ async function approveTask() {
   btnApprove.disabled = true;
   const r = await (await fetch('/api/task/approve', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node_grpc_url:dNode.value, target_repo:dRepo.value, deploy_pipeline:dPipe.value, unified_diff:currentDiff}) })).json();
   appendBubble('deploy', JSON.stringify(r, null, 2));
+}
+async function forkThread() {
+  const dst = window.prompt(`Clone thread "${thread}" into new:`);
+  if (!dst) return;
+  const spec = window.prompt('How many messages to clone? Format: <first>,<last> (f.ex. 2,6 or 0,10):', '2,6');
+  if (!spec) return;
+  const [h, t] = spec.split(',').map(x => parseInt(x.trim(), 10) || 0);
+  const cleanDst = dst.trim().replace(/\s+/g, '-');
+
+  const res = await (await fetch('/api/threads/fork', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: ch, src_thread: thread, dst_thread: cleanDst, keep_head: h, keep_tail: t })
+  })).json();
+
+  thread = cleanDst;
+  await refreshThreads();
+  await loadHistory();
+  appendBubble('system', `Forked from "${thread}": moved ${res.copied} messages (head=${h}, tail=${t}).`);
 }
 window.onload = async () => {
   const cfg = await (await fetch('/api/config')).json();
