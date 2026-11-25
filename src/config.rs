@@ -31,14 +31,20 @@ pub struct GeminiSection {
     pub chat_model: String,
     pub embed_model: String,
     pub api_key_env: String,
+    pub available_models: Vec<String>,
 }
 
 impl Default for GeminiSection {
     fn default() -> Self {
         Self {
-            chat_model: "gemini-2.5-flash".to_string(),
+            chat_model: "gemini-3.8-flash".to_string(),
             embed_model: "gemini-embedding-001".to_string(),
             api_key_env: "GEMINI_API_KEY".to_string(),
+            available_models: vec![
+                "gemini-3.8-flash".to_string(),
+                "gemini-4-hydrogen".to_string(),
+                "gemini-2.5-pro".to_string(),
+            ],
         }
     }
 }
