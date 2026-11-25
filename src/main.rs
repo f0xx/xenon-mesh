@@ -313,6 +313,7 @@ async fn main() -> Result<()> {
             .clone()
             .filter(|s| !s.trim().is_empty()),
     ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         match axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await {
             Ok(tls) => match addr.parse::<std::net::SocketAddr>() {
                 Ok(https) => {

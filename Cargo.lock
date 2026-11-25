@@ -3186,6 +3186,7 @@ dependencies = [
  "notify-debouncer-mini",
  "prost",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sqlx",
