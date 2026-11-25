@@ -61,8 +61,13 @@ async fn main() -> Result<()> {
     db.init_messages_schema().await?;
 
     let hmac_key = *blake3::hash(&std::fs::read(&cfg.node.hmac_secret_path)?).as_bytes();
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    let gemini = Arc::new(GeminiClient::new(api_key, "gemini-2.5-pro", "gemini-embedding-001"));
+
+    let api_key = std::env::var(&cfg.gemini.api_key_env).unwrap_or_default();
+    let gemini = Arc::new(GeminiClient::new(
+        api_key,
+        &cfg.gemini.chat_model,
+        &cfg.gemini.embed_model,
+    ));
 
     match cfg.node.mode {
         NodeMode::Master => {
@@ -86,6 +91,7 @@ async fn main() -> Result<()> {
                 gemini,
                 hmac_key,
                 bare_repos_root: cfg.git.bare_repos_root.clone(),
+                default_model: cfg.gemini.chat_model.clone(),
             });
             let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
             tokio::spawn(async move { axum::serve(listener, web_ui::router(st)).await.unwrap(); });

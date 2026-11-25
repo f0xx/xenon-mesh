@@ -13,9 +13,17 @@ pub struct WebState {
     pub gemini: Arc<GeminiClient>,
     pub hmac_key: [u8; 32],
     pub bare_repos_root: Option<String>,
+    pub default_model: String,
 }
 
-#[derive(Deserialize)] pub struct ChatReq { pub channel: String, pub thread: String, pub prompt: String }
+#[derive(Deserialize)]
+pub struct ChatReq {
+    pub channel: String,
+    pub thread: String,
+    pub prompt: String,
+    pub model: Option<String>,
+}
+
 #[derive(Serialize)] pub struct ChatRes { pub reply: String }
 #[derive(Deserialize)] pub struct HistoryQuery { pub channel: String, pub thread: String }
 #[derive(Deserialize)] pub struct ThreadsQuery { pub channel: String }
@@ -30,6 +38,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/memory/learn", post(handle_learn))
         .route("/api/task/approve", post(handle_approve))
         .route("/api/internal/reindex", post(handle_reindex))
+        .route("/api/config", get(|State(st): State<Arc<WebState>>| async move {
+            Json(serde_json::json!({ "default_model": st.default_model }))
+        }))
         .route("/v1/chat/completions", post(handle_oai_compat))
         .with_state(state)
 }
@@ -57,7 +68,10 @@ async fn handle_persistent_chat(State(st): State<Arc<WebState>>, Json(req): Json
     let turns: Vec<ChatTurn> = past.into_iter().map(|m| ChatTurn { role: m.author, text: m.content }).collect();
     let q_emb = st.gemini.embed_text(&req.prompt).await.unwrap_or_default();
     let ctx = build_prompt_context(&st.db, &req.channel, &q_emb, 8).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let reply = st.gemini.generate_chat(&ctx, &turns).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let model = req.model.as_deref().filter(|s| !s.is_empty()).unwrap_or(&st.default_model);
+    let reply = st.gemini.generate_chat_with_model(model, &ctx, &turns)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
     let bot_msg = SessionMessage {
         channel_id: req.channel, thread_id: req.thread,

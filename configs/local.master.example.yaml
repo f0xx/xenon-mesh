@@ -3,9 +3,13 @@ node:
   mode: "master"
 
 storage:
-  # Если Postgres временно упадет при обновлении Gentoo, демон автоматически перейдет на SQLite
   primary_url: "postgres://xmesh:labpass@127.0.0.1:5432/xmesh_lab"
   fallback_sqlite: "/var/lib/xmeshd/master_fallback.db"
+
+gemini:
+  chat_model: "gemini-2.5-flash"
+  embed_model: "gemini-embedding-001"
+  api_key_env: "GEMINI_API_KEY"
 
 git:
   bare_repos_root: "/srv/git"

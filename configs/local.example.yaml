@@ -9,7 +9,13 @@ watched_repos: []
 deploy_pipelines:
   reload-nft:
     workdir: "/srv/projects/router-fw"
-    command: ["/usr/local/libexec/safe-nft-apply.sh"]
-    use_bwrap: false # Нужен доступ к netlink ядра через doas/sudo враппер
+    command: ["/usr/local/libexec/nft-apply.sh"]
+    use_bwrap: false # access netlink through doas/sudo 
     allow_network: false
+
+gemini:
+  chat_model: "gemini-2.5-flash"
+  embed_model: "gemini-embedding-001"
+  api_key_env: "GEMINI_API_KEY"
+
 

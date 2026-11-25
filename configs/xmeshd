@@ -1,0 +1,3 @@
+# /etc/conf.d/xmeshd
+export GEMINI_API_KEY="AIzaSyKeyFrom_AI_Studio"
+

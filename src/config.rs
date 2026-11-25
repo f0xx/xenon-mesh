@@ -20,7 +20,27 @@ pub struct AppConfig {
     pub storage: StorageSection,
     pub git: GitSection,
     #[serde(default)]
+    pub gemini: GeminiSection,
+    #[serde(default)]
     pub deploy_pipelines: HashMap<String, DeployPipeline>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeminiSection {
+    pub chat_model: String,
+    pub embed_model: String,
+    pub api_key_env: String,
+}
+
+impl Default for GeminiSection {
+    fn default() -> Self {
+        Self {
+            chat_model: "gemini-2.5-flash".to_string(),
+            embed_model: "gemini-embedding-001".to_string(),
+            api_key_env: "GEMINI_API_KEY".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

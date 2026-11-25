@@ -33,12 +33,16 @@ impl GeminiClient {
     }
 
     pub async fn generate_chat(&self, system_ctx: &str, turns: &[ChatTurn]) -> Result<String> {
+        self.generate_chat_with_model(&self.chat_model, system_ctx, turns).await
+    }
+
+    pub async fn generate_chat_with_model(&self, model: &str, system_ctx: &str, turns: &[ChatTurn]) -> Result<String> {
         let contents: Vec<Value> = turns.iter().map(|t| json!({ "role": t.role, "parts": [{ "text": t.text }] })).collect();
         let mut body = json!({ "contents": contents, "generationConfig": { "temperature": 0.3 } });
         if !system_ctx.trim().is_empty() {
             body["systemInstruction"] = json!({ "parts": [{ "text": system_ctx }] });
         }
-        let res: Value = self.http.post(self.endpoint(&self.chat_model, "generateContent")).json(&body).send().await?.json().await?;
+        let res: Value = self.http.post(self.endpoint(model, "generateContent")).json(&body).send().await?.json().await?;
         res["candidates"][0]["content"]["parts"][0]["text"].as_str().map(str::to_string).context("Empty Gemini response")
     }
 

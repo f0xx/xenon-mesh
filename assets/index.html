@@ -33,6 +33,13 @@
   <hr style="border-color:#2d3748"><div id="threadList"></div>
 </aside>
 <main>
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;background:#181b20;border-bottom:1px solid #2d3748">
+    <b id="headerTitle"># general / main</b>
+    <select id="modelSelect" style="background:#0d0f12;color:#fff;border:1px solid #2d3748;padding:4px 8px;font:inherit">
+      <option value="gemini-2.5-flash">gemini-2.5-flash (fast / high quota)</option>
+      <option value="gemini-2.5-pro">gemini-2.5-pro (deep reasoning)</option>
+    </select>
+  </div>
   <div id="log"></div>
   <div class="bar"><textarea id="prompt" placeholder="Сообщение в тред..."></textarea><button onclick="send()">Send</button></div>
 </main>
@@ -93,8 +100,11 @@ function loadDiff(raw) {
 function pasteDiff() { const r = window.prompt('Unified diff:'); if (r) loadDiff(r); }
 async function send() {
   const p = prompt.value.trim(); if (!p) return; prompt.value = ''; appendBubble('user', p);
-  const d = await (await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, thread, prompt:p}) })).json();
-  appendBubble('model', d.reply || 'error'); await refreshThreads();
+  const d = await (await fetch('/api/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: ch, thread, prompt: p, model: modelSelect.value })
+  })).json();
+  appendBubble(modelSelect.value, d.reply || 'error'); await refreshThreads();
 }
 async function saveMem(pin) {
   await fetch('/api/memory/learn', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel:ch, title:mTitle.value, text:mText.value, pin}) });
@@ -105,7 +115,11 @@ async function approveTask() {
   const r = await (await fetch('/api/task/approve', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node_grpc_url:dNode.value, target_repo:dRepo.value, deploy_pipeline:dPipe.value, unified_diff:currentDiff}) })).json();
   appendBubble('deploy', JSON.stringify(r, null, 2));
 }
-window.onload = () => setCh(null, 'general');
+window.onload = async () => {
+  const cfg = await (await fetch('/api/config')).json();
+  if (cfg.default_model) modelSelect.value = cfg.default_model;
+  await setCh(null, 'general');
+};
 </script>
 </body></html>
 
