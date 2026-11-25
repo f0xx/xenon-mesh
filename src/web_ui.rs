@@ -1198,9 +1198,13 @@ struct ShareEntry {
 #[derive(Serialize, Deserialize)]
 struct ShareBody {
     channel: String,
+    #[serde(default)]
     origin_node: String,
+    #[serde(default)]
     members: Vec<String>,
+    #[serde(default)]
     messages: Vec<ShareMsg>,
+    #[serde(default)]
     entries: Vec<ShareEntry>,
     #[serde(default)]
     token_hash: String,
@@ -1842,7 +1846,11 @@ async fn handle_share(
             &payload,
         )
         .await?;
+        if resp.status() == StatusCode::FORBIDDEN {
+            return Err(StatusCode::FORBIDDEN);
+        }
         if !resp.status().is_success() {
+            warn!(status = %resp.status(), "hub rejected the share");
             return Err(StatusCode::BAD_GATEWAY);
         }
     }

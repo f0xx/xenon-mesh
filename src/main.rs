@@ -312,6 +312,9 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(|path| identity::load_peers(std::path::Path::new(path)))
         .unwrap_or_default();
+    if cfg.node.node_key_path.is_some() && node_key.is_none() {
+        warn!("node key path is set but the file could not be read");
+    }
     info!(
         "node identity key present: {}, peer keys: {}",
         node_key.is_some(),
