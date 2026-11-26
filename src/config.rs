@@ -312,6 +312,9 @@ pub struct ModelsSection {
     /// Applied to every provider. A provider's own `sampling` wins per field.
     #[serde(default)]
     pub sampling: Sampling,
+    /// Max follow-up critique rounds when multi-model debate is enabled. 0 disables debates.
+    #[serde(default)]
+    pub debate_max_rounds: u32,
 }
 
 impl Default for ModelsSection {
@@ -323,6 +326,7 @@ impl Default for ModelsSection {
             providers: Vec::new(),
             providers_file: String::new(),
             sampling: Sampling::default(),
+            debate_max_rounds: 0,
         }
     }
 }

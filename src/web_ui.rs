@@ -73,6 +73,8 @@ pub struct ChatReq {
     /// Re-run the model on the thread as stored. Used after an edit.
     #[serde(default)]
     pub rerun: bool,
+    #[serde(default)]
+    pub debate: bool,
 }
 
 #[derive(Deserialize)]
@@ -1384,6 +1386,7 @@ async fn run_one_reply(
     reply_thread: String,
     sync_hub: bool,
     left: Arc<AtomicUsize>,
+    send_saved: bool,
 ) {
     let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
     let forward = tx.clone();
@@ -1465,14 +1468,16 @@ async fn run_one_reply(
     drop(local_tx);
     let _ = pump.await;
     let last = left.fetch_sub(1, Ordering::SeqCst) == 1;
-    let _ = tx
-        .send(StreamEvent::Saved {
-            seq: stored.seq,
-            thread: reply_thread,
-            model: author,
-            last,
-        })
-        .await;
+    if send_saved {
+        let _ = tx
+            .send(StreamEvent::Saved {
+                seq: stored.seq,
+                thread: reply_thread,
+                model: author,
+                last,
+            })
+            .await;
+    }
 }
 
 async fn handle_persistent_chat(
@@ -1679,12 +1684,18 @@ async fn handle_persistent_chat(
                 .await;
         }
         let left = Arc::new(AtomicUsize::new(models_bg.len()));
+        let max_rounds = if req.debate && models_bg.len() > 1 {
+            st_bg.cfg.models.debate_max_rounds.min(6)
+        } else {
+            0
+        };
+        let has_debate = max_rounds > 0;
         let reply_name = reply_thread.unwrap_or_default();
         let mut pending = tokio::task::JoinSet::new();
-        for model in models_bg {
+        for model in &models_bg {
             pending.spawn(run_one_reply(
                 st_bg.clone(),
-                model,
+                model.clone(),
                 ctx.clone(),
                 turns.clone(),
                 tx.clone(),
@@ -1694,9 +1705,85 @@ async fn handle_persistent_chat(
                 reply_name.clone(),
                 sync_hub,
                 left.clone(),
+                !has_debate,
             ));
         }
         while pending.join_next().await.is_some() {}
+
+        if has_debate {
+            'debate: for round in 1..=max_rounds {
+                for (idx, model) in models_bg.iter().enumerate() {
+                    let is_final_turn = round == max_rounds && idx + 1 == models_bg.len();
+                    let _ = tx
+                        .send(StreamEvent::Status {
+                            text: format!("Debate round {round}/{max_rounds}: {model} reviewing..."),
+                            model: model.clone(),
+                        })
+                        .await;
+                    let history = st_bg
+                        .db
+                        .load_thread(&req.channel, &model_thread, 100)
+                        .await
+                        .unwrap_or_default();
+                    let mut debate_turns: Vec<ChatTurn> = history
+                        .into_iter()
+                        .map(|m| ChatTurn {
+                            role: m.author,
+                            text: m.content,
+                            attachments: vec![],
+                        })
+                        .collect();
+                    debate_turns.push(ChatTurn {
+                        role: "system".into(),
+                        text: format!(
+                            "You are participating in a peer code/architecture review (round {round} of {max_rounds}) as `{model}`.\n\
+                             Critically examine the previous responses from other models in this thread.\n\
+                             Point out concrete bugs, edge cases, race conditions, or flawed assumptions.\n\
+                             If all issues are resolved and you fully agree on the final solution, start your reply with `CONSENSUS:` and provide the clean unified ```diff.\n\
+                             Otherwise, explain the flaws and propose an improved solution or ```diff."
+                        ),
+                        attachments: vec![],
+                    });
+                    let one_left = Arc::new(AtomicUsize::new(1));
+                    run_one_reply(
+                        st_bg.clone(),
+                        model.clone(),
+                        ctx.clone(),
+                        debate_turns,
+                        tx.clone(),
+                        audit.clone(),
+                        req.channel.clone(),
+                        model_thread.clone(),
+                        reply_name.clone(),
+                        sync_hub,
+                        one_left,
+                        false,
+                    )
+                    .await;
+                    let latest = st_bg
+                        .db
+                        .load_thread(&req.channel, &model_thread, 100)
+                        .await
+                        .unwrap_or_default();
+                    let agreed = latest
+                        .last()
+                        .map(|m| m.content.trim_start().starts_with("CONSENSUS:"))
+                        .unwrap_or(false);
+                    if agreed || is_final_turn {
+                        let last_seq = latest.last().map(|m| m.seq).unwrap_or(0);
+                        let _ = tx
+                            .send(StreamEvent::Saved {
+                                seq: last_seq,
+                                thread: reply_name.clone(),
+                                model: model.clone(),
+                                last: true,
+                            })
+                            .await;
+                        break 'debate;
+                    }
+                }
+            }
+        }
     });
 
     let stream = ReceiverStream::new(rx)

@@ -96,6 +96,7 @@
     </div>
     <div style="display:flex;gap:6px;flex-shrink:0">
       <label title="Ask every selected model. Each reply is separate and they may disagree." style="font-size:12px;color:#a0aec0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="multiToggle"> multi</label>
+      <label id="debateWrap" title="Allow models to critique each other in rounds until consensus (requires debate_max_rounds > 0 in config)." style="font-size:12px;color:#a0aec0;display:none;align-items:center;gap:4px"><input type="checkbox" id="debateToggle"> debate</label>
       <select id="modelSelect"><option value="gemini-2.5-flash">gemini-2.5-flash</option><option value="gemini-2.5-pro">gemini-2.5-pro</option></select>
       <button id="bell" style="background:#4a5568" title="Desktop notifications need HTTPS or localhost" onclick="enableNotes()">Bell</button>
       <button style="background:#4a5568" onclick="toggleAudit()">Log</button>
@@ -552,6 +553,8 @@ function selectedModels() {
 function applyMultiMode() {
   modelSelect.multiple = multiToggle.checked;
   modelSelect.size = multiToggle.checked ? Math.min(8, Math.max(modelSelect.options.length, 2)) : 1;
+  debateWrap.style.display = multiToggle.checked ? 'flex' : 'none';
+  if (!multiToggle.checked) debateToggle.checked = false;
 }
 async function loadChatPref() {
   const gen = ++prefGen;
@@ -890,7 +893,7 @@ async function send(existing, rerun) {
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: ids[0] || '', models: ids, attachments: rerun ? [] : atts, rerun: !!rerun })
+      body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: ids[0] || '', models: ids, attachments: rerun ? [] : atts, rerun: !!rerun, debate: multiToggle.checked && debateToggle.checked })
     });
     if (!resp.ok || !resp.body) {
       const slot = ensureCard(ids[0] || '');
@@ -915,6 +918,9 @@ async function send(existing, rerun) {
         let ev;
         try { ev = JSON.parse(chunk.slice(5).trim()); }
         catch (err) { continue; }
+        if (ev.type === 'status' && ev.model && /Debate round /.test(ev.text || '')) {
+          cards.delete(ev.model);
+        }
         const slot = ensureCard(ev.model || ids[0] || '');
         if (ev.type === 'status') {
           slot.statusLine.textContent = `⏳ ${ev.text}`;
