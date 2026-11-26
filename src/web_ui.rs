@@ -1036,7 +1036,7 @@ async fn prompt_for(
     }
     let entries: Vec<_> = merged.into_values().collect();
     let q_emb = st.models.embed_text(query).await.unwrap_or_default();
-    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, 8, 28_000);
+    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, 10, 64_000);
     let mut outline = String::new();
     if let Some(dir) = outline_dir {
         outline = project_outline(&st.cfg, dir).await;

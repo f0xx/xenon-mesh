@@ -10,22 +10,38 @@ fn endpoint(model: &str, action: &str) -> String {
 }
 
 fn contents(turns: &[ChatTurn]) -> Vec<Value> {
-    turns
-        .iter()
-        .filter(|t| t.role != "system")
-        .map(|t| {
-            let mut parts = vec![json!({ "text": t.text })];
-            for att in &t.attachments {
-                parts.push(json!({
-                    "inlineData": { "mimeType": att.mime_type, "data": att.data_base64 }
-                }));
+    let mut out: Vec<Value> = Vec::new();
+    for t in turns.iter().filter(|t| t.role != "system") {
+        let role = map_role(ConcreteKind::Gemini, &t.role);
+        let label = if t.role.trim().is_empty()
+            || t.role == "user"
+            || t.role == "assistant"
+            || t.role == "model"
+        {
+            String::new()
+        } else {
+            format!("[{}]:\n", t.role)
+        };
+        let mut parts = vec![json!({ "text": format!("{label}{}", t.text) })];
+        for att in &t.attachments {
+            parts.push(json!({
+                "inlineData": { "mimeType": att.mime_type, "data": att.data_base64 }
+            }));
+        }
+        if let Some(last) = out.last_mut() {
+            if last["role"].as_str() == Some(role) {
+                if let Some(arr) = last["parts"].as_array_mut() {
+                    arr.extend(parts);
+                    continue;
+                }
             }
-            json!({
-                "role": map_role(ConcreteKind::Gemini, &t.role),
-                "parts": parts
-            })
-        })
-        .collect()
+        }
+        out.push(json!({
+            "role": role,
+            "parts": parts
+        }));
+    }
+    out
 }
 
 fn body(system_ctx: &str, turns: &[ChatTurn], thinking: bool, sampling: Sampling) -> Value {
