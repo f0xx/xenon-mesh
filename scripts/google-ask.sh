@@ -36,6 +36,15 @@ if [ -z "$body" ]; then
   exit 0
 fi
 
+case "$body" in
+  *trouble\ accessing\ Google\ Search*|*enablejs*)
+    echo "Google served its automated-access page instead of a result."
+    echo "The query was:"
+    printf '%s\n' "$query"
+    exit 0
+    ;;
+esac
+
 printf '%s' "$body" | python3 -c '
 import re, sys
 html = sys.stdin.read()
