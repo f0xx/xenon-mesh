@@ -1,6 +1,8 @@
 # Hub example. Copy to /etc/xmeshd/local.yaml and replace placeholders.
 # Database passwords and API keys stay in the environment or in this
 # untracked file, never in the source tree.
+# schema v1. node.id is required and is the name shown on this machine's messages.
+schema: 1
 node:
   id: "hub"
   mode: "master"

@@ -26,7 +26,13 @@ xmeshd check /etc/xmeshd/local.yaml /etc/xmeshd/cluster.yaml
 
 Copy `/etc/xmeshd/hmac.key` to every node. Do not commit it.
 
-The hub indexes `git.bare_repos_root` in the background. A bare repo with an empty HEAD is skipped. Drop a `.xmeshignore` file in a bare repo to exclude it. Install `githooks/post-receive` on the bare repo so a push calls `/api/internal/reindex`.
+The hub indexes `git.bare_repos_root` in the background. A bare repo with an empty HEAD is skipped. Each repo contributes at most 200 text files and the walk stops after 8 seconds, so a large tree cannot pin the process. Drop a `.xmeshignore` file in a bare repo to exclude it. Install `githooks/post-receive` on the bare repo so a push calls `/api/internal/reindex`.
+
+`node.id` is required. The daemon refuses to start when it is missing or blank. That id is the author shown on messages this machine sends, unless the name box in the UI (or `xmeshd cli` `/alias`) stores a different name. The override is one row on that node.
+
+`xmeshd cli` is a prompt against a daemon that is already running. It does not bind a port. See [cli.md](cli.md).
+
+`scripts/harvest-context-cloc.sh` is the outline command to use when `cloc` is installed. It prints a cloc summary and then source and header bodies, and stops after a size budget. If `cloc` is missing it runs `scripts/harvest-context.sh`.
 
 ## DR-29. Install a node
 

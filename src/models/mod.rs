@@ -67,7 +67,12 @@ pub enum StreamEvent {
     Thought { text: String },
     Delta { text: String },
     Done { model_used: String },
-    Saved { seq: u64 },
+    Saved {
+        seq: u64,
+        /// Set when the reply was stored in a thread of its own.
+        #[serde(default)]
+        thread: String,
+    },
     /// The page could not be fetched by the daemon. The UI opens it.
     Browse { url: String, text: String },
 }
@@ -156,8 +161,22 @@ pub fn pick_coding_model(names: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// A stored author is a person when it is not a model id.
+/// Model ids look like `provider/model`. Older rows used `user`.
+pub fn is_human_role(role: &str) -> bool {
+    let role = role.trim();
+    !role.is_empty()
+        && role != "system"
+        && role != "assistant"
+        && role != "model"
+        && role != "bot"
+        && role != "error"
+        && role != "deploy"
+        && !role.contains('/')
+}
+
 pub fn map_role(kind: ConcreteKind, role: &str) -> &'static str {
-    let user = matches!(role, "user" | "human");
+    let user = is_human_role(role);
     match kind {
         ConcreteKind::Gemini => {
             if user {
@@ -814,6 +833,10 @@ mod tests {
         assert_eq!(map_role(ConcreteKind::Gemini, "assistant"), "model");
         assert_eq!(map_role(ConcreteKind::OpenAi, "model"), "assistant");
         assert_eq!(map_role(ConcreteKind::Ollama, "user"), "user");
+        assert_eq!(map_role(ConcreteKind::OpenAi, "node-a"), "user");
+        assert_eq!(map_role(ConcreteKind::Ollama, "local/coder"), "assistant");
+        assert!(is_human_role("node-a"));
+        assert!(!is_human_role("local/coder"));
     }
 
     #[tokio::test]

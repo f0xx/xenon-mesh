@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+# xmeshd — local-first project chat
+
+name="xmeshd"
+description="Local-first chat daemon for project context and model backends"
+
+command="${XMESHD_BINARY:-/usr/bin/xmeshd}"
+command_args="${XMESHD_OPTS:-}"
+command_background=true
+command_user="${XMESHD_USER:-xmeshd}:${XMESHD_GROUP:-xmeshd}"
+pidfile="/run/xmeshd.pid"
+output_log="/var/log/xmeshd/stdout.log"
+error_log="/var/log/xmeshd/stderr.log"
+directory="/var/lib/xmeshd"
+
+depend() {
+	need net
+	after postgresql mysql
+}
+
+start_pre() {
+	checkpath --directory --owner "${command_user}" --mode 0750 /var/lib/xmeshd
+	checkpath --directory --owner "${command_user}" --mode 0750 /var/log/xmeshd
+	checkpath --directory --mode 0755 /etc/xmeshd
+	if [ ! -s /etc/xmeshd/local.yaml ] && [ ! -s /etc/xmeshd/cluster.yaml ]; then
+		eerror "Write /etc/xmeshd/local.yaml first (see configs/local.master.example.yaml)."
+		return 1
+	fi
+}

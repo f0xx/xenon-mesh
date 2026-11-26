@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use figment::{
     providers::{Env, Format, Yaml},
     Figment,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,8 +15,64 @@ pub enum NodeMode {
     Node,
 }
 
+/// Config schema. `1` and `"v1"` are the same. A missing key is v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaVersion(pub u32);
+
+impl Default for SchemaVersion {
+    fn default() -> Self {
+        SchemaVersion(1)
+    }
+}
+
+impl Serialize for SchemaVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = SchemaVersion;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("1 or \"v1\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<SchemaVersion, E> {
+                Ok(SchemaVersion(value as u32))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<SchemaVersion, E> {
+                if value < 0 {
+                    return Err(E::custom("schema version is negative"));
+                }
+                Ok(SchemaVersion(value as u32))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<SchemaVersion, E> {
+                let number = value.trim().trim_start_matches(['v', 'V']);
+                number
+                    .parse::<u32>()
+                    .map(SchemaVersion)
+                    .map_err(|_| E::custom(format!("unknown schema {value}")))
+            }
+        }
+        deserializer.deserialize_any(Visit)
+    }
+}
+
+fn default_schema() -> SchemaVersion {
+    SchemaVersion(1)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Schema of this file. This build reads v1. Omitted means v1.
+    #[serde(default = "default_schema")]
+    pub schema: SchemaVersion,
     pub node: NodeSection,
     pub storage: StorageSection,
     pub git: GitSection,
@@ -236,10 +293,26 @@ impl AppConfig {
             figment = figment.merge(Yaml::file(local_path));
         }
 
-        figment
+        let mut cfg: Self = figment
             .merge(Env::prefixed("XMESHD_").split("__"))
             .extract()
-            .context("Failed to parse merged configuration")
+            .context("Failed to parse merged configuration")?;
+        cfg.normalize()?;
+        Ok(cfg)
+    }
+
+    fn normalize(&mut self) -> Result<()> {
+        if self.schema != SchemaVersion(1) {
+            bail!(
+                "config schema is v{}, and this build reads v1",
+                self.schema.0
+            );
+        }
+        self.node.id = self.node.id.trim().to_string();
+        if self.node.id.is_empty() {
+            bail!("node.id is required and must not be empty");
+        }
+        Ok(())
     }
 }
 
@@ -320,6 +393,79 @@ models:
         assert_eq!(cfg.models.providers[0].kind, "auto");
         assert_eq!(cfg.models.providers[0].timeout_secs, 300);
         assert_eq!(cfg.gemini.chat_model, "gemini-2.5-pro");
+        assert_eq!(cfg.schema, SchemaVersion(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_v1_is_accepted_and_empty_node_id_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("xmesh-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cluster = dir.join("cluster.yaml");
+        let local = dir.join("local.yaml");
+        std::fs::write(&local, "schema: v1\n").unwrap();
+        std::fs::write(
+            &cluster,
+            r#"
+schema: 1
+node:
+  id: "  node-a  "
+  mode: node
+  listen_addr: "127.0.0.1:8443"
+  hmac_secret_path: "/tmp/hmac.key"
+storage:
+  primary_url: null
+  fallback_sqlite: "/tmp/mesh.db"
+git:
+  bare_repos_root: null
+"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load(cluster.to_str().unwrap(), local.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.schema, SchemaVersion(1));
+        assert_eq!(cfg.node.id, "node-a");
+        std::fs::write(
+            &cluster,
+            r#"
+node:
+  id: "   "
+  mode: node
+  listen_addr: "127.0.0.1:8443"
+  hmac_secret_path: "/tmp/hmac.key"
+storage:
+  primary_url: null
+  fallback_sqlite: "/tmp/mesh.db"
+git:
+  bare_repos_root: null
+"#,
+        )
+        .unwrap();
+        let err = AppConfig::load(cluster.to_str().unwrap(), local.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("node.id"), "{err}");
+        std::fs::write(&local, "schema: 2\n").unwrap();
+        std::fs::write(
+            &cluster,
+            r#"
+node:
+  id: node-a
+  mode: node
+  listen_addr: "127.0.0.1:8443"
+  hmac_secret_path: "/tmp/hmac.key"
+storage:
+  primary_url: null
+  fallback_sqlite: "/tmp/mesh.db"
+git:
+  bare_repos_root: null
+"#,
+        )
+        .unwrap();
+        let err = AppConfig::load(cluster.to_str().unwrap(), local.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("schema"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

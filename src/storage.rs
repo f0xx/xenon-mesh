@@ -216,6 +216,8 @@ fn message_id(channel: &str, thread: &str, seq: u64) -> String {
 pub struct ShownMessage {
     pub message: pb::SessionMessage,
     pub edited_at_ms: i64,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -234,11 +236,15 @@ pub struct P2pLink {
     pub token: String,
 }
 
-fn edited_at(detail: &str) -> i64 {
+fn detail_ms(detail: &str, key: &str) -> i64 {
     serde_json::from_str::<serde_json::Value>(detail)
         .ok()
-        .and_then(|v| v.get("edited_at_ms").and_then(|n| n.as_i64()))
+        .and_then(|v| v.get(key).and_then(|n| n.as_i64()))
         .unwrap_or(0)
+}
+
+fn edited_at(detail: &str) -> i64 {
+    detail_ms(detail, "edited_at_ms")
 }
 
 fn shown_from_row(row: &sqlx::any::AnyRow) -> ShownMessage {
@@ -254,6 +260,8 @@ fn shown_from_row(row: &sqlx::any::AnyRow) -> ShownMessage {
             created_at_ms: row.get("created_at_ms"),
         },
         edited_at_ms: edited_at(&detail),
+        started_at_ms: detail_ms(&detail, "started_at_ms"),
+        finished_at_ms: detail_ms(&detail, "finished_at_ms"),
     }
 }
 
@@ -433,6 +441,14 @@ impl Storage {
                 thread_id VARCHAR(128) NOT NULL,
                 visibility VARCHAR(16) NOT NULL,
                 PRIMARY KEY (channel_id, thread_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS node_settings (
+                setting_key VARCHAR(64) PRIMARY KEY,
+                value TEXT NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -1030,6 +1046,34 @@ impl Storage {
             .bind(peer_base)
             .bind(peer_name)
             .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_setting(&self, key: &str) -> Result<String> {
+        let sql = self.q("SELECT value FROM node_settings WHERE setting_key = $1");
+        let row = sqlx::query(&sql)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("value")).unwrap_or_default())
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO node_settings (setting_key, value) VALUES ($1, $2)
+                 ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            ),
+            _ => self.q(
+                "INSERT INTO node_settings (setting_key, value) VALUES ($1, $2)
+                 ON CONFLICT(setting_key) DO UPDATE SET value = $2",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(key)
+            .bind(value)
             .execute(&self.pool)
             .await?;
         Ok(())

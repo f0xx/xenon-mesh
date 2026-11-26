@@ -97,7 +97,7 @@ pub async fn run_tree_watcher(cfg: Arc<AppConfig>, db: Arc<Storage>) -> Result<(
         return Ok(());
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(8);
-    let mut debouncer = new_debouncer(Duration::from_secs(2), move |res: DebounceEventResult| {
+    let mut debouncer = new_debouncer(Duration::from_secs(15), move |res: DebounceEventResult| {
         if let Ok(events) = res {
             let paths: Vec<PathBuf> = events.into_iter().map(|event| event.path).collect();
             let _ = tx.blocking_send(paths);

@@ -12,7 +12,7 @@ pub fn search_query(turns: &[ChatTurn]) -> String {
     let question = turns
         .iter()
         .rev()
-        .find(|turn| turn.role == "user" || turn.role == "human")
+        .find(|turn| super::is_human_role(&turn.role))
         .map(|turn| turn.text.trim().to_string())
         .unwrap_or_default();
     let mut prior = Vec::new();

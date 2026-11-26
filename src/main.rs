@@ -1,4 +1,5 @@
 mod browse;
+mod cli;
 mod config;
 mod discover;
 mod executor;
@@ -169,7 +170,7 @@ impl ClusterService for NodeRpcServer {
             .append_public_message(&msg)
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let action = if stored.author == "user" {
+        let action = if models::is_human_role(&stored.author) {
             "chat.request"
         } else {
             "chat.reply"
@@ -189,7 +190,7 @@ impl ClusterService for NodeRpcServer {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  xmeshd\n  xmeshd check [local.yaml] [cluster.yaml]\n  xmeshd models <base_url>\n  xmeshd migrate <from_url> <to_url>\n  xmeshd export <db_url> <out.pb.zst>\n  xmeshd import <db_url> <in.pb.zst>"
+    "usage:\n  xmeshd\n  xmeshd cli [--url http://127.0.0.1:PORT]\n  xmeshd check [local.yaml] [cluster.yaml]\n  xmeshd models <base_url>\n  xmeshd migrate <from_url> <to_url>\n  xmeshd export <db_url> <out.pb.zst>\n  xmeshd import <db_url> <in.pb.zst>"
 }
 
 #[tokio::main]
@@ -223,6 +224,10 @@ async fn main() -> Result<()> {
             let base = args.get(2).context(usage())?;
             let report = ModelHub::probe(base).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        Some("cli") => {
+            cli::run(&args[2..]).await?;
             return Ok(());
         }
         Some("check") => {

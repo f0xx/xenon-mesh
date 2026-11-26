@@ -1,0 +1,20 @@
+Source: xmeshd
+Section: net
+Priority: optional
+Maintainer: xmeshd contributors <noreply@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/f0xx/xenon-mesh
+
+Package: xmeshd
+Architecture: any
+Depends: ${misc:Depends}, git
+Description: local-first chat for project context and model backends
+ One binary serves the chat UI, stores threads in SQLite (or Postgres or
+ MariaDB when configured), and calls an OpenAI-compatible, Ollama, or Gemini
+ endpoint. A single host is a complete install. A hub is optional and uses
+ the same package.
+ .
+ libgit2 is linked into the binary under GPL-2.0 with the libgit2 linking
+ exception. See /usr/share/doc/xmeshd/NOTICE.

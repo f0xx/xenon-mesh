@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>noreply@users.noreply.github.com</email>
+		<name>xmeshd contributors</name>
+	</maintainer>
+	<longdescription>
+		Local-first chat daemon. One binary serves the UI, stores threads in
+		SQLite or a server database, and calls a model endpoint the operator
+		configures. libgit2 is bundled under GPL-2.0 with its linking exception.
+	</longdescription>
+</pkgmetadata>

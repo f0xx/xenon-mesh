@@ -1,8 +1,10 @@
 # Purpose
 
-## DR-1. One hub, many nodes
+## DR-1. One process, optionally a hub
 
-The deployment is a star, not a peer mesh. The hub is the machine that owns the bare Git repositories people share. Every other machine runs `xmeshd` as a node, points `node.master_url` at the hub's gRPC address, and uses a copy of the same HMAC key.
+One machine with `mode: master` and SQLite is a complete install: the UI, the channels, and the model calls all stay on that host. A hub is only needed when several machines should share public repositories and public chats. Those machines run the same binary as nodes, point `node.master_url` at the hub's gRPC address, and use a copy of the same HMAC key.
+
+Neighbours on the same network can also open a direct chat. That history stays on the two peers. It does not replace the hub for shared project channels.
 
 A node may hold private projects that are never pushed. It may also clone a hub repository and join the public channel for that repository.
 

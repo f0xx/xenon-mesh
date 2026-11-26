@@ -150,6 +150,8 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/internal/complete", post(handle_complete))
         .route("/api/config", get(handle_config))
         .route("/api/threads/fork", post(handle_fork_thread))
+        .route("/api/threads/open", post(handle_open_thread))
+        .route("/api/alias", get(handle_alias_get).post(handle_alias_set))
         .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))
         .route("/api/channels", get(handle_list_channels).post(handle_upsert_channel))
         .route("/api/channel-state", post(handle_channel_state))
@@ -564,14 +566,29 @@ async fn handle_history(
         .load_shown(&q.channel, &q.thread, 200)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let threads = st
+        .db
+        .list_threads(&q.channel)
+        .await
+        .unwrap_or_default();
     Ok(Json(
         msgs.into_iter()
-            .map(|m| HistoryItem {
-                role: m.message.author,
-                text: m.message.content,
-                created_at_ms: m.message.created_at_ms,
-                seq: m.message.seq,
-                edited_at_ms: m.edited_at_ms,
+            .map(|m| {
+                let child = format!("m{}", m.message.seq);
+                HistoryItem {
+                    role: m.message.author,
+                    text: m.message.content,
+                    created_at_ms: m.message.created_at_ms,
+                    seq: m.message.seq,
+                    edited_at_ms: m.edited_at_ms,
+                    started_at_ms: m.started_at_ms,
+                    finished_at_ms: m.finished_at_ms,
+                    reply_thread: if q.thread == "main" && threads.iter().any(|t| t == &child) {
+                        child
+                    } else {
+                        String::new()
+                    },
+                }
             })
             .collect(),
     ))
@@ -585,6 +602,12 @@ struct HistoryItem {
     seq: u64,
     #[serde(default)]
     edited_at_ms: i64,
+    #[serde(default)]
+    started_at_ms: i64,
+    #[serde(default)]
+    finished_at_ms: i64,
+    #[serde(default)]
+    reply_thread: String,
 }
 
 async fn handle_list_threads(
@@ -763,6 +786,66 @@ async fn handle_fork_thread(
     Ok(Json(
         serde_json::json!({ "copied": copied, "thread": req.dst_thread, "visibility": "private" }),
     ))
+}
+
+#[derive(Deserialize)]
+struct OpenThreadReq {
+    channel: String,
+    seq: u64,
+}
+
+async fn handle_open_thread(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<OpenThreadReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rows = st
+        .db
+        .load_shown(&req.channel, "main", 500)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let parent = rows
+        .into_iter()
+        .find(|m| m.message.seq == req.seq)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let public = channel_is_public(&st, &req.channel).await;
+    let name = open_reply_thread(&st, &req.channel, &parent.message, public).await;
+    Ok(Json(serde_json::json!({ "thread": name })))
+}
+
+#[derive(Deserialize)]
+struct AliasReq {
+    alias: String,
+}
+
+async fn handle_alias_get(State(st): State<Arc<WebState>>) -> Json<serde_json::Value> {
+    let alias = clean_alias(&st.db.get_setting("alias").await.unwrap_or_default());
+    let display = if alias.is_empty() {
+        st.cfg.node.id.clone()
+    } else {
+        alias.clone()
+    };
+    Json(serde_json::json!({
+        "alias": alias,
+        "node_id": st.cfg.node.id,
+        "display": display
+    }))
+}
+
+async fn handle_alias_set(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<AliasReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let alias = clean_alias(&req.alias);
+    st.db
+        .set_setting("alias", &alias)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let display = if alias.is_empty() {
+        st.cfg.node.id.clone()
+    } else {
+        alias.clone()
+    };
+    Ok(Json(serde_json::json!({ "alias": alias, "display": display })))
 }
 
 async fn handle_reindex(
@@ -957,7 +1040,7 @@ async fn store_message(
                 }
             }
         } else if let Ok(stored) = st.db.append_public_message(&msg).await {
-            let action = if stored.author == "user" {
+            let action = if crate::models::is_human_role(&stored.author) {
                 "chat.request"
             } else {
                 "chat.reply"
@@ -985,7 +1068,7 @@ async fn store_message(
         .ok()
         .map(|p| p.viewing && p.channel == stored.channel_id)
         .unwrap_or(false);
-    if stored.author == "user" || viewing {
+    if crate::models::is_human_role(&stored.author) || viewing {
         let _ = st.db.mark_read(&stored.channel_id, stored.seq as i64).await;
     }
     if !detail.is_empty() {
@@ -1150,7 +1233,16 @@ async fn relay_complete(
     let mut carry = Vec::new();
     let mut text = String::new();
     let mut used = String::new();
-    while let Some(chunk) = resp.chunk().await? {
+    let idle = std::time::Duration::from_secs(300);
+    loop {
+        let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(err)) => anyhow::bail!("{err}"),
+            Err(_) => anyhow::bail!("hub model route went quiet for {}s", idle.as_secs()),
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         carry.extend_from_slice(&chunk);
         while let Some(pos) = carry.iter().position(|b| *b == b'\n') {
             let raw: Vec<u8> = carry.drain(..=pos).collect();
@@ -1206,17 +1298,19 @@ async fn handle_persistent_chat(
                 .join(", ")
         )
     };
-    if !req.rerun {
-        let user_msg = SessionMessage {
+    let who = display_name(&st).await;
+    let user_msg = if req.rerun {
+        None
+    } else {
+        Some(SessionMessage {
             channel_id: req.channel.clone(),
             thread_id: req.thread.clone(),
             seq: 0,
-            author: "user".into(),
+            author: who.clone(),
             content: format!("{}{}", req.prompt, att_note),
             created_at_ms: 0,
-        };
-        let _stored_user = store_message(&st, user_msg, sync_hub, "").await;
-    }
+        })
+    };
 
     let mut turns: Vec<ChatTurn> = past
         .into_iter()
@@ -1228,7 +1322,7 @@ async fn handle_persistent_chat(
         .collect();
     if !req.rerun {
         turns.push(ChatTurn {
-            role: "user".into(),
+            role: who,
             text: req.prompt.clone(),
             attachments: req.attachments,
         });
@@ -1238,15 +1332,49 @@ async fn handle_persistent_chat(
     let st_bg = st.clone();
     let model = req.model.filter(|s| !s.is_empty()).unwrap_or_default();
     tokio::spawn(async move {
+        let _clear = LiveClear {
+            st: st_bg.clone(),
+            channel: req.channel.clone(),
+        };
         set_live(&st_bg, &req.channel, "reply", now_ms() + 600_000);
+        let mut stored_user = None;
+        if let Some(user_msg) = user_msg {
+            let _ = tx
+                .send(StreamEvent::Status {
+                    text: "Saving the message...".into(),
+                })
+                .await;
+            stored_user = Some(store_message(&st_bg, user_msg, sync_hub, "").await);
+        }
+        let reply_thread = if visibility == "public" && req.thread == "main" {
+            if let Some(parent) = stored_user.as_ref() {
+                Some(open_reply_thread(&st_bg, &req.channel, parent, sync_hub).await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let model_thread = reply_thread.clone().unwrap_or_else(|| req.thread.clone());
+        if reply_thread.is_some() {
+            if let Some(last) = turns.pop() {
+                turns = vec![last];
+            }
+        }
         let _ = tx
             .send(StreamEvent::Status {
                 text: "Building context...".into(),
             })
             .await;
-        let mut ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt, &model)
-            .await
-            .unwrap_or_default();
+        let mut ctx = match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            prompt_for(&st_bg, &req.channel, &model_thread, &req.prompt, &model),
+        )
+        .await
+        {
+            Ok(Ok(text)) => text,
+            _ => "Project context was not ready in time. Answer from the conversation.".into(),
+        };
         let pages = prefetch_pages(&st_bg, &req.prompt).await;
         if !pages.is_empty() {
             ctx.push_str("\n\n## Web results\n");
@@ -1256,7 +1384,7 @@ async fn handle_persistent_chat(
             Some(serde_json::json!({
                 "node_id": st_bg.cfg.node.id,
                 "channel": req.channel,
-                "thread": req.thread
+                "thread": model_thread.clone()
             }))
         } else {
             None
@@ -1319,7 +1447,7 @@ async fn handle_persistent_chat(
             &st_bg,
             SessionMessage {
                 channel_id: channel_name.clone(),
-                thread_id: req.thread,
+                thread_id: model_thread.clone(),
                 seq: 0,
                 author,
                 content: final_text,
@@ -1330,9 +1458,11 @@ async fn handle_persistent_chat(
         )
         .await;
         let _ = tx
-            .send(StreamEvent::Saved { seq: stored.seq })
+            .send(StreamEvent::Saved {
+                seq: stored.seq,
+                thread: reply_thread.unwrap_or_default(),
+            })
             .await;
-        clear_live(&st_bg, &channel_name);
     });
 
     let stream = ReceiverStream::new(rx)
@@ -2292,6 +2422,63 @@ fn clear_live(st: &WebState, channel: &str) {
     if let Ok(mut map) = st.live.lock() {
         map.remove(channel);
     }
+}
+
+struct LiveClear {
+    st: Arc<WebState>,
+    channel: String,
+}
+
+impl Drop for LiveClear {
+    fn drop(&mut self) {
+        clear_live(&self.st, &self.channel);
+    }
+}
+
+async fn display_name(st: &WebState) -> String {
+    let alias = st.db.get_setting("alias").await.unwrap_or_default();
+    let alias = clean_alias(&alias);
+    if alias.is_empty() {
+        st.cfg.node.id.clone()
+    } else {
+        alias
+    }
+}
+
+fn clean_alias(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| *c != '/' && !c.is_control())
+        .take(40)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+async fn open_reply_thread(
+    st: &WebState,
+    channel: &str,
+    parent: &SessionMessage,
+    sync_hub: bool,
+) -> String {
+    let name = format!("m{}", parent.seq);
+    if st
+        .db
+        .load_thread(channel, &name, 1)
+        .await
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false)
+    {
+        return name;
+    }
+    let _ = st.db.set_thread_visibility(channel, &name, "inherit").await;
+    let copy = SessionMessage {
+        thread_id: name.clone(),
+        seq: 0,
+        ..parent.clone()
+    };
+    let _ = store_message(st, copy, sync_hub, "").await;
+    name
 }
 
 async fn high_water(st: &WebState, name: &str) -> i64 {

@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	cargo test --locked
+
+override_dh_auto_install:
+	install -Dm755 target/release/xmeshd debian/xmeshd/usr/bin/xmeshd
+	install -Dm755 scripts/google-ask.sh debian/xmeshd/usr/libexec/xmeshd/google-ask.sh
+	install -Dm755 scripts/harvest-context.sh debian/xmeshd/usr/libexec/xmeshd/harvest-context.sh
+	install -Dm755 scripts/xmesh-tls.sh debian/xmeshd/usr/libexec/xmeshd/xmesh-tls.sh
+	install -Dm755 scripts/xmesh-tunnel.sh debian/xmeshd/usr/libexec/xmeshd/xmesh-tunnel.sh
+	install -Dm644 configs/local.master.example.yaml debian/xmeshd/etc/xmeshd/local.yaml.example
+	install -Dm644 packaging/openrc/xmeshd debian/xmeshd/usr/share/xmeshd/xmeshd.openrc
+	install -Dm644 LICENSE debian/xmeshd/usr/share/doc/xmeshd/LICENSE
+	install -Dm644 NOTICE debian/xmeshd/usr/share/doc/xmeshd/NOTICE

@@ -1,4 +1,6 @@
 # Node example. Copy to /etc/xmeshd/local.yaml on a machine that joins a hub.
+# schema v1. node.id is required and is the name shown on this machine's messages.
+schema: 1
 node:
   id: "node-a"
   mode: "node"

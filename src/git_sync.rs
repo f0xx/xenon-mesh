@@ -1,79 +1,189 @@
 use crate::storage::pb::{ContextEntry, EntryType};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use git2::{DiffOptions, Repository};
+use std::io::{Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+use tracing::warn;
+
+/// A bare-repo index is a sample, not a full checkout.
+/// `git` runs as a child so a huge or corrupt object can be killed.
+/// An in-process inflate cannot be stopped, and a timed-out task would keep the CPU.
+const BARE_SCAN_FILES: usize = 200;
+const BARE_SCAN_BUDGET: Duration = Duration::from_secs(8);
 
 pub fn scan_bare_repo(bare_path: &Path, namespace: &str) -> Result<Vec<ContextEntry>> {
     if bare_path.join(".xmeshignore").exists() {
         return Ok(vec![]);
     }
 
-    let check = std::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(bare_path)
-        .args(["ls-tree", "-r", "--name-only", "HEAD"])
-        .output()?;
-
-    if !check.status.success() {
-        let err_msg = String::from_utf8_lossy(&check.stderr);
+    let listing = git_budget(bare_path, &["ls-tree", "-r", "-l", "HEAD"])?;
+    if !listing.status.success() && listing.stdout.is_empty() {
+        let err = String::from_utf8_lossy(&listing.stderr);
         anyhow::bail!(
             "Skipping corrupt/empty repo '{namespace}' (run `git --git-dir={bare_path:?} fsck --full`): {}",
-            err_msg.trim()
+            err.trim()
         );
     }
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let mut wanted: Vec<(String, u64, String)> = Vec::new();
+    for line in text.lines() {
+        if wanted.len() >= BARE_SCAN_FILES {
+            break;
+        }
+        let Some((oid, size, path)) = parse_lstree(line) else {
+            continue;
+        };
+        if size == 0 || size > 32 * 1024 || skip_indexed_path(&path) {
+            continue;
+        }
+        wanted.push((oid, size, path));
+    }
+    if wanted.is_empty() {
+        return Ok(vec![]);
+    }
 
-    let repo = Repository::open_bare(bare_path)?;
-
-    let head_tree = repo.head()?.peel_to_tree()?;
+    let mut child = Command::new("timeout")
+        .arg(BARE_SCAN_BUDGET.as_secs().to_string())
+        .arg("git")
+        .arg("--git-dir")
+        .arg(bare_path)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .or_else(|_| {
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(bare_path)
+                .args(["cat-file", "--batch"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+        })
+        .context("git cat-file")?;
+    {
+        let mut stdin = child.stdin.take().context("git cat-file stdin")?;
+        for (oid, _, _) in &wanted {
+            writeln!(stdin, "{oid}")?;
+        }
+    }
+    let mut stdout = child.stdout.take().context("git cat-file stdout")?;
     let mut entries = Vec::new();
-
-    head_tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        if entry.kind() != Some(git2::ObjectType::Blob) {
-            return git2::TreeWalkResult::Ok;
-        }
-        let Ok(obj) = entry.to_object(&repo) else {
-            return git2::TreeWalkResult::Ok;
+    let mut short = false;
+    for (_, size, path) in &wanted {
+        let Some(body) = read_batch_object(&mut stdout, *size) else {
+            short = true;
+            break;
         };
-        let Some(blob) = obj.as_blob() else {
-            return git2::TreeWalkResult::Ok;
+        if body.contains(&0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&body) else {
+            continue;
         };
-
-        if blob.is_binary() || blob.size() > 64 * 1024 {
-            return git2::TreeWalkResult::Ok;
-        }
-        let name = entry.name().unwrap_or_default();
-        if name.ends_with(".lock")
-            || name.ends_with("-lock.json")
-            || name.ends_with(".min.js")
-            || name.ends_with(".map")
-        {
-            return git2::TreeWalkResult::Ok;
-        }
-
-        if let Ok(text) = std::str::from_utf8(blob.content()) {
-            let rel_path = format!("{}{}", root, entry.name().unwrap_or_default());
-            let id = blake3::hash(format!("master:{namespace}:{rel_path}").as_bytes())
-                .to_hex()
-                .to_string();
-            let content_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-
-            entries.push(ContextEntry {
-                id,
-                namespace: namespace.to_string(),
-                entry_type: EntryType::Dynamic as i32,
-                source_path: rel_path,
-                content: text.to_string(),
-                content_hash,
-                embedding: vec![],
-                updated_at_ms: 0,
-                origin_node: "git-master".to_string(),
-                meta: Default::default(),
-            });
-        }
-        git2::TreeWalkResult::Ok
-    })?;
-
+        let id = blake3::hash(format!("master:{namespace}:{path}").as_bytes())
+            .to_hex()
+            .to_string();
+        let content_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+        entries.push(ContextEntry {
+            id,
+            namespace: namespace.to_string(),
+            entry_type: EntryType::Dynamic as i32,
+            source_path: path.clone(),
+            content: text.to_string(),
+            content_hash,
+            embedding: vec![],
+            updated_at_ms: 0,
+            origin_node: "git-master".to_string(),
+            meta: Default::default(),
+        });
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    if short {
+        warn!(
+            namespace,
+            files = entries.len(),
+            "bare repo scan stopped before every selected file was read"
+        );
+    }
     Ok(entries)
+}
+
+fn git_budget(bare_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut cmd = Command::new("timeout");
+    cmd.arg(BARE_SCAN_BUDGET.as_secs().to_string())
+        .arg("git")
+        .arg("--git-dir")
+        .arg(bare_path);
+    cmd.args(args);
+    cmd.output().or_else(|_| {
+        let mut plain = Command::new("git");
+        plain.arg("--git-dir").arg(bare_path).args(args);
+        plain.output().context("git")
+    })
+}
+
+fn parse_lstree(line: &str) -> Option<(String, u64, String)> {
+    let (meta, path) = line.split_once('\t')?;
+    let mut parts = meta.split_whitespace();
+    let _mode = parts.next()?;
+    if parts.next()? != "blob" {
+        return None;
+    }
+    let oid = parts.next()?.to_string();
+    let size: u64 = parts.next()?.parse().ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((oid, size, path.to_string()))
+}
+
+fn skip_indexed_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.ends_with(".lock")
+        || name.ends_with("-lock.json")
+        || name.ends_with(".min.js")
+        || name.ends_with(".map")
+    {
+        return true;
+    }
+    path.split('/').any(|part| {
+        SKIP_DIRS.contains(&part) || (part.starts_with('.') && part != ".gitignore")
+    })
+}
+
+/// `cat-file --batch` writes `<oid> <type> <size>\n<body>\n`.
+/// The size on the listing is what we asked for; a mismatch means stop.
+fn read_batch_object(reader: &mut impl Read, expect: u64) -> Option<Vec<u8>> {
+    let mut header = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if reader.read(&mut byte).ok()? == 0 {
+            return None;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        header.push(byte[0]);
+        if header.len() > 128 {
+            return None;
+        }
+    }
+    let header = String::from_utf8(header).ok()?;
+    let size: u64 = header.split_whitespace().nth(2)?.parse().ok()?;
+    if size != expect || size > 32 * 1024 {
+        return None;
+    }
+    let mut body = vec![0u8; size as usize];
+    reader.read_exact(&mut body).ok()?;
+    let mut nl = [0u8; 1];
+    reader.read_exact(&mut nl).ok()?;
+    (nl[0] == b'\n').then_some(body)
 }
 
 pub fn extract_local_diff(
@@ -392,5 +502,17 @@ mod tests {
             .all(|p| !p.contains("target") && !p.contains("leak")));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn lstree_line_keeps_small_blobs_only() {
+        let parsed = parse_lstree("100644 blob abcdef 42\tsrc/main.rs").unwrap();
+        assert_eq!(parsed.0, "abcdef");
+        assert_eq!(parsed.1, 42);
+        assert_eq!(parsed.2, "src/main.rs");
+        assert!(parse_lstree("040000 tree abc 0\tvendor").is_none());
+        assert!(skip_indexed_path("vendor/lib.rs"));
+        assert!(skip_indexed_path("src/app.min.js"));
+        assert!(!skip_indexed_path("src/main.rs"));
     }
 }

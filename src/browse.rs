@@ -14,32 +14,33 @@ pub struct Lookup {
 
 pub fn urls_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = text.as_bytes();
     let mut i = 0;
-    while i + 8 < bytes.len() {
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
         let rest = &text[i..];
-        let start = if rest.starts_with("https://") {
-            Some(i)
-        } else if rest.starts_with("http://") {
-            Some(i)
+        let matched = if rest.starts_with("https://") || rest.starts_with("http://") {
+            true
         } else {
-            None
+            false
         };
-        if let Some(start) = start {
-            let end = text[start..]
+        if matched {
+            let end = rest
                 .find(|c: char| c.is_whitespace() || "<>\"')".contains(c))
-                .map(|n| start + n)
+                .map(|n| i + n)
                 .unwrap_or(text.len());
-            let url = text[start..end].trim_end_matches('.').to_string();
+            let url = text[i..end].trim_end_matches('.').to_string();
             if url.len() > 8 && !out.contains(&url) {
                 out.push(url);
             }
             if out.len() >= 2 {
                 break;
             }
-            i = end;
+            i = end.max(i + 1);
         } else {
-            i += 1;
+            i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         }
     }
     out
@@ -263,6 +264,13 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "web");
         assert_eq!(tools[0].query, "rust ownership");
+    }
+
+    #[test]
+    fn urls_step_over_multibyte_characters() {
+        let text = "давай http://example.com/a и ещё";
+        assert_eq!(urls_in(text), vec!["http://example.com/a".to_string()]);
+        assert!(urls_in("привет, без ссылки").is_empty());
     }
 
     #[test]

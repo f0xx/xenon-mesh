@@ -1,0 +1,16 @@
+xmeshd
+Copyright (c) 2026 xmeshd contributors
+
+This program is licensed under the MIT License. See LICENSE.
+
+The release binary links third-party components. Their licenses stay with
+them and are not changed by the MIT license on this repository:
+
+- libgit2, via the git2 crate. GPL-2.0-only WITH the libgit2 linking
+  exception. The exception allows this library to be linked into another
+  program and that combination to be distributed. https://github.com/libgit2/libgit2
+- aws-lc, via rustls. Apache-2.0 OR ISC.
+- Other crates are MIT, Apache-2.0, BSD, or a combination of those.
+  Run `cargo license` (or read Cargo.lock) for the full set in a given build.
+
+Shell scripts under scripts/ are MIT, the same as the rest of this repository.

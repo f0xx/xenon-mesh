@@ -1,0 +1,39 @@
+# Contributor: xmeshd contributors <noreply@users.noreply.github.com>
+# Maintainer: xmeshd contributors <noreply@users.noreply.github.com>
+pkgname=xmeshd
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Local-first chat daemon for project context and model backends"
+url="https://github.com/f0xx/xenon-mesh"
+arch="x86_64 aarch64"
+license="MIT"
+depends="git"
+makedepends="cargo rust"
+options="net !check"
+# Until a release tag exists, build from a tarball of this repository:
+#   git archive --format=tar.gz --prefix=xmeshd-$pkgver/ -o packaging/alpine/xmeshd-$pkgver.tar.gz HEAD
+source="xmeshd-$pkgver.tar.gz"
+builddir="$srcdir/xmeshd-$pkgver"
+
+build() {
+	cargo build --release --locked
+}
+
+check() {
+	cargo test --locked
+}
+
+package() {
+	install -Dm755 target/release/xmeshd "$pkgdir"/usr/bin/xmeshd
+	install -Dm755 scripts/google-ask.sh "$pkgdir"/usr/libexec/xmeshd/google-ask.sh
+	install -Dm755 scripts/harvest-context.sh "$pkgdir"/usr/libexec/xmeshd/harvest-context.sh
+	install -Dm755 scripts/xmesh-tls.sh "$pkgdir"/usr/libexec/xmeshd/xmesh-tls.sh
+	install -Dm755 scripts/xmesh-tunnel.sh "$pkgdir"/usr/libexec/xmeshd/xmesh-tunnel.sh
+	install -Dm644 configs/local.master.example.yaml \
+		"$pkgdir"/etc/xmeshd/local.yaml.example
+	install -Dm755 packaging/openrc/xmeshd "$pkgdir"/etc/init.d/xmeshd
+	install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/xmeshd/LICENSE
+	install -Dm644 NOTICE "$pkgdir"/usr/share/licenses/xmeshd/NOTICE
+}
+
+sha512sums="SKIP"
