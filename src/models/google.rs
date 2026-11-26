@@ -78,6 +78,21 @@ pub async fn ask(
             err.chars().take(300).collect::<String>()
         );
     }
+    if let Some(rest) = text.strip_prefix("OPEN_BROWSER\t") {
+        let url = rest.lines().next().unwrap_or("").trim().to_string();
+        let note = format!(
+            "Google blocked a scripted fetch. A browser window opens this search:\n{url}"
+        );
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(StreamEvent::Browse {
+                    url,
+                    text: note.clone(),
+                })
+                .await;
+        }
+        return Ok(note);
+    }
     if text.chars().count() > 12_000 {
         text = text.chars().take(12_000).collect();
         text.push_str("\n…[truncated]");

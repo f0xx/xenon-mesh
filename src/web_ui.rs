@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::warn;
@@ -32,6 +32,7 @@ pub struct Presence {
     pub viewing: bool,
 }
 
+#[derive(Clone)]
 pub struct WebState {
     pub cfg: Arc<AppConfig>,
     pub db: Arc<Storage>,
@@ -41,6 +42,9 @@ pub struct WebState {
     pub peer_keys: HashMap<String, [u8; 32]>,
     pub status: Arc<RwLock<IndexStatus>>,
     pub presence: Arc<std::sync::Mutex<Presence>>,
+    pub neighbors: Arc<Mutex<Vec<crate::discover::Neighbor>>>,
+    /// channel -> (typing|reply, expiry epoch ms)
+    pub live: Arc<Mutex<HashMap<String, (String, i64)>>>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -156,6 +160,22 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/messages/edit", post(handle_message_edit))
         .route("/api/messages/delete", post(handle_message_delete))
         .route("/api/channels/clone", post(handle_clone_channel))
+        .route("/api/neighbors", get(handle_neighbors))
+        .route("/api/typing", post(handle_typing))
+        .route("/api/p2p/open", post(handle_p2p_open))
+        .route("/api/p2p/hello", post(handle_p2p_hello))
+        .route("/api/p2p/push", post(handle_p2p_push))
+        .route("/api/p2p/pull", get(handle_p2p_pull))
+        .route(
+            "/api/mesh/context",
+            get(handle_mesh_context).post(handle_mesh_context_put),
+        )
+        .route("/api/mesh/append", post(handle_mesh_append))
+        .route("/api/mesh/edit", post(handle_mesh_edit))
+        .route("/api/mesh/delete", post(handle_mesh_delete))
+        .route("/api/mesh/typing", post(handle_mesh_typing))
+        .route("/api/mesh/live", get(handle_mesh_live))
+        .route("/api/internal/web", post(handle_internal_web))
         .route("/api/join", post(handle_join))
         .route("/api/inspect", post(handle_inspect))
         .route("/api/audit", get(handle_audit).post(handle_audit_post))
@@ -271,6 +291,7 @@ async fn handle_list_channels(
             remote_seq = mesh.activity;
             for ch in mesh.channels {
                 if !rows.iter().any(|r| r.name == ch.name) {
+                    let _ = st.db.upsert_channel(&ch).await;
                     rows.push(ch);
                 }
             }
@@ -305,6 +326,11 @@ async fn handle_list_channels(
             },
         );
     }
+    let remote_live = if let Some(base) = master_http(&st.cfg) {
+        fetch_remote_live(base).await.unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let mut sidebar = Vec::with_capacity(rows.len());
     for row in rows {
         let pref = st
@@ -316,6 +342,28 @@ async fn handle_list_channels(
         let max_seq = local_max.max(*remote_seq.get(&row.name).unwrap_or(&0));
         let unread = (max_seq - pref.last_read_seq).max(0);
         let members = st.db.list_members(&row.name).await.unwrap_or_default();
+        let local_live = st
+            .live
+            .lock()
+            .ok()
+            .and_then(|map| {
+                map.get(&row.name).and_then(|(kind, until)| {
+                    (*until > now_ms()).then(|| kind.clone())
+                })
+            })
+            .unwrap_or_default();
+        let live = if local_live.is_empty() {
+            remote_live.get(&row.name).cloned().unwrap_or_default()
+        } else {
+            local_live
+        };
+        let p2p = st
+            .db
+            .get_p2p(&row.name)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
         sidebar.push(SidebarChannel {
             group: channel_group(&row.name, &row.visibility),
             pinned: pref.pinned,
@@ -326,6 +374,8 @@ async fn handle_list_channels(
             unread_count: unread,
             use_count: pref.use_count,
             members,
+            live,
+            p2p,
             name: row.name,
             visibility: row.visibility,
             namespace: row.namespace,
@@ -366,6 +416,10 @@ struct SidebarChannel {
     unread_count: i64,
     use_count: i64,
     members: Vec<String>,
+    #[serde(default)]
+    live: String,
+    #[serde(default)]
+    p2p: bool,
 }
 
 #[derive(Deserialize)]
@@ -493,23 +547,31 @@ async fn handle_history(
                 fetch_shared_history(base, &st.cfg.node.id, &q.channel, &q.thread).await
             {
                 for msg in msgs {
-                    let _ = st.db.append_message(&msg).await;
+                    apply_synced(&st, &q.channel, msg).await;
                 }
+            }
+        }
+    }
+    if let Some(link) = st.db.get_p2p(&q.channel).await.ok().flatten() {
+        if let Some(msgs) = pull_p2p(&link, &q.thread).await {
+            for msg in msgs {
+                apply_synced(&st, &q.channel, msg).await;
             }
         }
     }
     let msgs = st
         .db
-        .load_thread(&q.channel, &q.thread, 200)
+        .load_shown(&q.channel, &q.thread, 200)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         msgs.into_iter()
             .map(|m| HistoryItem {
-                role: m.author,
-                text: m.content,
-                created_at_ms: m.created_at_ms,
-                seq: m.seq,
+                role: m.message.author,
+                text: m.message.content,
+                created_at_ms: m.message.created_at_ms,
+                seq: m.message.seq,
+                edited_at_ms: m.edited_at_ms,
             })
             .collect(),
     ))
@@ -521,6 +583,8 @@ struct HistoryItem {
     text: String,
     created_at_ms: i64,
     seq: u64,
+    #[serde(default)]
+    edited_at_ms: i64,
 }
 
 async fn handle_list_threads(
@@ -778,6 +842,7 @@ async fn prompt_for(
                 .into(),
         );
     }
+    pull_remote_entries(st, channel).await;
     let channel_row = st.db.get_channel(channel).await.ok().flatten();
     let namespaces = channel_row
         .as_ref()
@@ -883,7 +948,12 @@ async fn store_message(
                 }
                 Err(err) => {
                     warn!("hub append failed, keeping the message locally: {err}");
-                    local_append(st, msg).await
+                    if let Some(stored) = http_append(st, &msg).await {
+                        let _ = st.db.append_message(&stored).await;
+                        stored
+                    } else {
+                        local_append(st, msg).await
+                    }
                 }
             }
         } else if let Ok(stored) = st.db.append_public_message(&msg).await {
@@ -923,6 +993,9 @@ async fn store_message(
             .db
             .save_message_detail(&stored.channel_id, &stored.thread_id, stored.seq, detail)
             .await;
+    }
+    if let Ok(Some(link)) = st.db.get_p2p(&stored.channel_id).await {
+        push_one(&link, &stored, false, 0).await;
     }
     stored
 }
@@ -1165,14 +1238,20 @@ async fn handle_persistent_chat(
     let st_bg = st.clone();
     let model = req.model.filter(|s| !s.is_empty()).unwrap_or_default();
     tokio::spawn(async move {
+        set_live(&st_bg, &req.channel, "reply", now_ms() + 600_000);
         let _ = tx
             .send(StreamEvent::Status {
                 text: "Building context...".into(),
             })
             .await;
-        let ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt, &model)
+        let mut ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt, &model)
             .await
             .unwrap_or_default();
+        let pages = prefetch_pages(&st_bg, &req.prompt).await;
+        if !pages.is_empty() {
+            ctx.push_str("\n\n## Web results\n");
+            ctx.push_str(&pages);
+        }
         let audit = if sync_hub {
             Some(serde_json::json!({
                 "node_id": st_bg.cfg.node.id,
@@ -1185,7 +1264,34 @@ async fn handle_persistent_chat(
         let started = now_ms();
         let (author, final_text) =
             match dispatch_chat(&st_bg, &model, &ctx, &turns, tx.clone(), audit).await {
-                Ok((reply, used)) => (used, reply),
+                Ok((reply, used)) => {
+                    let (clean, tools) = crate::browse::take_requests(&reply);
+                    if tools.is_empty() || used == "error" {
+                        (used, reply)
+                    } else {
+                        let _ = tx
+                            .send(StreamEvent::Status {
+                                text: "Fetching the web...".into(),
+                            })
+                            .await;
+                        let pages = run_lookups(&st_bg, &tools).await;
+                        let mut next = turns.clone();
+                        next.push(ChatTurn {
+                            role: "assistant".into(),
+                            text: clean.clone(),
+                            attachments: vec![],
+                        });
+                        next.push(ChatTurn {
+                            role: "user".into(),
+                            text: format!("Web results:\n{pages}"),
+                            attachments: vec![],
+                        });
+                        match dispatch_chat(&st_bg, &model, &ctx, &next, tx.clone(), None).await {
+                            Ok((second, used2)) => (used2, second),
+                            Err(err) => (used, format!("{clean}\n\n[web lookup failed: {err:#}]")),
+                        }
+                    }
+                }
                 Err(err) => {
                     let err_txt = format!("[ERROR] {err:#}");
                     let _ = tx
@@ -1208,10 +1314,11 @@ async fn handle_persistent_chat(
             "actions": ["chat"]
         })
         .to_string();
+        let channel_name = req.channel.clone();
         let stored = store_message(
             &st_bg,
             SessionMessage {
-                channel_id: req.channel,
+                channel_id: channel_name.clone(),
                 thread_id: req.thread,
                 seq: 0,
                 author,
@@ -1225,6 +1332,7 @@ async fn handle_persistent_chat(
         let _ = tx
             .send(StreamEvent::Saved { seq: stored.seq })
             .await;
+        clear_live(&st_bg, &channel_name);
     });
 
     let stream = ReceiverStream::new(rx)
@@ -1275,6 +1383,10 @@ struct ShareMsg {
     author: String,
     content: String,
     created_at_ms: i64,
+    #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
+    edited_at_ms: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1416,11 +1528,7 @@ async fn handle_channel_state(
         pref.use_count = pref.use_count.saturating_add(1);
     }
     if body.mark_read {
-        let seq = st
-            .db
-            .max_seq(&body.name)
-            .await
-            .unwrap_or(pref.last_read_seq);
+        let seq = high_water(&st, &body.name).await;
         pref.last_read_seq = pref.last_read_seq.max(seq);
     }
     st.db
@@ -1570,17 +1678,19 @@ async fn handle_mesh_history(
     };
     let msgs = st
         .db
-        .load_thread(&q.channel, thread, 400)
+        .load_sync(&q.channel, thread, 400)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
         msgs.into_iter()
             .map(|m| ShareMsg {
-                thread_id: m.thread_id,
-                seq: m.seq,
-                author: m.author,
-                content: m.content,
-                created_at_ms: m.created_at_ms,
+                thread_id: m.message.thread_id,
+                seq: m.message.seq,
+                author: m.message.author,
+                content: m.message.content,
+                created_at_ms: m.message.created_at_ms,
+                deleted: m.deleted,
+                edited_at_ms: m.edited_at_ms,
             })
             .collect(),
     ))
@@ -1591,7 +1701,7 @@ async fn fetch_shared_history(
     node_id: &str,
     channel: &str,
     thread: &str,
-) -> Option<Vec<SessionMessage>> {
+) -> Option<Vec<ShareMsg>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -1609,18 +1719,7 @@ async fn fetch_shared_history(
         .json()
         .await
         .ok()?;
-    Some(
-        msgs.into_iter()
-            .map(|m| SessionMessage {
-                channel_id: channel.to_string(),
-                thread_id: m.thread_id,
-                seq: m.seq,
-                author: m.author,
-                content: m.content,
-                created_at_ms: m.created_at_ms,
-            })
-            .collect(),
-    )
+    Some(msgs)
 }
 
 async fn apply_share(st: &WebState, body: ShareBody) -> Result<(), StatusCode> {
@@ -1893,27 +1992,15 @@ async fn handle_share(
                 author: m.author,
                 content: m.content,
                 created_at_ms: m.created_at_ms,
+                deleted: false,
+                edited_at_ms: 0,
             })
             .collect()
     } else {
         body.messages
     };
     let entries = if body.entries.is_empty() {
-        st.db
-            .load_entries(Some(&channel))
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .take(200)
-            .map(|e| ShareEntry {
-                id: e.id,
-                namespace: e.namespace,
-                source_path: e.source_path,
-                content: e.content,
-                content_hash: e.content_hash,
-                entry_type: e.entry_type,
-            })
-            .collect()
+        snapshot_entries(&st, &channel).await
     } else {
         body.entries
     };
@@ -2007,6 +2094,7 @@ async fn handle_message_delete(
         .set_message_deleted(&body.channel, &thread, body.seq, true)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    publish_delete(&st, &body.channel, &thread, body.seq).await;
     Ok(StatusCode::OK)
 }
 
@@ -2025,26 +2113,18 @@ async fn handle_message_edit(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    if record["author"].as_str() != Some("user") {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let _ = record;
     st.db
         .rewrite_message(&body.channel, &thread, body.seq, &body.text)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let later = st
+    let edited_at_ms = now_ms();
+    let detail = serde_json::json!({ "edited_at_ms": edited_at_ms, "actions": ["edit"] }).to_string();
+    let _ = st
         .db
-        .load_thread(&body.channel, &thread, 500)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    for msg in later {
-        if msg.seq > body.seq {
-            let _ = st
-                .db
-                .set_message_deleted(&body.channel, &thread, msg.seq, true)
-                .await;
-        }
-    }
+        .save_message_detail(&body.channel, &thread, body.seq, &detail)
+        .await;
+    publish_edit(&st, &body.channel, &thread, body.seq, &body.text, edited_at_ms).await;
     Ok(StatusCode::OK)
 }
 
@@ -2061,12 +2141,22 @@ async fn handle_clone_channel(
     if storage_name(name).is_err() || name == "general" {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let source = st
+    let source = match st
         .db
         .get_channel(&body.channel)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    {
+        Some(row) => row,
+        None => ChannelRow {
+            name: body.channel.clone(),
+            visibility: channel_visibility(&st, &body.channel).await,
+            namespace: body.channel.clone(),
+            origin_node: st.cfg.node.id.clone(),
+            context_namespaces: vec![body.channel.clone()],
+            updated_at_ms: 0,
+        },
+    };
     let msgs = st
         .db
         .load_thread(&body.channel, &thread, 500)
@@ -2135,4 +2225,892 @@ async fn handle_clone_channel(
         "thread": "main",
         "seq": 1
     })))
+}
+
+pub async fn publish_shared_outlines(st: Arc<WebState>) {
+    let Ok(rows) = st.db.list_channel_rows().await else {
+        return;
+    };
+    for row in rows {
+        if row.visibility != "shared" && row.visibility != "public" {
+            continue;
+        }
+        let entries = snapshot_entries(&st, &row.name).await;
+        if entries.is_empty() {
+            continue;
+        }
+        push_entries(&st, &row.name, &entries).await;
+    }
+}
+
+async fn push_entries(st: &WebState, channel: &str, entries: &[ShareEntry]) {
+    let Some(base) = master_http(&st.cfg) else {
+        for entry in entries {
+            let _ = st
+                .db
+                .upsert_proto(&entry_proto(st, entry), false)
+                .await;
+        }
+        return;
+    };
+    let _ = signed_post(
+        st,
+        &format!(
+            "{}/api/mesh/context?channel={}",
+            base.trim_end_matches('/'),
+            urlencoding(channel)
+        ),
+        "context",
+        &[channel],
+        &entries,
+    )
+    .await;
+}
+
+fn entry_proto(st: &WebState, entry: &ShareEntry) -> ContextEntry {
+    ContextEntry {
+        id: entry.id.clone(),
+        namespace: entry.namespace.clone(),
+        entry_type: entry.entry_type,
+        source_path: entry.source_path.clone(),
+        content: entry.content.clone(),
+        content_hash: entry.content_hash.clone(),
+        embedding: vec![],
+        updated_at_ms: now_ms(),
+        origin_node: st.cfg.node.id.clone(),
+        meta: Default::default(),
+    }
+}
+
+fn set_live(st: &WebState, channel: &str, kind: &str, until: i64) {
+    if let Ok(mut map) = st.live.lock() {
+        map.insert(channel.to_string(), (kind.to_string(), until));
+    }
+}
+
+fn clear_live(st: &WebState, channel: &str) {
+    if let Ok(mut map) = st.live.lock() {
+        map.remove(channel);
+    }
+}
+
+async fn high_water(st: &WebState, name: &str) -> i64 {
+    let local = st.db.max_seq(name).await.unwrap_or(0);
+    let remote = if let Some(base) = master_http(&st.cfg) {
+        fetch_mesh(base, &st.cfg.node.id)
+            .await
+            .and_then(|mesh| mesh.activity.get(name).copied())
+            .unwrap_or(0)
+    } else if matches!(st.cfg.node.mode, NodeMode::Master) {
+        st.db
+            .activity()
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|(n, _)| n == name).map(|(_, s)| s))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    local.max(remote)
+}
+
+async fn fetch_remote_live(base: &str) -> Option<HashMap<String, String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .ok()?;
+    client
+        .get(format!("{}/api/mesh/live", base.trim_end_matches('/')))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+async fn apply_synced(st: &WebState, channel: &str, msg: ShareMsg) {
+    let thread = msg.thread_id.clone();
+    let _ = st
+        .db
+        .append_message(&SessionMessage {
+            channel_id: channel.to_string(),
+            thread_id: thread.clone(),
+            seq: msg.seq,
+            author: msg.author,
+            content: msg.content,
+            created_at_ms: msg.created_at_ms,
+        })
+        .await;
+    if msg.deleted {
+        let _ = st
+            .db
+            .set_message_deleted(channel, &thread, msg.seq, true)
+            .await;
+    }
+    if msg.edited_at_ms > 0 {
+        let detail = serde_json::json!({ "edited_at_ms": msg.edited_at_ms }).to_string();
+        let _ = st
+            .db
+            .save_message_detail(channel, &thread, msg.seq, &detail)
+            .await;
+    }
+}
+
+fn share_entry(entry: ContextEntry) -> ShareEntry {
+    ShareEntry {
+        id: entry.id,
+        namespace: entry.namespace,
+        source_path: entry.source_path,
+        content: entry.content.chars().take(8_000).collect(),
+        content_hash: entry.content_hash,
+        entry_type: entry.entry_type,
+    }
+}
+
+async fn snapshot_entries(st: &WebState, channel: &str) -> Vec<ShareEntry> {
+    let mut entries = Vec::new();
+    if let Ok(rows) = st.db.load_entries(Some(channel)).await {
+        for entry in rows.into_iter().take(40) {
+            entries.push(share_entry(entry));
+        }
+    }
+    let namespaces = st
+        .db
+        .get_channel(channel)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.context_namespaces)
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| vec![channel.to_string()]);
+    for ns in namespaces {
+        let Some(dir) = project_dir(&st.cfg, &ns) else {
+            continue;
+        };
+        let outline = project_outline(&st.cfg, dir.clone()).await;
+        if !outline.is_empty() {
+            entries.push(ShareEntry {
+                id: blake3::hash(format!("outline:{ns}").as_bytes())
+                    .to_hex()
+                    .to_string(),
+                namespace: ns.clone(),
+                source_path: "_xmesh/outline.md".into(),
+                content: outline.chars().take(28_000).collect(),
+                content_hash: String::new(),
+                entry_type: EntryType::Pinned as i32,
+            });
+        }
+        let origin = st.cfg.node.id.clone();
+        let ns_scan = ns.clone();
+        if let Ok(Ok(files)) =
+            tokio::task::spawn_blocking(move || scan_workdir(&dir, &ns_scan, &origin)).await
+        {
+            for entry in files.into_iter().take(40) {
+                if entries.len() >= 80 {
+                    break;
+                }
+                entries.push(share_entry(entry));
+            }
+        }
+    }
+    entries
+}
+
+async fn pull_remote_entries(st: &WebState, channel: &str) {
+    let Some(base) = master_http(&st.cfg) else {
+        return;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let rows: Vec<ShareEntry> = match client
+        .get(format!("{}/api/mesh/context", base.trim_end_matches('/')))
+        .query(&[("node_id", st.cfg.node.id.as_str()), ("channel", channel)])
+        .send()
+        .await
+    {
+        Ok(resp) => resp.json().await.unwrap_or_default(),
+        Err(_) => return,
+    };
+    for entry in rows {
+        let _ = st
+            .db
+            .upsert_proto(
+                &ContextEntry {
+                    id: entry.id,
+                    namespace: entry.namespace,
+                    entry_type: entry.entry_type,
+                    source_path: entry.source_path,
+                    content: entry.content,
+                    content_hash: entry.content_hash,
+                    embedding: vec![],
+                    updated_at_ms: now_ms(),
+                    origin_node: st.cfg.node.id.clone(),
+                    meta: Default::default(),
+                },
+                false,
+            )
+            .await;
+    }
+}
+
+async fn http_append(st: &WebState, msg: &SessionMessage) -> Option<SessionMessage> {
+    let base = master_http(&st.cfg)?;
+    let payload = ShareMsg {
+        thread_id: msg.thread_id.clone(),
+        seq: msg.seq,
+        author: msg.author.clone(),
+        content: msg.content.clone(),
+        created_at_ms: msg.created_at_ms,
+        deleted: false,
+        edited_at_ms: 0,
+    };
+    let resp = signed_post(
+        st,
+        &format!(
+            "{}/api/mesh/append?channel={}",
+            base.trim_end_matches('/'),
+            urlencoding(&msg.channel_id)
+        ),
+        "append",
+        &[&msg.channel_id, &msg.thread_id, &msg.author, &msg.content],
+        &payload,
+    )
+    .await
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: ShareMsg = resp.json().await.ok()?;
+    Some(SessionMessage {
+        channel_id: msg.channel_id.clone(),
+        thread_id: body.thread_id,
+        seq: body.seq,
+        author: body.author,
+        content: body.content,
+        created_at_ms: body.created_at_ms,
+    })
+}
+
+fn urlencoding(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+async fn publish_edit(st: &WebState, channel: &str, thread: &str, seq: u64, text: &str, edited_at_ms: i64) {
+    if let Some(base) = master_http(&st.cfg) {
+        let payload = ShareMsg {
+            thread_id: thread.into(),
+            seq,
+            author: String::new(),
+            content: text.into(),
+            created_at_ms: 0,
+            deleted: false,
+            edited_at_ms,
+        };
+        let _ = signed_post(
+            st,
+            &format!(
+                "{}/api/mesh/edit?channel={}",
+                base.trim_end_matches('/'),
+                urlencoding(channel)
+            ),
+            "edit",
+            &[channel, thread, &seq.to_string(), text],
+            &payload,
+        )
+        .await;
+    }
+    if let Ok(Some(link)) = st.db.get_p2p(channel).await {
+        let msg = SessionMessage {
+            channel_id: channel.into(),
+            thread_id: thread.into(),
+            seq,
+            author: String::new(),
+            content: text.into(),
+            created_at_ms: 0,
+        };
+        push_one(&link, &msg, false, edited_at_ms).await;
+    }
+}
+
+async fn publish_delete(st: &WebState, channel: &str, thread: &str, seq: u64) {
+    if let Some(base) = master_http(&st.cfg) {
+        let payload = ShareMsg {
+            thread_id: thread.into(),
+            seq,
+            author: String::new(),
+            content: String::new(),
+            created_at_ms: 0,
+            deleted: true,
+            edited_at_ms: 0,
+        };
+        let _ = signed_post(
+            st,
+            &format!(
+                "{}/api/mesh/delete?channel={}",
+                base.trim_end_matches('/'),
+                urlencoding(channel)
+            ),
+            "delete",
+            &[channel, thread, &seq.to_string()],
+            &payload,
+        )
+        .await;
+    }
+    if let Ok(Some(link)) = st.db.get_p2p(channel).await {
+        let msg = SessionMessage {
+            channel_id: channel.into(),
+            thread_id: thread.into(),
+            seq,
+            author: String::new(),
+            content: String::new(),
+            created_at_ms: 0,
+        };
+        push_one(&link, &msg, true, 0).await;
+    }
+}
+
+async fn prefetch_pages(st: &WebState, prompt: &str) -> String {
+    let mut out = String::new();
+    for url in crate::browse::urls_in(prompt) {
+        let page = run_lookup(
+            st,
+            &crate::browse::Lookup {
+                kind: "fetch",
+                query: url.clone(),
+            },
+        )
+        .await;
+        out.push_str(&format!("\n### {url}\n{page}\n"));
+    }
+    out
+}
+
+async fn run_lookups(st: &WebState, tools: &[crate::browse::Lookup]) -> String {
+    let mut out = String::new();
+    for tool in tools.iter().take(2) {
+        let page = run_lookup(st, tool).await;
+        out.push_str(&format!("\n### {} {}\n{page}\n", tool.kind, tool.query));
+    }
+    out
+}
+
+async fn run_lookup(st: &WebState, lookup: &crate::browse::Lookup) -> String {
+    if let Some(base) = master_http(&st.cfg) {
+        if let Some(text) = remote_lookup(base, lookup).await {
+            return text;
+        }
+    }
+    crate::browse::run(lookup)
+        .await
+        .unwrap_or_else(|err| format!("lookup failed: {err}"))
+}
+
+async fn remote_lookup(base: &str, lookup: &crate::browse::Lookup) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(25))
+        .build()
+        .ok()?;
+    let resp = client
+        .post(format!("{}/api/internal/web", base.trim_end_matches('/')))
+        .json(&serde_json::json!({ "kind": lookup.kind, "query": lookup.query }))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("text").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+#[derive(Deserialize)]
+struct WebBody {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    query: String,
+}
+
+async fn handle_internal_web(Json(body): Json<WebBody>) -> Json<serde_json::Value> {
+    let lookup = crate::browse::Lookup {
+        kind: if body.kind == "fetch" { "fetch" } else { "web" },
+        query: body.query,
+    };
+    let text = crate::browse::run(&lookup)
+        .await
+        .unwrap_or_else(|err| format!("lookup failed: {err}"));
+    Json(serde_json::json!({ "text": text }))
+}
+
+async fn handle_neighbors(State(st): State<Arc<WebState>>) -> Json<Vec<crate::discover::Neighbor>> {
+    let rows = st.neighbors.lock().map(|g| g.clone()).unwrap_or_default();
+    Json(rows)
+}
+
+#[derive(Serialize, Deserialize)]
+struct TypingBody {
+    channel: String,
+    #[serde(default)]
+    kind: String,
+}
+
+async fn handle_typing(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<TypingBody>,
+) -> StatusCode {
+    if body.kind.is_empty() {
+        clear_live(&st, &body.channel);
+    } else {
+        set_live(&st, &body.channel, &body.kind, now_ms() + 6_000);
+    }
+    if let Some(base) = master_http(&st.cfg) {
+        let _ = signed_post(
+            &st,
+            &format!("{}/api/mesh/typing", base.trim_end_matches('/')),
+            "typing",
+            &[&body.channel, &body.kind],
+            &body,
+        )
+        .await;
+    }
+    StatusCode::OK
+}
+
+async fn handle_mesh_typing(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<TypingBody>,
+) -> StatusCode {
+    if body.kind.is_empty() {
+        clear_live(&st, &body.channel);
+    } else {
+        set_live(&st, &body.channel, &body.kind, now_ms() + 6_000);
+    }
+    StatusCode::OK
+}
+
+async fn handle_mesh_live(State(st): State<Arc<WebState>>) -> Json<HashMap<String, String>> {
+    let now = now_ms();
+    let rows = st
+        .live
+        .lock()
+        .map(|map| {
+            map.iter()
+                .filter(|(_, (_, until))| *until > now)
+                .map(|(name, (kind, _))| (name.clone(), kind.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(rows)
+}
+
+#[derive(Deserialize)]
+struct NodeChannelQuery {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    channel: String,
+}
+
+async fn member_or_public(st: &WebState, channel: &str, node_id: &str) -> Result<(), StatusCode> {
+    let Some(row) = st
+        .db
+        .get_channel(channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if row.visibility == "private" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if row.visibility == "shared" {
+        let member = st
+            .db
+            .member_state(channel, node_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if member.is_none() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_mesh_context(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<NodeChannelQuery>,
+) -> Result<Json<Vec<ShareEntry>>, StatusCode> {
+    member_or_public(&st, &q.channel, &q.node_id).await?;
+    let mut names = st
+        .db
+        .get_channel(&q.channel)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.context_namespaces)
+        .unwrap_or_default();
+    if !names.iter().any(|ns| ns == &q.channel) {
+        names.push(q.channel.clone());
+    }
+    let mut out = Vec::new();
+    for ns in names {
+        if let Ok(rows) = st.db.load_entries(Some(&ns)).await {
+            for entry in rows {
+                if out.len() >= 80 {
+                    break;
+                }
+                out.push(share_entry(entry));
+            }
+        }
+    }
+    Ok(Json(out))
+}
+
+async fn handle_mesh_context_put(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(q): Query<NodeChannelQuery>,
+    Json(entries): Json<Vec<ShareEntry>>,
+) -> Result<StatusCode, StatusCode> {
+    let node = header_node(&st, &headers);
+    member_or_public(&st, &q.channel, &node).await?;
+    for entry in entries.into_iter().take(80) {
+        let _ = st.db.upsert_proto(&entry_proto(&st, &entry), false).await;
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn handle_mesh_append(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(q): Query<NodeChannelQuery>,
+    Json(body): Json<ShareMsg>,
+) -> Result<Json<ShareMsg>, StatusCode> {
+    let node = header_node(&st, &headers);
+    member_or_public(&st, &q.channel, &node).await?;
+    let stored = st
+        .db
+        .append_public_message(&SessionMessage {
+            channel_id: q.channel,
+            thread_id: body.thread_id,
+            seq: body.seq,
+            author: body.author,
+            content: body.content,
+            created_at_ms: body.created_at_ms,
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(ShareMsg {
+        thread_id: stored.thread_id,
+        seq: stored.seq,
+        author: stored.author,
+        content: stored.content,
+        created_at_ms: stored.created_at_ms,
+        deleted: false,
+        edited_at_ms: 0,
+    }))
+}
+
+async fn handle_mesh_edit(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(q): Query<NodeChannelQuery>,
+    Json(body): Json<ShareMsg>,
+) -> Result<StatusCode, StatusCode> {
+    let node = header_node(&st, &headers);
+    member_or_public(&st, &q.channel, &node).await?;
+    st.db
+        .rewrite_message(&q.channel, &body.thread_id, body.seq, &body.content)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if body.edited_at_ms > 0 {
+        let detail = serde_json::json!({ "edited_at_ms": body.edited_at_ms }).to_string();
+        let _ = st
+            .db
+            .save_message_detail(&q.channel, &body.thread_id, body.seq, &detail)
+            .await;
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn handle_mesh_delete(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(q): Query<NodeChannelQuery>,
+    Json(body): Json<ShareMsg>,
+) -> Result<StatusCode, StatusCode> {
+    let node = header_node(&st, &headers);
+    member_or_public(&st, &q.channel, &node).await?;
+    st.db
+        .set_message_deleted(&q.channel, &body.thread_id, body.seq, true)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+fn header_node(st: &WebState, headers: &HeaderMap) -> String {
+    headers
+        .get("x-xmesh-node")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&st.cfg.node.id)
+        .to_string()
+}
+
+#[derive(Deserialize)]
+struct P2pOpen {
+    peer_base: String,
+    peer_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct P2pHello {
+    channel: String,
+    token: String,
+    from_name: String,
+    from_base: String,
+}
+
+#[derive(Deserialize)]
+struct P2pPush {
+    token: String,
+    channel: String,
+    #[serde(default)]
+    messages: Vec<ShareMsg>,
+}
+
+async fn handle_p2p_open(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<P2pOpen>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let peer_name = body.peer_name.trim();
+    if peer_name.is_empty() || storage_name(peer_name).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let channel = format!("p2p-{peer_name}");
+    let (token, _) = crate::identity::new_token();
+    let base = body.peer_base.trim_end_matches('/').to_string();
+    let hello = P2pHello {
+        channel: channel.clone(),
+        token: token.clone(),
+        from_name: st.cfg.node.id.clone(),
+        from_base: local_http_base(&st),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp = client
+        .post(format!("{base}/api/p2p/hello"))
+        .json(&hello)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !resp.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    st.db
+        .upsert_channel(&ChannelRow {
+            name: channel.clone(),
+            visibility: "private".into(),
+            namespace: channel.clone(),
+            origin_node: st.cfg.node.id.clone(),
+            context_namespaces: vec![channel.clone()],
+            updated_at_ms: 0,
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    st.db
+        .put_p2p(&channel, &base, peer_name, &token)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "channel": channel })))
+}
+
+async fn handle_p2p_hello(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<P2pHello>,
+) -> Result<StatusCode, StatusCode> {
+    if storage_name(&body.channel).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    st.db
+        .upsert_channel(&ChannelRow {
+            name: body.channel.clone(),
+            visibility: "private".into(),
+            namespace: body.channel.clone(),
+            origin_node: body.from_name.clone(),
+            context_namespaces: vec![body.channel.clone()],
+            updated_at_ms: 0,
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    st.db
+        .put_p2p(
+            &body.channel,
+            body.from_base.trim_end_matches('/'),
+            &body.from_name,
+            &body.token,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_p2p_push(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<P2pPush>,
+) -> Result<StatusCode, StatusCode> {
+    let link = st
+        .db
+        .get_p2p(&body.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if link.token != body.token {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    for msg in body.messages {
+        apply_synced(&st, &body.channel, msg).await;
+    }
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct P2pPullQuery {
+    channel: String,
+    token: String,
+    #[serde(default)]
+    thread: String,
+}
+
+async fn handle_p2p_pull(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<P2pPullQuery>,
+) -> Result<Json<Vec<ShareMsg>>, StatusCode> {
+    let link = st
+        .db
+        .get_p2p(&q.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if link.token != q.token {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let thread = if q.thread.is_empty() { "main" } else { &q.thread };
+    let rows = st
+        .db
+        .load_sync(&q.channel, thread, 400)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| ShareMsg {
+                thread_id: row.message.thread_id,
+                seq: row.message.seq,
+                author: row.message.author,
+                content: row.message.content,
+                created_at_ms: row.message.created_at_ms,
+                deleted: row.deleted,
+                edited_at_ms: row.edited_at_ms,
+            })
+            .collect(),
+    ))
+}
+
+fn local_http_base(st: &WebState) -> String {
+    let port = st
+        .cfg
+        .node
+        .http_addr
+        .rsplit(':')
+        .next()
+        .unwrap_or("8080");
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    if !ip.is_loopback() {
+                        return format!("http://{ip}:{port}");
+                    }
+                }
+            }
+        }
+    }
+    format!("http://127.0.0.1:{port}")
+}
+
+async fn pull_p2p(link: &crate::storage::P2pLink, thread: &str) -> Option<Vec<ShareMsg>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    client
+        .get(format!(
+            "{}/api/p2p/pull",
+            link.peer_base.trim_end_matches('/')
+        ))
+        .query(&[
+            ("channel", link.channel.as_str()),
+            ("token", link.token.as_str()),
+            ("thread", thread),
+        ])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+async fn push_one(link: &crate::storage::P2pLink, msg: &SessionMessage, deleted: bool, edited_at_ms: i64) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let payload = P2pPushBody {
+        token: link.token.clone(),
+        channel: link.channel.clone(),
+        messages: vec![ShareMsg {
+            thread_id: msg.thread_id.clone(),
+            seq: msg.seq,
+            author: msg.author.clone(),
+            content: msg.content.clone(),
+            created_at_ms: msg.created_at_ms,
+            deleted,
+            edited_at_ms,
+        }],
+    };
+    let _ = client
+        .post(format!(
+            "{}/api/p2p/push",
+            link.peer_base.trim_end_matches('/')
+        ))
+        .json(&payload)
+        .send()
+        .await;
+}
+
+#[derive(Serialize)]
+struct P2pPushBody {
+    token: String,
+    channel: String,
+    messages: Vec<ShareMsg>,
 }

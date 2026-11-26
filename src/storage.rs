@@ -212,6 +212,51 @@ fn message_id(channel: &str, thread: &str, seq: u64) -> String {
         .to_string()
 }
 
+#[derive(Clone, Debug)]
+pub struct ShownMessage {
+    pub message: pb::SessionMessage,
+    pub edited_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyncRow {
+    pub message: pb::SessionMessage,
+    pub deleted: bool,
+    pub edited_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct P2pLink {
+    pub channel: String,
+    pub peer_base: String,
+    #[allow(dead_code)]
+    pub peer_name: String,
+    pub token: String,
+}
+
+fn edited_at(detail: &str) -> i64 {
+    serde_json::from_str::<serde_json::Value>(detail)
+        .ok()
+        .and_then(|v| v.get("edited_at_ms").and_then(|n| n.as_i64()))
+        .unwrap_or(0)
+}
+
+fn shown_from_row(row: &sqlx::any::AnyRow) -> ShownMessage {
+    let seq: i64 = row.get("seq");
+    let detail: String = row.try_get("detail").unwrap_or_default();
+    ShownMessage {
+        message: pb::SessionMessage {
+            channel_id: row.get("channel_id"),
+            thread_id: row.get("thread_id"),
+            seq: seq as u64,
+            author: row.get("author"),
+            content: row.get("content"),
+            created_at_ms: row.get("created_at_ms"),
+        },
+        edited_at_ms: edited_at(&detail),
+    }
+}
+
 fn decode_namespaces(raw: &str, fallback: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_else(|_| {
         if fallback.is_empty() {
@@ -341,6 +386,16 @@ impl Storage {
                 token_hash VARCHAR(64) PRIMARY KEY,
                 channel_name VARCHAR(128) NOT NULL,
                 created_at_ms BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS p2p_links (
+                channel_name VARCHAR(128) PRIMARY KEY,
+                peer_base TEXT NOT NULL,
+                peer_name TEXT NOT NULL,
+                token TEXT NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -889,6 +944,111 @@ impl Storage {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(Self::message_from_row).collect())
+    }
+
+    pub async fn load_shown(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ShownMessage>> {
+        let sql = self.q(
+            "SELECT s.channel_id, s.thread_id, s.seq, s.author, s.content, s.created_at_ms,
+                    COALESCE(m.detail, '') AS detail
+             FROM session_messages s
+             LEFT JOIN message_meta m ON m.id = s.id
+             WHERE s.channel_id = $1 AND s.thread_id = $2
+             AND s.id NOT IN (SELECT id FROM message_meta WHERE deleted != 0)
+             ORDER BY s.seq ASC LIMIT $3",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(channel_id)
+            .bind(thread_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(shown_from_row).collect())
+    }
+
+    pub async fn load_sync(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SyncRow>> {
+        let sql = self.q(
+            "SELECT s.channel_id, s.thread_id, s.seq, s.author, s.content, s.created_at_ms,
+                    COALESCE(m.deleted, 0) AS deleted, COALESCE(m.detail, '') AS detail
+             FROM session_messages s
+             LEFT JOIN message_meta m ON m.id = s.id
+             WHERE s.channel_id = $1 AND s.thread_id = $2
+             ORDER BY s.seq ASC LIMIT $3",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(channel_id)
+            .bind(thread_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let deleted = row
+                    .try_get::<i64, _>("deleted")
+                    .or_else(|_| row.try_get::<i32, _>("deleted").map(i64::from))
+                    .unwrap_or(0);
+                SyncRow {
+                    message: Self::message_from_row(row),
+                    deleted: deleted != 0,
+                    edited_at_ms: edited_at(&row.try_get::<String, _>("detail").unwrap_or_default()),
+                }
+            })
+            .collect())
+    }
+
+    pub async fn put_p2p(
+        &self,
+        channel: &str,
+        peer_base: &str,
+        peer_name: &str,
+        token: &str,
+    ) -> Result<()> {
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO p2p_links (channel_name, peer_base, peer_name, token)
+                 VALUES ($1, $2, $3, $4)
+                 ON DUPLICATE KEY UPDATE peer_base = VALUES(peer_base), peer_name = VALUES(peer_name), token = VALUES(token)",
+            ),
+            _ => self.q(
+                "INSERT INTO p2p_links (channel_name, peer_base, peer_name, token)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(channel_name) DO UPDATE SET peer_base = $2, peer_name = $3, token = $4",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(channel)
+            .bind(peer_base)
+            .bind(peer_name)
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_p2p(&self, channel: &str) -> Result<Option<P2pLink>> {
+        let sql = self.q(
+            "SELECT channel_name, peer_base, peer_name, token FROM p2p_links WHERE channel_name = $1",
+        );
+        let row = sqlx::query(&sql)
+            .bind(channel)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| P2pLink {
+            channel: r.get("channel_name"),
+            peer_base: r.get("peer_base"),
+            peer_name: r.get("peer_name"),
+            token: r.get("token"),
+        }))
     }
 
     async fn load_messages(

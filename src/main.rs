@@ -1,4 +1,6 @@
+mod browse;
 mod config;
+mod discover;
 mod executor;
 mod identity;
 mod git_sync;
@@ -332,10 +334,21 @@ async fn main() -> Result<()> {
             channel: "general".into(),
             viewing: false,
         })),
+        neighbors: Arc::new(std::sync::Mutex::new(Vec::new())),
+        live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    });
+    let neighbors = web.neighbors.clone();
+    let publish = web.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        web_ui::publish_shared_outlines(publish).await;
     });
     let app = web_ui::router(web);
     let listener = tokio::net::TcpListener::bind(&cfg.node.http_addr).await?;
     let http_addr = listener.local_addr()?;
+    if cfg.node.discover {
+        discover::spawn(cfg.node.id.clone(), http_addr.port(), neighbors);
+    }
     let http_app = app.clone();
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, http_app).await {

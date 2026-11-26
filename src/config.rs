@@ -59,6 +59,9 @@ pub struct NodeSection {
     /// Hub only. Directory of `<node-id>.key` files, one per peer.
     #[serde(default)]
     pub peer_keys_dir: Option<String>,
+    /// Advertise this daemon on the local network and list neighbours.
+    #[serde(default = "default_true")]
+    pub discover: bool,
     #[serde(default)]
     pub allowed_workspaces: Vec<String>,
 }

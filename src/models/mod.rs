@@ -68,6 +68,8 @@ pub enum StreamEvent {
     Delta { text: String },
     Done { model_used: String },
     Saved { seq: u64 },
+    /// The page could not be fetched by the daemon. The UI opens it.
+    Browse { url: String, text: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

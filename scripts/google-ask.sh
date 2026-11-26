@@ -24,23 +24,29 @@ fetch() {
     "$1" || true
 }
 
-body=$(fetch "$url")
+browser=""
+for candidate in chromium chromium-browser google-chrome google-chrome-stable; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    browser=$candidate
+    break
+  fi
+done
+
+body=""
+if [ -n "$browser" ]; then
+  body=$("$browser" --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$url" 2>/dev/null || true)
+fi
+if [ -z "$body" ]; then
+  body=$(fetch "$url")
+fi
 if [ -z "$body" ]; then
   plain=$(printf '%s' "https://www.google.com/search?hl=en&q={query}" | sed "s/{query}/$enc/g")
   body=$(fetch "$plain")
 fi
 
-if [ -z "$body" ]; then
-  echo "Web search returned no page. The query was:"
-  printf '%s\n' "$query"
-  exit 0
-fi
-
 case "$body" in
-  *trouble\ accessing\ Google\ Search*|*enablejs*)
-    echo "Google served its automated-access page instead of a result."
-    echo "The query was:"
-    printf '%s\n' "$query"
+  *trouble\ accessing\ Google\ Search*|*enablejs*|"")
+    printf 'OPEN_BROWSER\t%s\n' "$url"
     exit 0
     ;;
 esac

@@ -60,7 +60,9 @@ pub fn coding_preamble(channel: &str) -> String {
          Do not claim the source is unavailable when those blocks are present.\n\
          When you change code, include one unified diff inside a ```diff fence that `git apply` can consume, then explain the change briefly.\n\
          Prefer small reviewable edits. Pinned and learned notes are invariants.\n\
-         The daemon process runs as its operating-system user. You decide whether an action is safe to propose. The operating system enforces that user's rights."
+         The daemon process runs as its operating-system user. You decide whether an action is safe to propose. The operating system enforces that user's rights.\n\
+         Facts that are not in the project blocks or in a Web results block are not known to you. Do not invent web pages, versions, or current events.\n\
+         When you need a lookup, end the reply with one fenced block of language web whose body is the query, or language fetch whose body is one http(s) URL. The daemon runs it and asks you again."
     )
 }
 
