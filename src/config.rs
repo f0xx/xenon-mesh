@@ -86,6 +86,10 @@ pub struct GitSection {
     /// Findings are appended to the built-in diff inspection.
     #[serde(default)]
     pub inspect_command: Vec<String>,
+    /// Optional argv. The project path is the last argument. Stdout replaces
+    /// the built-in project outline in chat context.
+    #[serde(default)]
+    pub harvest_command: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -168,6 +172,12 @@ pub struct ProviderConfig {
     pub coding_bias: bool,
     pub timeout_secs: u64,
     pub openapi_url: String,
+    /// Argv of the web-search script. The query is written to its stdin.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Browser identity for the web-search script. Empty uses the script default.
+    #[serde(default)]
+    pub user_agent: String,
 }
 
 impl Default for ProviderConfig {
@@ -185,6 +195,8 @@ impl Default for ProviderConfig {
             coding_bias: true,
             timeout_secs: 300,
             openapi_url: String::new(),
+            command: Vec::new(),
+            user_agent: String::new(),
         }
     }
 }

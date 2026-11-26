@@ -184,8 +184,8 @@ pub struct SidebarKey {
     pub name: String,
 }
 
-/// Pinned channels stay at the top of their group and are ordered Z to A.
-/// Everything else is most-used first, then Z to A.
+/// Pinned channels stay at the top of their group, A to Z.
+/// Everything else is most-used first, then A to Z.
 pub fn cmp_sidebar(a: &SidebarKey, b: &SidebarKey) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     let group = a.group.cmp(&b.group);
@@ -197,13 +197,13 @@ pub fn cmp_sidebar(a: &SidebarKey, b: &SidebarKey) -> std::cmp::Ordering {
         return pin;
     }
     if a.pinned {
-        return b.name.to_lowercase().cmp(&a.name.to_lowercase());
+        return a.name.to_lowercase().cmp(&b.name.to_lowercase());
     }
     let used = b.use_count.cmp(&a.use_count);
     if used != Equal {
         return used;
     }
-    b.name.to_lowercase().cmp(&a.name.to_lowercase())
+    a.name.to_lowercase().cmp(&b.name.to_lowercase())
 }
 
 fn message_id(channel: &str, thread: &str, seq: u64) -> String {
@@ -327,6 +327,24 @@ impl Storage {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_msg_thread ON session_messages(channel_id, thread_id, seq)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS message_meta (
+                id VARCHAR(64) PRIMARY KEY,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS invite_tokens (
+                token_hash VARCHAR(64) PRIMARY KEY,
+                channel_name VARCHAR(128) NOT NULL,
+                created_at_ms BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
         self.widen_author().await;
         self.init_aux_tables().await?;
         Ok(())
@@ -666,6 +684,124 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn save_message_detail(
+        &self,
+        channel: &str,
+        thread: &str,
+        seq: u64,
+        detail: &str,
+    ) -> Result<()> {
+        let id = message_id(channel, thread, seq);
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO message_meta (id, deleted, detail) VALUES ($1, 0, $2)
+                 ON DUPLICATE KEY UPDATE detail = VALUES(detail)",
+            ),
+            _ => self.q(
+                "INSERT INTO message_meta (id, deleted, detail) VALUES ($1, 0, $2)
+                 ON CONFLICT(id) DO UPDATE SET detail = $2",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(&id)
+            .bind(detail)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_message_deleted(
+        &self,
+        channel: &str,
+        thread: &str,
+        seq: u64,
+        deleted: bool,
+    ) -> Result<()> {
+        let id = message_id(channel, thread, seq);
+        let flag = if deleted { 1 } else { 0 };
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO message_meta (id, deleted, detail) VALUES ($1, $2, '')
+                 ON DUPLICATE KEY UPDATE deleted = VALUES(deleted)",
+            ),
+            _ => self.q(
+                "INSERT INTO message_meta (id, deleted, detail) VALUES ($1, $2, '')
+                 ON CONFLICT(id) DO UPDATE SET deleted = $2",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(&id)
+            .bind(flag)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rewrite_message(
+        &self,
+        channel: &str,
+        thread: &str,
+        seq: u64,
+        content: &str,
+    ) -> Result<()> {
+        let sql = self.q(
+            "UPDATE session_messages SET content = $1 WHERE channel_id = $2 AND thread_id = $3 AND seq = $4",
+        );
+        let result = sqlx::query(&sql)
+            .bind(content)
+            .bind(channel)
+            .bind(thread)
+            .bind(seq as i64)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            bail!("message not found");
+        }
+        Ok(())
+    }
+
+    pub async fn message_record(
+        &self,
+        channel: &str,
+        thread: &str,
+        seq: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        let sql = self.q(
+            "SELECT s.channel_id, s.thread_id, s.seq, s.author, s.content, s.created_at_ms,
+                    COALESCE(m.deleted, 0) AS deleted, COALESCE(m.detail, '') AS detail
+             FROM session_messages s
+             LEFT JOIN message_meta m ON m.id = s.id
+             WHERE s.channel_id = $1 AND s.thread_id = $2 AND s.seq = $3",
+        );
+        let row = sqlx::query(&sql)
+            .bind(channel)
+            .bind(thread)
+            .bind(seq as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let seq: i64 = row.get("seq");
+        let deleted = row
+            .try_get::<i64, _>("deleted")
+            .or_else(|_| row.try_get::<i32, _>("deleted").map(|v| i64::from(v)))
+            .unwrap_or(0);
+        let detail: String = row.try_get("detail").unwrap_or_default();
+        let detail_json = serde_json::from_str::<serde_json::Value>(&detail)
+            .unwrap_or(serde_json::Value::String(detail));
+        Ok(Some(serde_json::json!({
+            "channel_id": row.get::<String, _>("channel_id"),
+            "thread_id": row.get::<String, _>("thread_id"),
+            "seq": seq,
+            "author": row.get::<String, _>("author"),
+            "content": row.get::<String, _>("content"),
+            "created_at_ms": row.get::<i64, _>("created_at_ms"),
+            "deleted": deleted != 0,
+            "detail": detail_json
+        })))
+    }
+
     pub async fn next_seq(&self, channel: &str, thread: &str) -> Result<u64> {
         let sql = self.q("SELECT COALESCE(MAX(seq), 0) AS s FROM session_messages WHERE channel_id = $1 AND thread_id = $2");
         let row = sqlx::query(&sql)
@@ -743,6 +879,7 @@ impl Storage {
             "SELECT channel_id, thread_id, seq, author, content, created_at_ms
              FROM session_messages
              WHERE channel_id = $1 AND thread_id = $2
+             AND id NOT IN (SELECT id FROM message_meta WHERE deleted != 0)
              ORDER BY seq ASC LIMIT $3",
         );
         let rows = sqlx::query(&sql)
@@ -1215,6 +1352,19 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn add_invite(&self, channel: &str, token_hash: &str) -> Result<()> {
+        let sql = self.q(
+            "INSERT INTO invite_tokens (token_hash, channel_name, created_at_ms) VALUES ($1, $2, $3)",
+        );
+        sqlx::query(&sql)
+            .bind(token_hash)
+            .bind(channel)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn invite_matches(&self, channel: &str, token_hash: &str) -> Result<bool> {
         let sql = self.q(
             "SELECT token_hash FROM channel_invites WHERE channel_name = $1",
@@ -1223,9 +1373,21 @@ impl Storage {
             .bind(channel)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row
+        if row
             .map(|r| r.get::<String, _>("token_hash") == token_hash)
-            .unwrap_or(false))
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+        let sql = self.q(
+            "SELECT token_hash FROM invite_tokens WHERE channel_name = $1 AND token_hash = $2",
+        );
+        let extra = sqlx::query(&sql)
+            .bind(channel)
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(extra.is_some())
     }
 
     pub async fn namespace_is_public(&self, namespace: &str) -> Result<bool> {
@@ -1317,7 +1479,7 @@ mod tests {
         let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
-            ["general", "mu", "alpha", "mid", "zeta", "local", "team"]
+            ["general", "alpha", "mu", "mid", "zeta", "local", "team"]
         );
     }
 

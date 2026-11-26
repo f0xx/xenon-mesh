@@ -82,6 +82,72 @@ pub async fn embed(
         .collect())
 }
 
+fn reply_text(res: &Value) -> String {
+    let mut out = String::new();
+    let Some(parts) = res["candidates"]
+        .get(0)
+        .and_then(|c| c["content"]["parts"].as_array())
+    else {
+        return out;
+    };
+    for part in parts {
+        if part["thought"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        if let Some(text) = part["text"].as_str() {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// These Gemini models advertise `generateContent` and not
+/// `streamGenerateContent`. The stream endpoint hangs or returns 503.
+/// A 503 is retried; a 429 is the project's quota and is returned as-is.
+async fn generate_value(
+    http: &Client,
+    api_key: &str,
+    model: &str,
+    system_ctx: &str,
+    turns: &[ChatTurn],
+    timeout: Duration,
+) -> Result<Value> {
+    let mut delay = 1u64;
+    let mut last = String::new();
+    for attempt in 0..3 {
+        let resp = http
+            .post(endpoint(model, "generateContent"))
+            .timeout(timeout)
+            .header("x-goog-api-key", api_key)
+            .json(&body(system_ctx, turns, false))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 503 && attempt + 1 < 3 {
+            last = super::remote::api_error_message(&text);
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            delay *= 2;
+            continue;
+        }
+        if !status.is_success() {
+            let msg = super::remote::api_error_message(&text);
+            bail!(
+                "status={} {msg} (generateContent {})",
+                status.as_u16(),
+                model
+            );
+        }
+        return serde_json::from_str(&text).with_context(|| {
+            format!(
+                "gemini response was not JSON: {}",
+                text.chars().take(180).collect::<String>()
+            )
+        });
+    }
+    bail!("status=503 {last} (generateContent {model}, retried)")
+}
+
 pub async fn generate(
     http: &Client,
     api_key: &str,
@@ -93,26 +159,12 @@ pub async fn generate(
     if api_key.is_empty() {
         bail!("gemini API key is empty");
     }
-    let res: Value = http
-        .post(endpoint(model, "generateContent"))
-        .timeout(timeout)
-        .header("x-goog-api-key", api_key)
-        .json(&body(system_ctx, turns, false))
-        .send()
-        .await?
-        .json()
-        .await?;
-    if let Some(txt) = res["candidates"]
-        .get(0)
-        .and_then(|c| c["content"]["parts"].get(0))
-        .and_then(|p| p["text"].as_str())
-    {
-        return Ok(txt.to_string());
+    let res = generate_value(http, api_key, model, system_ctx, turns, timeout).await?;
+    let text = reply_text(&res);
+    if text.is_empty() {
+        bail!("empty gemini response");
     }
-    let err = res["error"]["message"]
-        .as_str()
-        .unwrap_or("empty gemini response");
-    bail!("status=502 {err}")
+    Ok(text)
 }
 
 pub async fn stream(
@@ -124,56 +176,7 @@ pub async fn stream(
     timeout: Duration,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
-    if api_key.is_empty() {
-        bail!("gemini API key is empty");
-    }
-    let url = format!("{}?alt=sse", endpoint(model, "streamGenerateContent"));
-    let mut resp = http
-        .post(url)
-        .timeout(timeout)
-        .header("x-goog-api-key", api_key)
-        .json(&body(system_ctx, turns, true))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_default();
-        let msg = super::remote::api_error_message(&err_txt);
-        bail!("status={} {msg}", status.as_u16());
-    }
-
-    let mut full = String::new();
-    let mut buf = String::new();
-    while let Some(chunk) = resp.chunk().await? {
-        let mut pending = Vec::new();
-        super::remote::feed_sse(&mut buf, &String::from_utf8_lossy(&chunk), |data| {
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(parts) = v["candidates"]
-                    .get(0)
-                    .and_then(|c| c["content"]["parts"].as_array())
-                {
-                    for p in parts {
-                        let txt = p["text"].as_str().unwrap_or("");
-                        if txt.is_empty() {
-                            continue;
-                        }
-                        if p["thought"].as_bool().unwrap_or(false) {
-                            pending.push(StreamEvent::Thought {
-                                text: txt.to_string(),
-                            });
-                        } else {
-                            full.push_str(txt);
-                            pending.push(StreamEvent::Delta {
-                                text: txt.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        });
-        for ev in pending {
-            let _ = tx.send(ev).await;
-        }
-    }
-    Ok(full)
+    let text = generate(http, api_key, model, system_ctx, turns, timeout).await?;
+    let _ = tx.send(StreamEvent::Delta { text: text.clone() }).await;
+    Ok(text)
 }

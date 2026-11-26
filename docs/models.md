@@ -10,7 +10,8 @@ A Gemini provider is announced by the hub under the hub's own node id, with `pro
 | --- | --- | --- | --- |
 | `openai`, `openapi`, `openai-compat` | `POST {base}/chat/completions` and `POST {base}/embeddings`. `{base}` is the root ending in `/v1` | `GET {base}/models` | `data[0].embedding` |
 | `ollama` | `POST {root}/api/chat` and `POST {root}/api/embed` | `GET {root}/api/tags` | `embeddings[0]` |
-| `gemini` | Generative Language API. The key is sent as `x-goog-api-key`, not in the query string | Configured list only | `embedContent` |
+| `gemini` | Generative Language API, `generateContent`. The key is sent as `x-goog-api-key`, not in the query string. A 503 is retried a few times | Configured list only | `embedContent` |
+| `google`, `web` | Runs `command`. The query is stdin. `user_agent` and `base_url` (the search URL, with `{query}`) are exported as `XMESH_UA` and `XMESH_SEARCH_URL`. The script in `scripts/google-ask.sh` is the page client | Configured list only | None. No repository source is attached |
 | `auto` | Probe, then one of the rows above | Same as the detected kind | Same as the detected kind |
 
 `auto` looks for an OpenAPI document and reads `paths`:
@@ -51,7 +52,7 @@ The system text is, in order:
 1. `models.system_prompt`, when set
 2. A short coding preamble that names the channel and asks for a single unified diff when code changes
 3. Pinned notes, learned notes, and `@diff:` snapshots
-4. Up to 8 ranked source chunks, inside a character budget
+4. A path index of the associated project, plus overview files, then up to 8 ranked source chunks. A question that shares no tokens with the source still receives that outline. `git.harvest_command` replaces the built-in walk with a script; the project path is the last argument. A `google` model receives a one-line note and a short summary of the chat instead of source.
 
 Roles stored in history are the literal author (`user` or `provider/model`). They are mapped per protocol: Gemini wants `user` and `model`; OpenAI-compatible and Ollama want `user` and `assistant`.
 

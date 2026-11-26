@@ -44,6 +44,12 @@
   .mtime { color:#a0aec0; font-weight:normal; font-size:12px; }
   .dayline { display:flex; align-items:center; gap:10px; color:#718096; font-size:12px; margin:14px 4px; }
   .dayline:before, .dayline:after { content:''; flex:1; border-top:1px solid #2d3748; }
+  .msgtools { display:flex; gap:4px; justify-content:flex-end; margin-top:6px; }
+  .msgtools button, #msgCtx button { background:transparent; color:#a0aec0; padding:0 6px; font-size:12px; }
+  #msgCtx { position:fixed; background:#1a1d23; border:1px solid #2d3748; z-index:30; min-width:160px; }
+  #msgCtx button { display:block; width:100%; text-align:left; padding:6px 10px; }
+  #debugBox { position:fixed; inset:10% 15%; background:#0d1117; border:1px solid #2d3748; z-index:40; overflow:auto; padding:12px; }
+  .msg.flash { outline:1px solid #63b3ed; }
   #findings { color:#ecc94b; font-size:12px; white-space:pre-wrap; margin:6px 0; }
 </style>
 </head>
@@ -106,6 +112,8 @@
   <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()" data-i18n="approve">Approve & Execute</button>
 </div>
 <div id="ctx" hidden></div>
+<div id="msgCtx" hidden></div>
+<div id="debugBox" hidden></div>
 <div id="audit"></div>
 <script>
 const I18N = {
@@ -330,7 +338,7 @@ async function loadHistory() {
       const key = dayKey(m.created_at_ms);
       if (key !== lastDay) { lastDay = key; dayDivider(m.created_at_ms); }
     }
-    appendBubble(m.role, m.text, m.created_at_ms);
+    appendBubble(m.role, m.text, m.created_at_ms, m.seq);
   });
 }
 function dayKey(ms) {
@@ -406,9 +414,13 @@ function renderMarkdown(raw) {
   return txt.replace(/\x00BLK(\d+)\x00/g, (_, i) => blocks[Number(i)]);
 }
 
-function appendBubble(who, txt, ts) {
+let hubHttp = '';
+let busy = false;
+const deep = Object.fromEntries(new URLSearchParams(location.search));
+function appendBubble(who, txt, ts, seq) {
   const box = document.createElement('div');
   box.className = 'msg md';
+  if (seq) box.dataset.seq = String(seq);
   const hdr = document.createElement('div');
   hdr.className = 'msghead';
   const whoEl = document.createElement('span');
@@ -435,8 +447,93 @@ function appendBubble(who, txt, ts) {
     b.onclick = () => loadDiff(m[1]);
     box.appendChild(b);
   }
+  if (seq) {
+    const tools = document.createElement('div');
+    tools.className = 'msgtools';
+    [['Link', () => copyPermalink(seq)], who === 'user' ? ['Edit', () => editMessage(seq, txt)] : null, ['Clone', () => cloneMessage(seq, 'from')], ['Debug', () => debugMessage(seq)], ['Hide', () => hideMessage(seq)]]
+      .filter(Boolean)
+      .forEach(([label, fn]) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.onclick = fn;
+        tools.appendChild(b);
+      });
+    box.appendChild(tools);
+    box.oncontextmenu = (ev) => { ev.preventDefault(); openMsgMenu(ev, seq, who, txt); };
+  }
   log.appendChild(box);
   log.scrollTop = log.scrollHeight;
+}
+function openMsgMenu(ev, seq, who, txt) {
+  msgCtx.innerHTML = '';
+  const items = [
+    ['Copy permalink', () => copyPermalink(seq)],
+    who === 'user' ? ['Edit and rerun', () => editMessage(seq, txt)] : null,
+    ['Clone from here', () => cloneMessage(seq, 'from')],
+    ['Clone up to here', () => cloneMessage(seq, 'until')],
+    ['Debug', () => debugMessage(seq)],
+    ['Delete', () => hideMessage(seq)]
+  ].filter(Boolean);
+  items.forEach(([label, fn]) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { msgCtx.hidden = true; fn(); };
+    msgCtx.appendChild(b);
+  });
+  msgCtx.hidden = false;
+  msgCtx.style.left = Math.min(ev.clientX, window.innerWidth - 180) + 'px';
+  msgCtx.style.top = Math.min(ev.clientY, window.innerHeight - 220) + 'px';
+}
+document.addEventListener('click', () => { msgCtx.hidden = true; });
+async function copyPermalink(seq) {
+  const vis = (chMeta[ch] && chMeta[ch].visibility) || 'private';
+  let token = '';
+  if (vis !== 'public') {
+    const r = await fetch('/api/permalink', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread, seq }) });
+    if (r.ok) token = (await r.json()).token || '';
+  }
+  const base = (vis === 'public' && hubHttp) ? hubHttp.replace(/\/$/, '') : location.origin;
+  const q = new URLSearchParams({ c: ch, t: thread, s: String(seq) });
+  if (token) q.set('k', token);
+  const url = base + '/?' + q.toString();
+  try { await navigator.clipboard.writeText(url); }
+  catch (err) { window.prompt('Permalink', url); }
+}
+async function editMessage(seq, txt) {
+  if (busy) { window.alert('Wait for the current reply.'); return; }
+  const text = window.prompt('Edit message', txt);
+  if (text === null || !text.trim()) return;
+  const r = await fetch('/api/messages/edit', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread, seq, text }) });
+  if (!r.ok) { window.alert('Edit failed'); return; }
+  await loadHistory();
+  await send(text, true);
+}
+async function hideMessage(seq) {
+  if (!window.confirm('Hide this message? It stays in the database.')) return;
+  await fetch('/api/messages/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread, seq }) });
+  await loadHistory();
+}
+async function cloneMessage(seq, mode) {
+  const name = window.prompt('New channel for the copied history', ch + '-copy');
+  if (!name) return;
+  const r = await fetch('/api/channels/clone', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread, seq, mode, name: name.trim() }) });
+  if (!r.ok) { window.alert('Clone failed'); return; }
+  const body = await r.json();
+  await refreshChannels();
+  thread = body.thread || 'main';
+  await setCh(body.channel);
+  await copyPermalink(body.seq || 1);
+}
+async function debugMessage(seq) {
+  const row = await (await fetch(`/api/messages/debug?channel=${encodeURIComponent(ch)}&thread=${encodeURIComponent(thread)}&seq=${seq}`)).json();
+  debugBox.hidden = false;
+  debugBox.innerHTML = '';
+  const close = document.createElement('button');
+  close.textContent = 'Close';
+  close.onclick = () => { debugBox.hidden = true; };
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(row, null, 2);
+  debugBox.append(close, pre);
 }
 
 let pendingAtts = [];
@@ -482,14 +579,16 @@ function attachDiffButton(container, txt) {
   b.onclick = () => loadDiff(m[1]);
   container.appendChild(b);
 }
-async function send() {
+async function send(existing, rerun) {
   const box = document.getElementById('composer');
-  const p = box.value.trim();
+  const p = rerun ? existing : box.value.trim();
   if (!p && !pendingAtts.length) return;
+  if (busy) return;
+  busy = true;
   const atts = pendingAtts; pendingAtts = []; renderAtts();
-  box.value = '';
+  if (!rerun) box.value = '';
   const sentAt = Date.now();
-  appendBubble('user', p + (atts.length ? `\n[Attached: ${atts.map(a=>a.name).join(', ')}]` : ''), sentAt);
+  if (!rerun) appendBubble('user', p + (atts.length ? `\n[Attached: ${atts.map(a=>a.name).join(', ')}]` : ''), sentAt);
 
   const card = document.createElement('div'); card.className = 'msg md';
   const hdr = document.createElement('div'); hdr.className = 'msghead';
@@ -507,7 +606,7 @@ async function send() {
   const sentOn = ch;
   const resp = await fetch('/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: modelSelect.value, attachments: atts })
+    body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: modelSelect.value, attachments: rerun ? [] : atts, rerun: !!rerun })
   });
   if (!resp.ok || !resp.body) {
     statusLine.style.display = 'none';
@@ -538,6 +637,14 @@ async function send() {
         statusLine.style.display = 'none';
         fullText += ev.text;
         body.innerHTML = renderMarkdown(fullText);
+      } else if (ev.type === 'saved') {
+        busy = false;
+        await loadHistory();
+        const row = document.querySelector(`[data-seq="${ev.seq}"]`);
+        if (row) {
+          row.classList.add('flash');
+          row.scrollIntoView({ block: 'center' });
+        }
       } else if (ev.type === 'done') {
         whoEl.textContent = `[${ev.model_used}]`;
         timeEl.textContent = clockLabel(Date.now());
@@ -549,6 +656,7 @@ async function send() {
       log.scrollTop = log.scrollHeight;
     }
   }
+  busy = false;
   await refreshThreads();
 }
 
@@ -585,6 +693,7 @@ window.onload = async () => {
   dNode.value = localStorage.dNode || ''; dRepo.value = localStorage.dRepo || ''; dPipe.value = localStorage.dPipe || '';
   langSelect.value = lang; setLang(lang);
   const cfg = await (await fetch('/api/config')).json();
+  hubHttp = cfg.hub_http || '';
   if (cfg.models && cfg.models.length) {
     modelSelect.innerHTML = '';
     const groups = new Map();
@@ -615,7 +724,19 @@ window.onload = async () => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
   });
-  await setCh('general');
+  if (deep.c) {
+    if (deep.k) {
+      await fetch('/api/join', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: deep.c, token: deep.k }) });
+    }
+    thread = deep.t || 'main';
+    await setCh(deep.c);
+    if (deep.s) {
+      const row = document.querySelector(`[data-seq="${deep.s}"]`);
+      if (row) row.scrollIntoView({ block: 'center' });
+    }
+  } else {
+    await setCh('general');
+  }
 };
 const spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']; let si = 0, lastDone = -1;
 setInterval(async () => {

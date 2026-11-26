@@ -63,6 +63,9 @@ pub struct ChatReq {
     pub model: Option<String>,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// Re-run the model on the thread as stored. Used after an edit.
+    #[serde(default)]
+    pub rerun: bool,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +151,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/channel-state", post(handle_channel_state))
         .route("/api/presence", post(handle_presence))
         .route("/api/share", post(handle_share))
+        .route("/api/permalink", post(handle_permalink))
+        .route("/api/messages/debug", get(handle_message_debug))
+        .route("/api/messages/edit", post(handle_message_edit))
+        .route("/api/messages/delete", post(handle_message_delete))
+        .route("/api/channels/clone", post(handle_clone_channel))
         .route("/api/join", post(handle_join))
         .route("/api/inspect", post(handle_inspect))
         .route("/api/audit", get(handle_audit).post(handle_audit_post))
@@ -227,6 +235,7 @@ async fn handle_config(State(st): State<Arc<WebState>>) -> Json<serde_json::Valu
         "models": models,
         "mode": mode_name(&st.cfg.node.mode),
         "node_id": st.cfg.node.id,
+        "hub_http": master_http(&st.cfg).unwrap_or(""),
         "embeddings": st.models.embeddings_configured().await
     }))
 }
@@ -500,6 +509,7 @@ async fn handle_history(
                 role: m.author,
                 text: m.content,
                 created_at_ms: m.created_at_ms,
+                seq: m.seq,
             })
             .collect(),
     ))
@@ -510,6 +520,7 @@ struct HistoryItem {
     role: String,
     text: String,
     created_at_ms: i64,
+    seq: u64,
 }
 
 async fn handle_list_threads(
@@ -724,7 +735,7 @@ async fn handle_oai_compat(
         .find(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .unwrap_or("");
-    let ctx = prompt_for(&st, channel, "main", last_user)
+    let ctx = prompt_for(&st, channel, "main", last_user, "")
         .await
         .unwrap_or_default();
     let turns: Vec<ChatTurn> = req
@@ -753,7 +764,20 @@ async fn prompt_for(
     channel: &str,
     _thread: &str,
     query: &str,
+    model: &str,
 ) -> Result<String, StatusCode> {
+    let choices = st.models.model_choices().await;
+    if model.split('/').next() == Some("google")
+        || choices
+            .iter()
+            .any(|choice| choice.id == model && choice.kind == "google")
+    {
+        return Ok(
+            "Answer from the web result only. Do not invent repository source. \
+             A short summary of the recent chat is included in the search."
+                .into(),
+        );
+    }
     let channel_row = st.db.get_channel(channel).await.ok().flatten();
     let namespaces = channel_row
         .as_ref()
@@ -761,6 +785,7 @@ async fn prompt_for(
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![channel.to_string()]);
     let mut merged: HashMap<String, ContextEntry> = HashMap::new();
+    let mut outline_dir = project_dir(&st.cfg, channel);
     for ns in &namespaces {
         if let Ok(entries) = st.db.load_entries(Some(ns)).await {
             for e in entries {
@@ -775,6 +800,9 @@ async fn prompt_for(
                     }
                 }
             }
+        }
+        if outline_dir.is_none() {
+            outline_dir = project_dir(&st.cfg, ns);
         }
         if let Some(dir) = project_dir(&st.cfg, ns) {
             let origin = st.cfg.node.id.clone();
@@ -804,10 +832,48 @@ async fn prompt_for(
     let entries: Vec<_> = merged.into_values().collect();
     let q_emb = st.models.embed_text(query).await.unwrap_or_default();
     let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, 8, 28_000);
-    Ok(format!("{}\n\n{retrieved}", coding_preamble(channel)))
+    let mut outline = String::new();
+    if let Some(dir) = outline_dir {
+        outline = project_outline(&st.cfg, dir).await;
+    }
+    Ok(format!(
+        "{}\n\n{outline}\n\n{retrieved}",
+        coding_preamble(channel)
+    ))
 }
 
-async fn store_message(st: &WebState, msg: SessionMessage, sync_hub: bool) -> SessionMessage {
+async fn project_outline(cfg: &AppConfig, dir: std::path::PathBuf) -> String {
+    if !cfg.git.harvest_command.is_empty() {
+        let program = cfg.git.harvest_command[0].clone();
+        let args: Vec<String> = cfg.git.harvest_command[1..].to_vec();
+        let path = dir.clone();
+        let harvested = tokio::process::Command::new(&program)
+            .args(&args)
+            .arg(&path)
+            .output();
+        if let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(20), harvested).await
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !text.is_empty() {
+                    return text.chars().take(28_000).collect();
+                }
+            }
+        }
+    }
+    tokio::task::spawn_blocking(move || crate::git_sync::project_outline(&dir))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default()
+}
+
+async fn store_message(
+    st: &WebState,
+    msg: SessionMessage,
+    sync_hub: bool,
+    detail: &str,
+) -> SessionMessage {
     let stored = if sync_hub {
         if let Some(url) = master_url(&st.cfg) {
             match hub::append_public(url, msg.clone(), &st.cfg.node.id, st.node_key.as_ref()).await {
@@ -851,6 +917,12 @@ async fn store_message(st: &WebState, msg: SessionMessage, sync_hub: bool) -> Se
         .unwrap_or(false);
     if stored.author == "user" || viewing {
         let _ = st.db.mark_read(&stored.channel_id, stored.seq as i64).await;
+    }
+    if !detail.is_empty() {
+        let _ = st
+            .db
+            .save_message_detail(&stored.channel_id, &stored.thread_id, stored.seq, detail)
+            .await;
     }
     stored
 }
@@ -1061,15 +1133,17 @@ async fn handle_persistent_chat(
                 .join(", ")
         )
     };
-    let user_msg = SessionMessage {
-        channel_id: req.channel.clone(),
-        thread_id: req.thread.clone(),
-        seq: 0,
-        author: "user".into(),
-        content: format!("{}{}", req.prompt, att_note),
-        created_at_ms: 0,
-    };
-    let _stored_user = store_message(&st, user_msg, sync_hub).await;
+    if !req.rerun {
+        let user_msg = SessionMessage {
+            channel_id: req.channel.clone(),
+            thread_id: req.thread.clone(),
+            seq: 0,
+            author: "user".into(),
+            content: format!("{}{}", req.prompt, att_note),
+            created_at_ms: 0,
+        };
+        let _stored_user = store_message(&st, user_msg, sync_hub, "").await;
+    }
 
     let mut turns: Vec<ChatTurn> = past
         .into_iter()
@@ -1079,11 +1153,13 @@ async fn handle_persistent_chat(
             attachments: vec![],
         })
         .collect();
-    turns.push(ChatTurn {
-        role: "user".into(),
-        text: req.prompt.clone(),
-        attachments: req.attachments,
-    });
+    if !req.rerun {
+        turns.push(ChatTurn {
+            role: "user".into(),
+            text: req.prompt.clone(),
+            attachments: req.attachments,
+        });
+    }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
     let st_bg = st.clone();
@@ -1094,7 +1170,7 @@ async fn handle_persistent_chat(
                 text: "Building context...".into(),
             })
             .await;
-        let ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt)
+        let ctx = prompt_for(&st_bg, &req.channel, &req.thread, &req.prompt, &model)
             .await
             .unwrap_or_default();
         let audit = if sync_hub {
@@ -1106,11 +1182,12 @@ async fn handle_persistent_chat(
         } else {
             None
         };
+        let started = now_ms();
         let (author, final_text) =
             match dispatch_chat(&st_bg, &model, &ctx, &turns, tx.clone(), audit).await {
                 Ok((reply, used)) => (used, reply),
                 Err(err) => {
-                    let err_txt = format!("[ERROR] {err}");
+                    let err_txt = format!("[ERROR] {err:#}");
                     let _ = tx
                         .send(StreamEvent::Delta {
                             text: err_txt.clone(),
@@ -1119,8 +1196,19 @@ async fn handle_persistent_chat(
                     ("error".into(), err_txt)
                 }
             };
-        let author = if author.is_empty() { model } else { author };
-        let _ = store_message(
+        let author = if author.is_empty() { model.clone() } else { author };
+        let finished = now_ms();
+        let detail = serde_json::json!({
+            "started_at_ms": started,
+            "finished_at_ms": finished,
+            "model": author,
+            "raw": final_text,
+            "processed": final_text,
+            "error": if author == "error" { final_text.as_str() } else { "" },
+            "actions": ["chat"]
+        })
+        .to_string();
+        let stored = store_message(
             &st_bg,
             SessionMessage {
                 channel_id: req.channel,
@@ -1131,8 +1219,12 @@ async fn handle_persistent_chat(
                 created_at_ms: 0,
             },
             sync_hub,
+            &detail,
         )
         .await;
+        let _ = tx
+            .send(StreamEvent::Saved { seq: stored.seq })
+            .await;
     });
 
     let stream = ReceiverStream::new(rx)
@@ -1856,4 +1948,191 @@ async fn handle_share(
     }
     apply_share(&st, payload).await?;
     Ok(Json(serde_json::json!({ "token": token })))
+}
+
+#[derive(Deserialize)]
+struct MsgBody {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    name: String,
+}
+
+async fn handle_permalink(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<MsgBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let vis = channel_visibility(&st, &body.channel).await;
+    if vis == "public" {
+        return Ok(Json(serde_json::json!({ "public": true, "token": "" })));
+    }
+    let (token, hash) = crate::identity::new_token();
+    st.db
+        .add_invite(&body.channel, &hash)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "public": false, "token": token })))
+}
+
+async fn handle_message_debug(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<MsgBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let thread = if q.thread.is_empty() { "main" } else { &q.thread };
+    st.db
+        .message_record(&q.channel, thread, q.seq)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn handle_message_delete(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<MsgBody>,
+) -> Result<StatusCode, StatusCode> {
+    let thread = if body.thread.is_empty() {
+        "main".into()
+    } else {
+        body.thread
+    };
+    st.db
+        .set_message_deleted(&body.channel, &thread, body.seq, true)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_message_edit(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<MsgBody>,
+) -> Result<StatusCode, StatusCode> {
+    let thread = if body.thread.is_empty() {
+        "main".into()
+    } else {
+        body.thread.clone()
+    };
+    let record = st
+        .db
+        .message_record(&body.channel, &thread, body.seq)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if record["author"].as_str() != Some("user") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    st.db
+        .rewrite_message(&body.channel, &thread, body.seq, &body.text)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let later = st
+        .db
+        .load_thread(&body.channel, &thread, 500)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for msg in later {
+        if msg.seq > body.seq {
+            let _ = st
+                .db
+                .set_message_deleted(&body.channel, &thread, msg.seq, true)
+                .await;
+        }
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn handle_clone_channel(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<MsgBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let thread = if body.thread.is_empty() {
+        "main".into()
+    } else {
+        body.thread.clone()
+    };
+    let name = body.name.trim();
+    if storage_name(name).is_err() || name == "general" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let source = st
+        .db
+        .get_channel(&body.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let msgs = st
+        .db
+        .load_thread(&body.channel, &thread, 500)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let kept: Vec<_> = msgs
+        .into_iter()
+        .filter(|msg| {
+            if body.mode == "until" {
+                msg.seq <= body.seq
+            } else {
+                msg.seq >= body.seq
+            }
+        })
+        .collect();
+    let mut namespaces = source.context_namespaces.clone();
+    if !namespaces.iter().any(|ns| ns == &body.channel) {
+        namespaces.insert(0, body.channel.clone());
+    }
+    if !namespaces.iter().any(|ns| ns == name) {
+        namespaces.insert(0, name.to_string());
+    }
+    let visibility = if source.visibility == "shared" {
+        "shared"
+    } else {
+        "private"
+    };
+    st.db
+        .upsert_channel(&ChannelRow {
+            name: name.to_string(),
+            visibility: visibility.into(),
+            namespace: name.to_string(),
+            origin_node: st.cfg.node.id.clone(),
+            context_namespaces: namespaces,
+            updated_at_ms: 0,
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if visibility == "shared" {
+        let members = st
+            .db
+            .list_members(&body.channel)
+            .await
+            .unwrap_or_default();
+        let rows = members
+            .into_iter()
+            .map(|node| (node, "member".into(), "active".into()))
+            .collect::<Vec<_>>();
+        let _ = st.db.set_members(name, &rows).await;
+    }
+    for (idx, msg) in kept.iter().enumerate() {
+        let _ = st
+            .db
+            .append_message(&SessionMessage {
+                channel_id: name.to_string(),
+                thread_id: "main".into(),
+                seq: (idx as u64) + 1,
+                author: msg.author.clone(),
+                content: msg.content.clone(),
+                created_at_ms: msg.created_at_ms,
+            })
+            .await;
+    }
+    Ok(Json(serde_json::json!({
+        "channel": name,
+        "thread": "main",
+        "seq": 1
+    })))
 }

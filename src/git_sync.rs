@@ -290,6 +290,83 @@ pub fn scan_workdir(root: &Path, namespace: &str, origin: &str) -> Result<Vec<Co
     Ok(out)
 }
 
+/// Path index plus the short project files a general question needs.
+/// Build directories are skipped. The result is capped so a chat prompt stays bounded.
+pub fn project_outline(root: &Path) -> Result<String> {
+    let root = std::fs::canonicalize(root)?;
+    let mut paths = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            if paths.len() >= 500 {
+                break;
+            }
+            let path = ent.path();
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') && name != ".gitignore" {
+                continue;
+            }
+            let Ok(canon) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            if !canon.starts_with(&root) {
+                continue;
+            }
+            if canon.is_dir() {
+                if SKIP_DIRS.iter().any(|s| name == *s) {
+                    continue;
+                }
+                stack.push(canon);
+                continue;
+            }
+            let rel = canon.strip_prefix(&root).unwrap_or(&canon);
+            paths.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    paths.sort();
+    let mut out = String::from("### [TREE]\n");
+    for path in &paths {
+        out.push_str(path);
+        out.push('\n');
+        if out.len() > 12_000 {
+            out.push_str("…\n");
+            break;
+        }
+    }
+    for path in &paths {
+        let lower = path.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        let overview = name.starts_with("readme")
+            || name == "cargo.toml"
+            || name == "package.json"
+            || name == "agents.md"
+            || lower.starts_with("docs/");
+        if !overview {
+            continue;
+        }
+        let full = root.join(path);
+        let Ok(bytes) = std::fs::read(&full) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let body: String = text.chars().take(4_000).collect();
+        out.push_str(&format!("\n### [CODE: {path}]\n{body}\n"));
+        if out.len() > 28_000 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

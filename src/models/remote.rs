@@ -45,14 +45,48 @@ pub fn feed_sse(buf: &mut String, chunk: &str, mut on_data: impl FnMut(&str)) {
 }
 
 pub fn openai_delta_parts(v: &Value) -> (String, String) {
-    let delta = &v["choices"][0]["delta"];
-    let content = delta["content"].as_str().unwrap_or("").to_string();
+    let choice = &v["choices"][0];
+    let delta = &choice["delta"];
+    let mut content = delta["content"].as_str().unwrap_or("").to_string();
+    if content.is_empty() {
+        content = choice["message"]["content"]
+            .as_str()
+            .or_else(|| choice["text"].as_str())
+            .unwrap_or("")
+            .to_string();
+    }
     let reasoning = delta["reasoning"]
         .as_str()
         .or_else(|| delta["reasoning_content"].as_str())
         .unwrap_or("")
         .to_string();
     (content, reasoning)
+}
+
+pub fn explain_error(err: &reqwest::Error) -> String {
+    let mut out = err.to_string();
+    let mut src = std::error::Error::source(err);
+    while let Some(next) = src {
+        let text = next.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        src = next.source();
+    }
+    out
+}
+
+async fn next_chunk(resp: &mut reqwest::Response, idle: Duration) -> Result<Option<Vec<u8>>> {
+    match tokio::time::timeout(idle, resp.chunk()).await {
+        Ok(Ok(Some(chunk))) => Ok(Some(chunk.to_vec())),
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(err)) => bail!("{}", explain_error(&err)),
+        Err(_) => bail!(
+            "timed out after {}s with no further response from the model",
+            idle.as_secs()
+        ),
+    }
 }
 
 pub fn openai_completion_text(v: &Value) -> Option<String> {
@@ -379,8 +413,7 @@ pub async fn openai_stream(
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
     let resp = auth(
-        http.post(format!("{}/chat/completions", openai_root(base)))
-            .timeout(timeout),
+        http.post(format!("{}/chat/completions", openai_root(base))),
         api_key,
     )
     .json(&json!({
@@ -394,7 +427,7 @@ pub async fn openai_stream(
     if !resp.status().is_success() {
         return Err(error_from(resp).await);
     }
-    read_openai_sse(resp, tx).await
+    read_openai_sse(resp, timeout, tx).await
 }
 
 pub async fn ollama_stream(
@@ -408,7 +441,6 @@ pub async fn ollama_stream(
 ) -> Result<String> {
     let resp = http
         .post(format!("{}/api/chat", service_root(base)))
-        .timeout(timeout)
         .json(&json!({
             "model": model,
             "stream": true,
@@ -422,7 +454,20 @@ pub async fn ollama_stream(
     let mut full = String::new();
     let mut buf = String::new();
     let mut resp = resp;
-    while let Some(chunk) = resp.chunk().await? {
+    loop {
+        let chunk = match next_chunk(&mut resp, timeout).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => {
+                if full.is_empty() {
+                    return Err(err);
+                }
+                let note = format!("\n[ERROR] {err:#}");
+                full.push_str(&note);
+                emit(tx, StreamEvent::Delta { text: note }).await;
+                break;
+            }
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buf.find('\n') {
             let line = buf[..pos].trim().to_string();
@@ -467,22 +512,53 @@ fn apply_openai_data(data: &str, full: &mut String, pending: &mut Vec<StreamEven
 
 async fn read_openai_sse(
     mut resp: reqwest::Response,
+    idle: Duration,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
     let mut full = String::new();
     let mut buf = String::new();
-    while let Some(chunk) = resp.chunk().await? {
+    loop {
+        let chunk = match next_chunk(&mut resp, idle).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => {
+                if full.is_empty() {
+                    return Err(err);
+                }
+                let note = format!("\n[ERROR] {err:#}");
+                full.push_str(&note);
+                let _ = tx
+                    .send(StreamEvent::Delta { text: note })
+                    .await;
+                break;
+            }
+        };
         let mut pending = Vec::new();
         feed_sse(&mut buf, &String::from_utf8_lossy(&chunk), |data| {
             apply_openai_data(data, &mut full, &mut pending);
         });
+        // Some servers send one JSON object, or NDJSON, instead of SSE.
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf.drain(..=pos);
+            if line.starts_with('{') {
+                apply_openai_data(&line, &mut full, &mut pending);
+            }
+        }
         for ev in pending {
             emit(tx, ev).await;
         }
     }
-    if let Some(rest) = buf.trim().strip_prefix("data:") {
+    let tail = buf.trim();
+    if let Some(rest) = tail.strip_prefix("data:") {
         let mut pending = Vec::new();
         apply_openai_data(rest.trim(), &mut full, &mut pending);
+        for ev in pending {
+            emit(tx, ev).await;
+        }
+    } else if full.is_empty() && tail.starts_with('{') {
+        let mut pending = Vec::new();
+        apply_openai_data(tail, &mut full, &mut pending);
         for ev in pending {
             emit(tx, ev).await;
         }

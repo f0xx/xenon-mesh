@@ -56,11 +56,25 @@ pub fn lexical_score(query: &str, content: &str) -> f32 {
 pub fn coding_preamble(channel: &str) -> String {
     format!(
         "You are a collaborative coding assistant in channel `{channel}`.\n\
-         Retrieved source blocks are repository context you may read.\n\
+         The path index and source blocks below are this channel's project. Read them and answer from them, including a general question about what the project is.\n\
+         Do not claim the source is unavailable when those blocks are present.\n\
          When you change code, include one unified diff inside a ```diff fence that `git apply` can consume, then explain the change briefly.\n\
          Prefer small reviewable edits. Pinned and learned notes are invariants.\n\
-         General questions are allowed; there is no topic restriction."
+         The daemon process runs as its operating-system user. You decide whether an action is safe to propose. The operating system enforces that user's rights."
     )
+}
+
+fn is_overview(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.starts_with("readme")
+        || name == "cargo.toml"
+        || name == "package.json"
+        || name == "go.mod"
+        || name == "pyproject.toml"
+        || name == "agents.md"
+        || lower.starts_with("docs/")
+        || lower.contains("/docs/")
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -135,7 +149,53 @@ pub fn assemble_context(
     }
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (_, e) in ranked.into_iter().take(top_k) {
+    for e in entries
+        .iter()
+        .filter(|e| e.entry_type == ENTRY_DYNAMIC && is_overview(&e.source_path))
+    {
+        if used >= char_budget {
+            break;
+        }
+        let room = char_budget.saturating_sub(used).min(6_000);
+        if room < 200 {
+            break;
+        }
+        let body = truncate(&e.content, room);
+        push(
+            &mut blocks,
+            &mut used,
+            format!("### [CODE: {} @ {}]\n{body}", e.source_path, e.origin),
+        );
+    }
+
+    let positive = ranked.iter().any(|(score, _)| *score > 0.0);
+    let ranked = if positive {
+        ranked
+    } else {
+        // A question that shares no tokens with the source, such as a
+        // description request in another language, still needs the tree.
+        let mut fill: Vec<(f32, &PromptEntry)> = entries
+            .iter()
+            .filter(|e| e.entry_type == ENTRY_DYNAMIC && !is_always_included(e))
+            .map(|e| {
+                let prefer = if e.source_path.contains("src/") || e.source_path.starts_with("src/")
+                {
+                    1.0
+                } else {
+                    0.1
+                };
+                (prefer, e)
+            })
+            .collect();
+        fill.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        fill
+    };
+
+    for (_, e) in ranked
+        .into_iter()
+        .filter(|(_, entry)| !is_overview(&entry.source_path))
+        .take(top_k)
+    {
         if used >= char_budget {
             break;
         }
@@ -223,6 +283,17 @@ mod tests {
         assert!(ctx.contains("DIFF"));
         assert!(ctx.contains("src/executor.rs"));
         assert!(!ctx.contains("paint_pixels"));
+    }
+
+    #[test]
+    fn a_question_with_no_shared_tokens_still_sees_the_project() {
+        let entries = vec![
+            entry(ENTRY_DYNAMIC, "README.md", "xenon mesh hub and node"),
+            entry(ENTRY_DYNAMIC, "src/main.rs", "fn main() {}"),
+        ];
+        let ctx = assemble_context(&entries, "дай описание о чем этот проект", &[], 4, 20_000);
+        assert!(ctx.contains("README.md"), "{ctx}");
+        assert!(ctx.contains("src/main.rs"), "{ctx}");
     }
 
     #[test]

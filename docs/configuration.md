@@ -38,6 +38,7 @@ Examples:
 | `git.watched_repos` | `{namespace, local_path, base_branch}`. Diffs are against that ref. The worktree is also scanned when a chat's namespace matches |
 | `git.project_roots` | `{path, visibility}`. Each immediate child directory becomes a channel and is readable in that chat. `private` keeps the thread on this node. `public` publishes the thread to the hub. A hub also turns each bare repo under `bare_repos_root` into a public channel |
 | `git.watch_changes` | Default true. inotify on project roots and bare repos. A change reindexes that tree. A directory that disappears drops the channel the scanner created. Set false to keep the startup scan only |
+| `git.harvest_command` | Optional argv. The project path is appended. Stdout becomes the chat's project outline. `scripts/harvest-context.sh` is the bundled walker |
 | `git.inspect_command` | Optional argv. The diff is written to stdin. Stdout lines are findings in the side panel |
 
 `deploy_pipelines.<name>` is `{workdir, command, use_bwrap, allow_network, git_ref, git_force}`. `command` is an argv list. The UI sends the pipeline name; it does not send a shell string. `git_ref` and `git_force` are recorded when the command is `git push`.
@@ -54,7 +55,9 @@ models:
   providers:
     - id: local
       host: local              # label after the model name; empty uses id
-      kind: auto               # openai | ollama | gemini | auto
+      kind: auto               # openai | ollama | gemini | google | auto
+      command: []              # google/web: argv, query on stdin
+      user_agent: ""           # google/web: sent to the script as XMESH_UA
       base_url: "http://127.0.0.1:11434/v1"
       api_key_env: ""          # name of an environment variable, never the key
       openapi_url: ""          # optional OpenAPI document
