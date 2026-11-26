@@ -98,7 +98,12 @@ pub async fn ask(
         text.push_str("\n…[truncated]");
     }
     if let Some(tx) = tx {
-        let _ = tx.send(StreamEvent::Delta { text: text.clone() }).await;
+        let _ = tx
+            .send(StreamEvent::Delta {
+                text: text.clone(),
+                model: String::new(),
+            })
+            .await;
     }
     Ok(text)
 }

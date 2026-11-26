@@ -454,6 +454,17 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chat_model_prefs (
+                channel_name VARCHAR(128) NOT NULL,
+                thread_id VARCHAR(128) NOT NULL,
+                models TEXT NOT NULL,
+                multi INTEGER NOT NULL,
+                PRIMARY KEY (channel_name, thread_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS channel_prefs (
                 channel_name VARCHAR(128) PRIMARY KEY,
                 pinned INTEGER NOT NULL,
@@ -1046,6 +1057,58 @@ impl Storage {
             .bind(peer_base)
             .bind(peer_name)
             .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_chat_models(&self, channel: &str, thread: &str) -> Result<(Vec<String>, bool)> {
+        let sql = self.q(
+            "SELECT models, multi FROM chat_model_prefs WHERE channel_name = $1 AND thread_id = $2",
+        );
+        let Some(row) = sqlx::query(&sql)
+            .bind(channel)
+            .bind(thread)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok((Vec::new(), false));
+        };
+        let raw: String = row.get("models");
+        let multi: i32 = row.try_get("multi").unwrap_or(0);
+        let models = raw
+            .split('\n')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok((models, multi != 0))
+    }
+
+    pub async fn set_chat_models(
+        &self,
+        channel: &str,
+        thread: &str,
+        models: &[String],
+        multi: bool,
+    ) -> Result<()> {
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO chat_model_prefs (channel_name, thread_id, models, multi)
+                 VALUES ($1, $2, $3, $4)
+                 ON DUPLICATE KEY UPDATE models = VALUES(models), multi = VALUES(multi)",
+            ),
+            _ => self.q(
+                "INSERT INTO chat_model_prefs (channel_name, thread_id, models, multi)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(channel_name, thread_id) DO UPDATE SET models = $3, multi = $4",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(channel)
+            .bind(thread)
+            .bind(models.join("\n"))
+            .bind(i32::from(multi))
             .execute(&self.pool)
             .await?;
         Ok(())

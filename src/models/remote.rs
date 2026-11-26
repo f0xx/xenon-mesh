@@ -1,4 +1,5 @@
 use super::{map_role, ChatTurn, ConcreteKind, StreamEvent};
+use crate::config::Sampling;
 use anyhow::{bail, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -345,6 +346,61 @@ pub async fn ollama_embed(
     ollama_embedding(&resp.json().await?).ok_or_else(|| anyhow::anyhow!("missing embedding"))
 }
 
+fn openai_payload(
+    model: &str,
+    system_ctx: &str,
+    turns: &[ChatTurn],
+    sampling: Sampling,
+    stream: bool,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "temperature": sampling.temperature.unwrap_or(0.2),
+        "messages": messages(system_ctx, turns, ConcreteKind::OpenAi)
+    });
+    if stream {
+        body["stream"] = json!(true);
+    }
+    if let Some(top_p) = sampling.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(max_tokens) = sampling.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    body
+}
+
+fn ollama_payload(
+    model: &str,
+    system_ctx: &str,
+    turns: &[ChatTurn],
+    sampling: Sampling,
+    stream: bool,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "stream": stream,
+        "messages": messages(system_ctx, turns, ConcreteKind::Ollama)
+    });
+    let mut options = serde_json::Map::new();
+    if let Some(temperature) = sampling.temperature {
+        options.insert("temperature".into(), json!(temperature));
+    }
+    if let Some(top_p) = sampling.top_p {
+        options.insert("top_p".into(), json!(top_p));
+    }
+    if let Some(repeat_penalty) = sampling.repeat_penalty {
+        options.insert("repeat_penalty".into(), json!(repeat_penalty));
+    }
+    if let Some(max_tokens) = sampling.max_tokens {
+        options.insert("num_predict".into(), json!(max_tokens));
+    }
+    if !options.is_empty() {
+        body["options"] = Value::Object(options);
+    }
+    body
+}
+
 pub async fn openai_generate(
     http: &Client,
     base: &str,
@@ -353,17 +409,14 @@ pub async fn openai_generate(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
 ) -> Result<String> {
     let resp = auth(
         http.post(format!("{}/chat/completions", openai_root(base)))
             .timeout(timeout),
         api_key,
     )
-    .json(&json!({
-        "model": model,
-        "temperature": 0.2,
-        "messages": messages(system_ctx, turns, ConcreteKind::OpenAi)
-    }))
+    .json(&openai_payload(model, system_ctx, turns, sampling, false))
     .send()
     .await?;
     if !resp.status().is_success() {
@@ -380,15 +433,12 @@ pub async fn ollama_generate(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
 ) -> Result<String> {
     let resp = http
         .post(format!("{}/api/chat", service_root(base)))
         .timeout(timeout)
-        .json(&json!({
-            "model": model,
-            "stream": false,
-            "messages": messages(system_ctx, turns, ConcreteKind::Ollama)
-        }))
+        .json(&ollama_payload(model, system_ctx, turns, sampling, false))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -410,18 +460,14 @@ pub async fn openai_stream(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
     let resp = auth(
         http.post(format!("{}/chat/completions", openai_root(base))),
         api_key,
     )
-    .json(&json!({
-        "model": model,
-        "temperature": 0.2,
-        "stream": true,
-        "messages": messages(system_ctx, turns, ConcreteKind::OpenAi)
-    }))
+    .json(&openai_payload(model, system_ctx, turns, sampling, true))
     .send()
     .await?;
     if !resp.status().is_success() {
@@ -437,15 +483,12 @@ pub async fn ollama_stream(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
     let resp = http
         .post(format!("{}/api/chat", service_root(base)))
-        .json(&json!({
-            "model": model,
-            "stream": true,
-            "messages": messages(system_ctx, turns, ConcreteKind::Ollama)
-        }))
+        .json(&ollama_payload(model, system_ctx, turns, sampling, true))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -464,7 +507,7 @@ pub async fn ollama_stream(
                 }
                 let note = format!("\n[ERROR] {err:#}");
                 full.push_str(&note);
-                emit(tx, StreamEvent::Delta { text: note }).await;
+                emit(tx, StreamEvent::Delta { text: note, model: String::new() }).await;
                 break;
             }
         };
@@ -478,11 +521,11 @@ pub async fn ollama_stream(
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 let (content, thinking, _done) = ollama_parts(&v);
                 if !thinking.is_empty() {
-                    emit(tx, StreamEvent::Thought { text: thinking }).await;
+                    emit(tx, StreamEvent::Thought { text: thinking, model: String::new() }).await;
                 }
                 if !content.is_empty() {
                     full.push_str(&content);
-                    emit(tx, StreamEvent::Delta { text: content }).await;
+                    emit(tx, StreamEvent::Delta { text: content, model: String::new() }).await;
                 }
             }
         }
@@ -501,11 +544,11 @@ fn apply_openai_data(data: &str, full: &mut String, pending: &mut Vec<StreamEven
     if let Ok(v) = serde_json::from_str::<Value>(data) {
         let (content, reasoning) = openai_delta_parts(&v);
         if !reasoning.is_empty() {
-            pending.push(StreamEvent::Thought { text: reasoning });
+            pending.push(StreamEvent::Thought { text: reasoning, model: String::new() });
         }
         if !content.is_empty() {
             full.push_str(&content);
-            pending.push(StreamEvent::Delta { text: content });
+            pending.push(StreamEvent::Delta { text: content, model: String::new() });
         }
     }
 }
@@ -528,7 +571,7 @@ async fn read_openai_sse(
                 let note = format!("\n[ERROR] {err:#}");
                 full.push_str(&note);
                 let _ = tx
-                    .send(StreamEvent::Delta { text: note })
+                    .send(StreamEvent::Delta { text: note, model: String::new() })
                     .await;
                 break;
             }
@@ -681,6 +724,7 @@ mod tests {
                 attachments: vec![],
             }],
             Duration::from_secs(5),
+            Sampling::default(),
             &tx,
         )
         .await

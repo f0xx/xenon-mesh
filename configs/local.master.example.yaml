@@ -23,6 +23,12 @@ gemini:
 models:
   # Empty default: after discovery, pick the highest coding rank.
   default: ""
+  # Optional extra providers. See configs/providers.example.json.
+  providers_file: ""
+  # sampling:
+  #   temperature: 0.2
+  #   top_p: 0.9
+  #   repeat_penalty: 1.05
   providers:
     - id: local
       kind: openai

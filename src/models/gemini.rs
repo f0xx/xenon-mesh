@@ -1,4 +1,5 @@
 use super::{map_role, ChatTurn, ConcreteKind, StreamEvent};
+use crate::config::Sampling;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -27,24 +28,27 @@ fn contents(turns: &[ChatTurn]) -> Vec<Value> {
         .collect()
 }
 
-fn body(system_ctx: &str, turns: &[ChatTurn], thinking: bool) -> Value {
+fn body(system_ctx: &str, turns: &[ChatTurn], thinking: bool, sampling: Sampling) -> Value {
     let mut extra = String::new();
     for t in turns.iter().filter(|t| t.role == "system") {
         extra.push('\n');
         extra.push_str(&t.text);
     }
     let system = format!("{system_ctx}{extra}");
-    let mut body = if thinking {
-        json!({
-            "contents": contents(turns),
-            "generationConfig": { "temperature": 0.2, "thinkingConfig": { "includeThoughts": true } }
-        })
-    } else {
-        json!({
-            "contents": contents(turns),
-            "generationConfig": { "temperature": 0.2 }
-        })
-    };
+    let mut generation = json!({ "temperature": sampling.temperature.unwrap_or(0.2) });
+    if let Some(top_p) = sampling.top_p {
+        generation["topP"] = json!(top_p);
+    }
+    if let Some(max_tokens) = sampling.max_tokens {
+        generation["maxOutputTokens"] = json!(max_tokens);
+    }
+    if thinking {
+        generation["thinkingConfig"] = json!({ "includeThoughts": true });
+    }
+    let mut body = json!({
+        "contents": contents(turns),
+        "generationConfig": generation
+    });
     if !system.trim().is_empty() {
         body["systemInstruction"] = json!({ "parts": [{ "text": system }] });
     }
@@ -111,6 +115,7 @@ async fn generate_value(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
 ) -> Result<Value> {
     let mut delay = 1u64;
     let mut last = String::new();
@@ -119,7 +124,7 @@ async fn generate_value(
             .post(endpoint(model, "generateContent"))
             .timeout(timeout)
             .header("x-goog-api-key", api_key)
-            .json(&body(system_ctx, turns, false))
+            .json(&body(system_ctx, turns, false, sampling))
             .send()
             .await?;
         let status = resp.status();
@@ -155,11 +160,12 @@ pub async fn generate(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
 ) -> Result<String> {
     if api_key.is_empty() {
         bail!("gemini API key is empty");
     }
-    let res = generate_value(http, api_key, model, system_ctx, turns, timeout).await?;
+    let res = generate_value(http, api_key, model, system_ctx, turns, timeout, sampling).await?;
     let text = reply_text(&res);
     if text.is_empty() {
         bail!("empty gemini response");
@@ -174,9 +180,15 @@ pub async fn stream(
     system_ctx: &str,
     turns: &[ChatTurn],
     timeout: Duration,
+    sampling: Sampling,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
-    let text = generate(http, api_key, model, system_ctx, turns, timeout).await?;
-    let _ = tx.send(StreamEvent::Delta { text: text.clone() }).await;
+    let text = generate(http, api_key, model, system_ctx, turns, timeout, sampling).await?;
+    let _ = tx
+        .send(StreamEvent::Delta {
+            text: text.clone(),
+            model: String::new(),
+        })
+        .await;
     Ok(text)
 }

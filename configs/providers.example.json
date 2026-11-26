@@ -1,0 +1,33 @@
+{
+  "atria": {
+    "label": "Atria ASI",
+    "type": "openai_chat",
+    "base_url": "https://api.atria-asi.ai/v1",
+    "api_key_env": "ATRIA_API_KEY",
+    "models": ["Atria-Dawn-Preview"],
+    "max_tokens": 8192,
+    "discover": false
+  },
+  "routeway": {
+    "label": "RouteWay",
+    "type": "openai_chat",
+    "base_url": "https://api.routeway.ai/v1",
+    "api_key_env": "ROUTEWAY_API_KEY",
+    "models": [
+      "deepseek-v4-flash:free",
+      "gemma-4-26b-a4b-it-chimerax:free"
+    ],
+    "max_tokens": 8192,
+    "discover": false
+  },
+  "vireonix": {
+    "label": "Vireonix",
+    "type": "openai_chat",
+    "base_url": "https://vireonix.ai/v1",
+    "api_key": "",
+    "auth_optional": true,
+    "models": ["auto"],
+    "max_tokens": 8192,
+    "discover": false
+  }
+}

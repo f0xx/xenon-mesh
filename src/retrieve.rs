@@ -59,6 +59,8 @@ pub fn coding_preamble(channel: &str) -> String {
          The path index and source blocks below are this channel's project. Read them and answer from them, including a general question about what the project is.\n\
          Do not claim the source is unavailable when those blocks are present.\n\
          When you change code, include one unified diff inside a ```diff fence that `git apply` can consume, then explain the change briefly.\n\
+         Source blocks are numbered `NNNNN|`. That number is the line in the file. Use those numbers in the @@ hunk header.\n\
+         Do not copy the `NNNNN|` prefix into the diff or into other code fences. A hunk with invented line numbers will not apply.\n\
          Prefer small reviewable edits. Pinned and learned notes are invariants.\n\
          The daemon process runs as its operating-system user. You decide whether an action is safe to propose. The operating system enforces that user's rights.\n\
          Facts that are not in the project blocks or in a Web results block are not known to you. Do not invent web pages, versions, or current events.\n\
@@ -162,7 +164,7 @@ pub fn assemble_context(
         if room < 200 {
             break;
         }
-        let body = truncate(&e.content, room);
+        let body = number_source(&e.content, room);
         push(
             &mut blocks,
             &mut used,
@@ -205,7 +207,7 @@ pub fn assemble_context(
         if room < 200 {
             break;
         }
-        let body = truncate(&e.content, room);
+        let body = number_source(&e.content, room);
         push(
             &mut blocks,
             &mut used,
@@ -214,6 +216,20 @@ pub fn assemble_context(
     }
 
     blocks.join("\n\n")
+}
+
+/// File line numbers, kept inside `max_chars`. The prefix is `NNNNN|`.
+pub fn number_source(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let row = format!("{:>5}|{line}\n", i + 1);
+        if out.len() + row.len() > max_chars && !out.is_empty() {
+            out.push_str("…[truncated]\n");
+            break;
+        }
+        out.push_str(&row);
+    }
+    out
 }
 
 pub fn map_entries<'a>(
@@ -284,6 +300,7 @@ mod tests {
         assert!(ctx.contains("never disable auth"));
         assert!(ctx.contains("DIFF"));
         assert!(ctx.contains("src/executor.rs"));
+        assert!(ctx.contains("|fn apply_unified_diff"));
         assert!(!ctx.contains("paint_pixels"));
     }
 

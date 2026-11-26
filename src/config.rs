@@ -209,6 +209,31 @@ impl Default for GeminiSection {
     }
 }
 
+/// Sampling knobs sent with a chat request.
+///
+/// An unset field is left to the provider. OpenAI-compatible and Gemini calls
+/// already use temperature 0.2 when this is empty. Ollama uses the model file
+/// when `temperature` is unset, and that file is often 0.8.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Sampling {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+impl Sampling {
+    pub fn overlay(self, over: Self) -> Self {
+        Self {
+            temperature: over.temperature.or(self.temperature),
+            top_p: over.top_p.or(self.top_p),
+            repeat_penalty: over.repeat_penalty.or(self.repeat_penalty),
+            max_tokens: over.max_tokens.or(self.max_tokens),
+        }
+    }
+}
+
 /// One remote model endpoint.
 ///
 /// `kind` is `openai` (OpenAI-compatible HTTP, including Ollama `/v1`),
@@ -225,6 +250,10 @@ pub struct ProviderConfig {
     pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// Inline key from an external providers file. Prefer `api_key_env`.
+    /// Empty, or a value that starts with `PASTE_`, is ignored.
+    #[serde(default)]
+    pub api_key: String,
     pub chat_model: String,
     pub embed_model: String,
     pub models: Vec<String>,
@@ -238,6 +267,10 @@ pub struct ProviderConfig {
     /// Browser identity for the web-search script. Empty uses the script default.
     #[serde(default)]
     pub user_agent: String,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub sampling: Sampling,
 }
 
 impl Default for ProviderConfig {
@@ -257,6 +290,9 @@ impl Default for ProviderConfig {
             openapi_url: String::new(),
             command: Vec::new(),
             user_agent: String::new(),
+            api_key: String::new(),
+            max_tokens: 0,
+            sampling: Sampling::default(),
         }
     }
 }
@@ -269,6 +305,13 @@ pub struct ModelsSection {
     pub embed_provider: String,
     pub system_prompt: String,
     pub providers: Vec<ProviderConfig>,
+    /// Optional JSON file of extra providers. Same shape as
+    /// `configs/providers.example.json`. Missing file adds nothing.
+    #[serde(default)]
+    pub providers_file: String,
+    /// Applied to every provider. A provider's own `sampling` wins per field.
+    #[serde(default)]
+    pub sampling: Sampling,
 }
 
 impl Default for ModelsSection {
@@ -278,6 +321,8 @@ impl Default for ModelsSection {
             embed_provider: String::new(),
             system_prompt: String::new(),
             providers: Vec::new(),
+            providers_file: String::new(),
+            sampling: Sampling::default(),
         }
     }
 }
@@ -312,7 +357,134 @@ impl AppConfig {
         if self.node.id.is_empty() {
             bail!("node.id is required and must not be empty");
         }
+        self.merge_providers_file()?;
         Ok(())
+    }
+
+    fn merge_providers_file(&mut self) -> Result<()> {
+        let path = self.models.providers_file.trim();
+        if path.is_empty() {
+            return Ok(());
+        }
+        if !Path::new(path).exists() {
+            return Ok(());
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading providers file {path}"))?;
+        for extra in providers_from_json(&text)? {
+            if !self.models.providers.iter().any(|p| p.id == extra.id) {
+                self.models.providers.push(extra);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse the external providers JSON used by other lab tools.
+///
+/// A provider with an empty key, or a key that still says `PASTE_`, is left
+/// out unless `auth_optional` is true. The file can sit on disk before the
+/// key exists.
+pub fn providers_from_json(text: &str) -> Result<Vec<ProviderConfig>> {
+    let raw: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
+        .context("providers file is not a JSON object")?;
+    let mut out = Vec::new();
+    for (id, value) in raw {
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let auth_optional = obj.get("auth_optional").and_then(|v| v.as_bool()).unwrap_or(false);
+        let inline = usable_key(obj.get("api_key").and_then(|v| v.as_str()).unwrap_or(""));
+        let api_key_env = obj
+            .get("api_key_env")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let env_set = !api_key_env.is_empty()
+            && std::env::var(&api_key_env)
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty());
+        if !auth_optional && inline.is_empty() && !env_set {
+            continue;
+        }
+        let models = obj
+            .get("models")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let kind = match obj
+            .get("type")
+            .or_else(|| obj.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("openai_chat")
+        {
+            "ollama" => "ollama",
+            "gemini" => "gemini",
+            "google" | "web" => "google",
+            _ => "openai",
+        };
+        let label = obj
+            .get("label")
+            .or_else(|| obj.get("host"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let discover = obj
+            .get("discover")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(models.is_empty());
+        let mut sampling = Sampling::default();
+        if let Some(n) = obj.get("temperature").and_then(|v| v.as_f64()) {
+            sampling.temperature = Some(n as f32);
+        }
+        if let Some(n) = obj.get("top_p").and_then(|v| v.as_f64()) {
+            sampling.top_p = Some(n as f32);
+        }
+        if let Some(n) = obj.get("repeat_penalty").and_then(|v| v.as_f64()) {
+            sampling.repeat_penalty = Some(n as f32);
+        }
+        let max_tokens = obj.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if max_tokens > 0 {
+            sampling.max_tokens = Some(max_tokens);
+        }
+        out.push(ProviderConfig {
+            id,
+            host: label,
+            kind: kind.into(),
+            base_url: obj
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string(),
+            api_key_env,
+            api_key: inline,
+            chat_model: models.first().cloned().unwrap_or_default(),
+            models,
+            discover,
+            coding_bias: true,
+            timeout_secs: obj.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(180),
+            max_tokens,
+            sampling,
+            ..ProviderConfig::default()
+        });
+    }
+    Ok(out)
+}
+
+fn usable_key(raw: &str) -> String {
+    let key = raw.trim();
+    if key.is_empty() || key.starts_with("PASTE_") {
+        String::new()
+    } else {
+        key.to_string()
     }
 }
 
@@ -342,6 +514,23 @@ mod tests {
             "postgres://app:***@127.0.0.1:5432/mesh"
         );
         assert_eq!(redact_url("sqlite:///tmp/mesh.db"), "sqlite:///tmp/mesh.db");
+    }
+
+    #[test]
+    fn providers_json_keeps_open_hosts_and_skips_placeholders() {
+        let parsed = providers_from_json(
+            r#"{
+              "atria": {"type":"openai_chat","base_url":"https://api.example/v1","api_key":"PASTE_ATRIA_API_KEY_HERE","models":["Dawn"]},
+              "open": {"label":"Open","type":"openai_chat","base_url":"https://open.example/v1","api_key":"","auth_optional":true,"models":["auto"],"max_tokens":1000,"temperature":0.2}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "open");
+        assert_eq!(parsed[0].host, "Open");
+        assert!(!parsed[0].discover);
+        assert_eq!(parsed[0].sampling.temperature, Some(0.2));
+        assert_eq!(parsed[0].sampling.max_tokens, Some(1000));
     }
 
     #[test]

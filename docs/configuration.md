@@ -106,6 +106,10 @@ When `models.providers` is non-empty, it is the whole provider list. The legacy 
 | `embed_provider` | empty | provider id used for embeddings. Empty skips embeddings and retrieval stays lexical |
 | `system_prompt` | empty | text prepended to the coding preamble |
 | `providers` | empty → `[]` | list of providers, below |
+| `providers_file` | empty | optional JSON file of extra providers. See `configs/providers.example.json`. A missing file adds nothing. A provider with no key is skipped unless `auth_optional` is true. The hub serves those models and nodes reach them through the hub, the same way as Gemini |
+| `sampling.temperature` | unset | sent on chat requests. Unset keeps the built-in 0.2 for OpenAI-compatible and Gemini calls. Unset leaves Ollama on the model file, which is often 0.8. Set `0.2` on an Ollama provider when coding answers wander |
+| `sampling.top_p` | unset | sent only when set |
+| `sampling.repeat_penalty` | unset | Ollama `options.repeat_penalty` when set |
 
 Each provider (`#[serde(default)]` on the whole map, so a short entry is valid):
 
@@ -125,6 +129,8 @@ Each provider (`#[serde(default)]` on the whole map, so a short entry is valid):
 | `openapi_url` | `""` | optional OpenAPI document for `kind: auto` |
 | `command` | `[]` | `google` only. Argv. The query is written to stdin |
 | `user_agent` | `""` | `google` only. Passed to the script as `XMESH_UA` |
+| `sampling` | unset fields | overrides `models.sampling` for this provider, one field at a time |
+| `max_tokens` | `0` | OpenAI-compatible `max_tokens`, Ollama `num_predict`, Gemini `maxOutputTokens`. `0` omits the field |
 
 ```yaml
 models:

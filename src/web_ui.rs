@@ -18,9 +18,10 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -65,6 +66,8 @@ pub struct ChatReq {
     pub thread: String,
     pub prompt: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
     /// Re-run the model on the thread as stored. Used after an edit.
@@ -152,6 +155,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/threads/fork", post(handle_fork_thread))
         .route("/api/threads/open", post(handle_open_thread))
         .route("/api/alias", get(handle_alias_get).post(handle_alias_set))
+        .route("/api/chat-pref", get(handle_chat_pref_get).post(handle_chat_pref_set))
         .route("/api/memory", get(handle_list_memory).delete(handle_delete_memory))
         .route("/api/channels", get(handle_list_channels).post(handle_upsert_channel))
         .route("/api/channel-state", post(handle_channel_state))
@@ -245,7 +249,7 @@ async fn handle_config(State(st): State<Arc<WebState>>) -> Json<serde_json::Valu
     }
     if master_http(&st.cfg).is_none() {
         for choice in models.iter_mut() {
-            if choice.kind == "gemini" {
+            if choice.kind == "gemini" || choice.proxied {
                 choice.host = st.cfg.node.id.clone();
                 choice.label = format!("{} : {}", choice.model, choice.host);
                 choice.proxied = true;
@@ -848,6 +852,59 @@ async fn handle_alias_set(
     Ok(Json(serde_json::json!({ "alias": alias, "display": display })))
 }
 
+#[derive(Deserialize)]
+struct ChatPrefQuery {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+}
+
+#[derive(Deserialize)]
+struct ChatPrefBody {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    multi: bool,
+}
+
+async fn handle_chat_pref_get(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<ChatPrefQuery>,
+) -> Json<serde_json::Value> {
+    let thread = if q.thread.is_empty() { "main" } else { &q.thread };
+    let (models, multi) = st
+        .db
+        .get_chat_models(&q.channel, thread)
+        .await
+        .unwrap_or_default();
+    Json(serde_json::json!({ "models": models, "multi": multi }))
+}
+
+async fn handle_chat_pref_set(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<ChatPrefBody>,
+) -> Result<StatusCode, StatusCode> {
+    let thread = if req.thread.is_empty() {
+        "main".to_string()
+    } else {
+        req.thread
+    };
+    let models: Vec<String> = req
+        .models
+        .into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    st.db
+        .set_chat_models(&req.channel, &thread, &models, req.multi && models.len() > 1)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
 async fn handle_reindex(
     State(st): State<Arc<WebState>>,
     Query(q): Query<ReindexQuery>,
@@ -990,6 +1047,29 @@ async fn prompt_for(
     ))
 }
 
+fn number_harvest_code(text: &str) -> String {
+    let mut out = String::new();
+    let mut numbering = false;
+    let mut n = 0usize;
+    for line in text.lines() {
+        if line.starts_with("### ") {
+            numbering = line.starts_with("### [CODE:");
+            n = 0;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if numbering {
+            n += 1;
+            out.push_str(&format!("{n:>5}|{line}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 async fn project_outline(cfg: &AppConfig, dir: std::path::PathBuf) -> String {
     if !cfg.git.harvest_command.is_empty() {
         let program = cfg.git.harvest_command[0].clone();
@@ -1004,7 +1084,8 @@ async fn project_outline(cfg: &AppConfig, dir: std::path::PathBuf) -> String {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !text.is_empty() {
-                    return text.chars().take(28_000).collect();
+                    let numbered = number_harvest_code(&text);
+                    return numbered.chars().take(28_000).collect();
                 }
             }
         }
@@ -1166,11 +1247,13 @@ async fn handle_complete(
             let _ = tx
                 .send(StreamEvent::Delta {
                     text: format!("[ERROR] {err}"),
+                    model: String::new(),
                 })
                 .await;
             let _ = tx
                 .send(StreamEvent::Done {
                     model_used: "error".into(),
+                    model: String::new(),
                 })
                 .await;
         }
@@ -1254,8 +1337,8 @@ async fn relay_complete(
                 continue;
             };
             match &ev {
-                StreamEvent::Delta { text: delta } => text.push_str(delta),
-                StreamEvent::Done { model_used } => used = model_used.clone(),
+                StreamEvent::Delta { text: delta, .. } => text.push_str(delta),
+                StreamEvent::Done { model_used, .. } => used = model_used.clone(),
                 _ => {}
             }
             let _ = tx.send(ev).await;
@@ -1265,6 +1348,131 @@ async fn relay_complete(
         used = model.to_string();
     }
     Ok((text, used))
+}
+
+fn stamp(ev: StreamEvent, model: &str) -> StreamEvent {
+    match ev {
+        StreamEvent::Status { text, .. } => StreamEvent::Status {
+            text,
+            model: model.to_string(),
+        },
+        StreamEvent::Thought { text, .. } => StreamEvent::Thought {
+            text,
+            model: model.to_string(),
+        },
+        StreamEvent::Delta { text, .. } => StreamEvent::Delta {
+            text,
+            model: model.to_string(),
+        },
+        StreamEvent::Done { model_used, .. } => StreamEvent::Done {
+            model_used,
+            model: model.to_string(),
+        },
+        other => other,
+    }
+}
+
+async fn run_one_reply(
+    st: Arc<WebState>,
+    model: String,
+    ctx: String,
+    turns: Vec<ChatTurn>,
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    audit: Option<serde_json::Value>,
+    channel: String,
+    thread: String,
+    reply_thread: String,
+    sync_hub: bool,
+    left: Arc<AtomicUsize>,
+) {
+    let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
+    let forward = tx.clone();
+    let label = model.clone();
+    let pump = tokio::spawn(async move {
+        while let Some(ev) = local_rx.recv().await {
+            let _ = forward.send(stamp(ev, &label)).await;
+        }
+    });
+    let started = now_ms();
+    let (author, final_text) = match dispatch_chat(&st, &model, &ctx, &turns, local_tx.clone(), audit).await
+    {
+        Ok((reply, used)) => {
+            let (clean, tools) = crate::browse::take_requests(&reply);
+            if tools.is_empty() || used == "error" {
+                (used, reply)
+            } else {
+                let _ = local_tx
+                    .send(StreamEvent::Status {
+                        text: "Fetching the web...".into(),
+                        model: String::new(),
+                    })
+                    .await;
+                let pages = run_lookups(&st, &tools).await;
+                let mut next = turns.clone();
+                next.push(ChatTurn {
+                    role: "assistant".into(),
+                    text: clean.clone(),
+                    attachments: vec![],
+                });
+                next.push(ChatTurn {
+                    role: "user".into(),
+                    text: format!("Web results:\n{pages}"),
+                    attachments: vec![],
+                });
+                match dispatch_chat(&st, &model, &ctx, &next, local_tx.clone(), None).await {
+                    Ok((second, used2)) => (used2, second),
+                    Err(err) => (used, format!("{clean}\n\n[web lookup failed: {err:#}]")),
+                }
+            }
+        }
+        Err(err) => {
+            let err_txt = format!("[ERROR] {err:#}");
+            let _ = local_tx
+                .send(StreamEvent::Delta {
+                    text: err_txt.clone(),
+                    model: String::new(),
+                })
+                .await;
+            ("error".into(), err_txt)
+        }
+    };
+    let author = if author.is_empty() { model.clone() } else { author };
+    let finished = now_ms();
+    let detail = serde_json::json!({
+        "started_at_ms": started,
+        "finished_at_ms": finished,
+        "model": author,
+        "raw": final_text,
+        "processed": final_text,
+        "error": if author == "error" { final_text.as_str() } else { "" },
+        "actions": ["chat"]
+    })
+    .to_string();
+    let stored = store_message(
+        &st,
+        SessionMessage {
+            channel_id: channel,
+            thread_id: thread,
+            seq: 0,
+            author: author.clone(),
+            content: final_text,
+            created_at_ms: 0,
+        },
+        sync_hub,
+        &detail,
+    )
+    .await;
+    drop(local_tx);
+    let _ = pump.await;
+    let last = left.fetch_sub(1, Ordering::SeqCst) == 1;
+    let _ = tx
+        .send(StreamEvent::Saved {
+            seq: stored.seq,
+            thread: reply_thread,
+            model: author,
+            last,
+        })
+        .await;
 }
 
 async fn handle_persistent_chat(
@@ -1328,9 +1536,40 @@ async fn handle_persistent_chat(
         });
     }
 
+    let mut models: Vec<String> = req
+        .models
+        .iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if models.is_empty() {
+        if let Some(one) = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            models.push(one.to_string());
+        }
+    }
+    if models.is_empty() {
+        let fallback = st.models.default_model().await;
+        if !fallback.is_empty() {
+            models.push(fallback);
+        }
+    }
+    {
+        let mut seen = HashSet::new();
+        models.retain(|m| seen.insert(m.clone()));
+    }
+    let _ = st
+        .db
+        .set_chat_models(&req.channel, &req.thread, &models, models.len() > 1)
+        .await;
+
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
     let st_bg = st.clone();
-    let model = req.model.filter(|s| !s.is_empty()).unwrap_or_default();
+    let models_bg = models;
     tokio::spawn(async move {
         let _clear = LiveClear {
             st: st_bg.clone(),
@@ -1342,6 +1581,7 @@ async fn handle_persistent_chat(
             let _ = tx
                 .send(StreamEvent::Status {
                     text: "Saving the message...".into(),
+                    model: String::new(),
                 })
                 .await;
             stored_user = Some(store_message(&st_bg, user_msg, sync_hub, "").await);
@@ -1360,15 +1600,36 @@ async fn handle_persistent_chat(
             if let Some(last) = turns.pop() {
                 turns = vec![last];
             }
+            let _ = st_bg
+                .db
+                .set_chat_models(
+                    &req.channel,
+                    model_thread.as_str(),
+                    &models_bg,
+                    models_bg.len() > 1,
+                )
+                .await;
         }
         let _ = tx
             .send(StreamEvent::Status {
                 text: "Building context...".into(),
+                model: String::new(),
             })
             .await;
+        let prompt_model = models_bg
+            .iter()
+            .find(|m| !m.starts_with("google/"))
+            .cloned()
+            .unwrap_or_else(|| models_bg.first().cloned().unwrap_or_default());
         let mut ctx = match tokio::time::timeout(
             std::time::Duration::from_secs(45),
-            prompt_for(&st_bg, &req.channel, &model_thread, &req.prompt, &model),
+            prompt_for(
+                &st_bg,
+                &req.channel,
+                &model_thread,
+                &req.prompt,
+                &prompt_model,
+            ),
         )
         .await
         {
@@ -1389,80 +1650,53 @@ async fn handle_persistent_chat(
         } else {
             None
         };
-        let started = now_ms();
-        let (author, final_text) =
-            match dispatch_chat(&st_bg, &model, &ctx, &turns, tx.clone(), audit).await {
-                Ok((reply, used)) => {
-                    let (clean, tools) = crate::browse::take_requests(&reply);
-                    if tools.is_empty() || used == "error" {
-                        (used, reply)
-                    } else {
-                        let _ = tx
-                            .send(StreamEvent::Status {
-                                text: "Fetching the web...".into(),
-                            })
-                            .await;
-                        let pages = run_lookups(&st_bg, &tools).await;
-                        let mut next = turns.clone();
-                        next.push(ChatTurn {
-                            role: "assistant".into(),
-                            text: clean.clone(),
-                            attachments: vec![],
-                        });
-                        next.push(ChatTurn {
-                            role: "user".into(),
-                            text: format!("Web results:\n{pages}"),
-                            attachments: vec![],
-                        });
-                        match dispatch_chat(&st_bg, &model, &ctx, &next, tx.clone(), None).await {
-                            Ok((second, used2)) => (used2, second),
-                            Err(err) => (used, format!("{clean}\n\n[web lookup failed: {err:#}]")),
-                        }
-                    }
-                }
-                Err(err) => {
-                    let err_txt = format!("[ERROR] {err:#}");
-                    let _ = tx
-                        .send(StreamEvent::Delta {
-                            text: err_txt.clone(),
-                        })
-                        .await;
-                    ("error".into(), err_txt)
-                }
-            };
-        let author = if author.is_empty() { model.clone() } else { author };
-        let finished = now_ms();
-        let detail = serde_json::json!({
-            "started_at_ms": started,
-            "finished_at_ms": finished,
-            "model": author,
-            "raw": final_text,
-            "processed": final_text,
-            "error": if author == "error" { final_text.as_str() } else { "" },
-            "actions": ["chat"]
-        })
-        .to_string();
-        let channel_name = req.channel.clone();
-        let stored = store_message(
-            &st_bg,
-            SessionMessage {
-                channel_id: channel_name.clone(),
-                thread_id: model_thread.clone(),
-                seq: 0,
-                author,
-                content: final_text,
-                created_at_ms: 0,
-            },
-            sync_hub,
-            &detail,
-        )
-        .await;
-        let _ = tx
-            .send(StreamEvent::Saved {
-                seq: stored.seq,
-                thread: reply_thread.unwrap_or_default(),
-            })
-            .await;
+        if models_bg.is_empty() {
+            let _ = tx
+                .send(StreamEvent::Delta {
+                    text: "[ERROR] no model is configured".into(),
+                    model: String::new(),
+                })
+                .await;
+            let _ = tx
+                .send(StreamEvent::Saved {
+                    seq: 0,
+                    thread: reply_thread.unwrap_or_default(),
+                    model: "error".into(),
+                    last: true,
+                })
+                .await;
+            return;
+        }
+        if models_bg.len() > 1 {
+            let _ = tx
+                .send(StreamEvent::Status {
+                    text: format!(
+                        "Asking {} models. Each reply stands alone, and they may disagree.",
+                        models_bg.len()
+                    ),
+                    model: String::new(),
+                })
+                .await;
+        }
+        let left = Arc::new(AtomicUsize::new(models_bg.len()));
+        let reply_name = reply_thread.unwrap_or_default();
+        let mut pending = tokio::task::JoinSet::new();
+        for model in models_bg {
+            pending.spawn(run_one_reply(
+                st_bg.clone(),
+                model,
+                ctx.clone(),
+                turns.clone(),
+                tx.clone(),
+                audit.clone(),
+                req.channel.clone(),
+                model_thread.clone(),
+                reply_name.clone(),
+                sync_hub,
+                left.clone(),
+            ));
+        }
+        while pending.join_next().await.is_some() {}
     });
 
     let stream = ReceiverStream::new(rx)

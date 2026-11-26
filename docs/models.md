@@ -35,7 +35,17 @@ If `chat_model` is empty and `coding_bias` is true, discovery sorts names and pi
 | `instruct` | +10 |
 | `reason`, `think`, or `-r1` | +5 |
 
-`models.default` wins when it is set. The UI lists every discovered model with the coding models first. Fallback after a 404, 429, or 5xx tries at most two more names from the same provider. Authentication failures and connection failures do not fall through.
+`models.default` wins when it is set. The UI lists every discovered model with the coding models first. A chat with no saved choice uses that default. The last model chosen in a channel and thread is stored on that node and restored when the chat is opened again. The multi switch next to the model list asks every selected model; each reply is stored on its own and they are not merged, so they can disagree. Fallback after a 404, 429, or 5xx tries at most two more names from the same provider. Authentication failures and connection failures do not fall through.
+
+## Sampling
+
+`models.sampling` and a provider's own `sampling` set `temperature`, `top_p`, and `repeat_penalty`. A provider field overrides the shared one. OpenAI-compatible and Gemini calls use temperature 0.2 when it is unset. An Ollama request omits `temperature` when it is unset, and the server then uses the model file. That file is often 0.8, which is loose for coding. Set `temperature: 0.2` on the Ollama provider to override it for these chats without editing the model file.
+
+`repeat_penalty` is sent only to native Ollama, as `options.repeat_penalty`.
+
+## External providers
+
+`models.providers_file` points at a JSON object whose keys are provider ids. The shape matches `configs/providers.example.json`: `type` `openai_chat`, `base_url`, `models`, `api_key` or `api_key_env`, and `auth_optional`. A placeholder key (`PASTE_…`) or an empty key drops that provider unless `auth_optional` is true. `api_key_env` keeps the provider only when that variable is set at startup. Providers loaded this way are not written into the source tree. On the hub they are proxied: a node selects `provider/model` and the hub performs the call, the same as Gemini.
 
 ## DR-20. Embeddings are optional
 

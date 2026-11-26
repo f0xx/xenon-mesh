@@ -11,7 +11,7 @@ mod gemini;
 mod google;
 mod remote;
 
-use crate::config::{AppConfig, GeminiSection, ProviderConfig};
+use crate::config::{AppConfig, GeminiSection, ProviderConfig, Sampling};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::Serialize;
@@ -63,15 +63,36 @@ use serde::Deserialize;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StreamEvent {
-    Status { text: String },
-    Thought { text: String },
-    Delta { text: String },
-    Done { model_used: String },
+    Status {
+        text: String,
+        #[serde(default)]
+        model: String,
+    },
+    Thought {
+        text: String,
+        #[serde(default)]
+        model: String,
+    },
+    Delta {
+        text: String,
+        #[serde(default)]
+        model: String,
+    },
+    Done {
+        model_used: String,
+        #[serde(default)]
+        model: String,
+    },
     Saved {
         seq: u64,
         /// Set when the reply was stored in a thread of its own.
         #[serde(default)]
         thread: String,
+        #[serde(default)]
+        model: String,
+        /// True for the last reply when several models were asked together.
+        #[serde(default = "default_true")]
+        last: bool,
     },
     /// The page could not be fetched by the daemon. The UI opens it.
     Browse { url: String, text: String },
@@ -122,6 +143,13 @@ struct ProviderState {
     discover: bool,
     command: Vec<String>,
     user_agent: String,
+    api_key: String,
+    sampling: Sampling,
+    proxied: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 struct ModelState {
@@ -244,18 +272,25 @@ fn legacy_gemini(g: &GeminiSection) -> ProviderConfig {
 }
 
 pub fn providers_from_config(cfg: &AppConfig) -> Vec<ProviderConfig> {
-    if !cfg.models.providers.is_empty() {
-        return cfg.models.providers.clone();
+    let mut list = if !cfg.models.providers.is_empty() {
+        cfg.models.providers.clone()
+    } else {
+        let routed = cfg
+            .node
+            .master_http
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        if routed {
+            Vec::new()
+        } else {
+            vec![legacy_gemini(&cfg.gemini)]
+        }
+    };
+    let base = cfg.models.sampling;
+    for provider in &mut list {
+        provider.sampling = base.overlay(provider.sampling);
     }
-    let routed = cfg
-        .node
-        .master_http
-        .as_deref()
-        .is_some_and(|url| !url.trim().is_empty());
-    if routed {
-        return Vec::new();
-    }
-    vec![legacy_gemini(&cfg.gemini)]
+    list
 }
 
 impl ProviderState {
@@ -283,6 +318,16 @@ impl ProviderState {
             discover: cfg.discover,
             command: cfg.command.clone(),
             user_agent: cfg.user_agent.clone(),
+            api_key: {
+                let key = cfg.api_key.trim();
+                if key.is_empty() || key.starts_with("PASTE_") {
+                    String::new()
+                } else {
+                    key.to_string()
+                }
+            },
+            sampling: cfg.sampling,
+            proxied: cfg.kind == "gemini" || cfg.base_url.starts_with("https://"),
         }
     }
 
@@ -295,11 +340,14 @@ impl ProviderState {
     }
 
     fn key(&self) -> String {
-        if self.api_key_env.trim().is_empty() {
-            String::new()
-        } else {
-            std::env::var(&self.api_key_env).unwrap_or_default()
+        if !self.api_key_env.trim().is_empty() {
+            if let Ok(value) = std::env::var(&self.api_key_env) {
+                if !value.trim().is_empty() {
+                    return value;
+                }
+            }
         }
+        self.api_key.clone()
     }
 }
 
@@ -387,7 +435,7 @@ impl ModelHub {
                     host,
                     kind: p.kind.as_str().into(),
                     coding_rank: coding_rank(&model),
-                    proxied: false,
+                    proxied: p.proxied,
                     model,
                 });
             }
@@ -624,6 +672,7 @@ impl ModelHub {
                 let _ = tx
                     .send(StreamEvent::Status {
                         text: format!("Awaiting {m} : {}...", provider.host_label()),
+                        model: String::new(),
                     })
                     .await;
             }
@@ -634,6 +683,7 @@ impl ModelHub {
                         let _ = tx
                             .send(StreamEvent::Done {
                                 model_used: format!("{}/{}", provider.id, m),
+                                model: String::new(),
                             })
                             .await;
                     }
@@ -648,6 +698,7 @@ impl ModelHub {
                             let _ = tx
                                 .send(StreamEvent::Status {
                                     text: format!("{m} failed ({brief}), trying another model"),
+                                    model: String::new(),
                                 })
                                 .await;
                         }
@@ -689,6 +740,7 @@ impl ModelHub {
                     system,
                     turns,
                     provider.timeout,
+                    provider.sampling,
                     tx,
                 )
                 .await
@@ -701,6 +753,7 @@ impl ModelHub {
                     system,
                     turns,
                     provider.timeout,
+                    provider.sampling,
                 )
                 .await
             }
@@ -713,6 +766,7 @@ impl ModelHub {
                     system,
                     turns,
                     provider.timeout,
+                    provider.sampling,
                     tx,
                 )
                 .await
@@ -726,6 +780,7 @@ impl ModelHub {
                     system,
                     turns,
                     provider.timeout,
+                    provider.sampling,
                 )
                 .await
             }
@@ -737,6 +792,7 @@ impl ModelHub {
                     system,
                     turns,
                     provider.timeout,
+                    provider.sampling,
                     tx,
                 )
                 .await
@@ -749,6 +805,7 @@ impl ModelHub {
                     system,
                     turns,
                     provider.timeout,
+                    provider.sampling,
                 )
                 .await
             }
