@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lookup {
-    pub kind: &'static str,
+    pub kind: String,
     pub query: String,
 }
 
@@ -73,7 +73,7 @@ pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
                 let query = inside.trim();
                 if !query.is_empty() {
                     tools.push(Lookup {
-                        kind: "web",
+                        kind: "web".into(),
                         query: query.chars().take(300).collect(),
                     });
                 }
@@ -82,7 +82,7 @@ pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
                 let query = inside.trim();
                 if query.starts_with("http://") || query.starts_with("https://") {
                     tools.push(Lookup {
-                        kind: "fetch",
+                        kind: "fetch".into(),
                         query: query.chars().take(500).collect(),
                     });
                 } else {
@@ -91,6 +91,23 @@ pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
                     kept.push('\n');
                     kept.push_str(inside);
                     kept.push_str("```");
+                }
+            }
+            "read" | "file" => {
+                for line in inside.lines().map(str::trim).filter(|l| !l.is_empty()).take(3) {
+                    tools.push(Lookup {
+                        kind: "read".into(),
+                        query: line.chars().take(300).collect(),
+                    });
+                }
+            }
+            "grep" | "find" => {
+                let query = inside.trim();
+                if !query.is_empty() {
+                    tools.push(Lookup {
+                        kind: "grep".into(),
+                        query: query.chars().take(200).collect(),
+                    });
                 }
             }
             _ => {
@@ -133,7 +150,7 @@ pub async fn fetch_page(url: &str) -> Result<String> {
 }
 
 pub async fn run(lookup: &Lookup) -> Result<String> {
-    match lookup.kind {
+    match lookup.kind.as_str() {
         "fetch" => fetch_page(&lookup.query).await,
         _ => search(&lookup.query).await,
     }
@@ -264,6 +281,12 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "web");
         assert_eq!(tools[0].query, "rust ownership");
+
+        let (text2, tools2) = take_requests("Checking storage.\n```read\nsrc/storage.rs:10-50\n```\n```grep\nappend_public\n```");
+        assert_eq!(text2, "Checking storage.");
+        assert_eq!(tools2.len(), 2);
+        assert_eq!(tools2[0].kind, "read");
+        assert_eq!(tools2[1].kind, "grep");
     }
 
     #[test]

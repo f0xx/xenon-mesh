@@ -1082,6 +1082,24 @@ async fn prompt_for(
                 .into(),
         );
     }
+    let (entries, outline_dir) = collect_channel_entries(st, channel).await;
+    let q_emb = st.models.embed_text(query).await.unwrap_or_default();
+    let (top_k, budget, chunk) = retrieval_budget(model);
+    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, top_k.min(4), budget.min(18_000), chunk.min(5_000));
+    let mut outline = String::new();
+    if let Some(dir) = outline_dir {
+        outline = project_outline(&st.cfg, dir).await;
+    }
+    Ok(format!(
+        "{}\n\n{outline}\n\n{retrieved}",
+        coding_preamble(channel)
+    ))
+}
+
+async fn collect_channel_entries(
+    st: &WebState,
+    channel: &str,
+) -> (Vec<ContextEntry>, Option<std::path::PathBuf>) {
     pull_remote_entries(st, channel).await;
     let channel_row = st.db.get_channel(channel).await.ok().flatten();
     let namespaces = channel_row
@@ -1091,13 +1109,14 @@ async fn prompt_for(
         .unwrap_or_else(|| vec![channel.to_string()]);
     let mut merged: HashMap<String, ContextEntry> = HashMap::new();
     let mut outline_dir = project_dir(&st.cfg, channel);
+    let is_pub = channel_is_public(st, channel).await;
     for ns in &namespaces {
         if let Ok(entries) = st.db.load_entries(Some(ns)).await {
             for e in entries {
                 merged.insert(e.id.clone(), e);
             }
         }
-        if channel_is_public(st, channel).await {
+        if is_pub {
             if let Some(url) = master_url(&st.cfg) {
                 if let Ok(env) = hub::query_namespace(url, ns).await {
                     for e in env.entries {
@@ -1134,18 +1153,106 @@ async fn prompt_for(
             }
         }
     }
-    let entries: Vec<_> = merged.into_values().collect();
-    let q_emb = st.models.embed_text(query).await.unwrap_or_default();
-    let (top_k, budget, chunk) = retrieval_budget(model);
-    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, top_k, budget, chunk);
-    let mut outline = String::new();
-    if let Some(dir) = outline_dir {
-        outline = project_outline(&st.cfg, dir).await;
+    (merged.into_values().collect(), outline_dir)
+}
+
+fn parse_read_spec(spec: &str) -> (&str, Option<(usize, usize)>) {
+    let trimmed = spec.trim().trim_start_matches("./");
+    if let Some((path, range)) = trimmed.rsplit_once(':') {
+        if let Some((a, b)) = range.split_once('-') {
+            if let (Ok(start), Ok(end)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                return (path.trim(), Some((start.max(1), end.max(start.max(1)))));
+            }
+        } else if let Ok(line) = range.trim().parse::<usize>() {
+            let s = line.saturating_sub(30).max(1);
+            return (path.trim(), Some((s, line + 60)));
+        }
     }
-    Ok(format!(
-        "{}\n\n{outline}\n\n{retrieved}",
-        coding_preamble(channel)
-    ))
+    (trimmed, None)
+}
+
+fn format_line_slice(text: &str, range: Option<(usize, usize)>, max_chars: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let (start, end) = match range {
+        Some((s, e)) => (s.min(total.max(1)), e.min(total)),
+        None => (1, total),
+    };
+    let mut out = String::new();
+    for idx in start..=end {
+        let Some(line) = lines.get(idx - 1) else { break };
+        let row = format!("{idx:>5}|{line}
+");
+        if out.len() + row.len() > max_chars && !out.is_empty() {
+            out.push_str(&format!("…[truncated at line {idx} of {total}]
+"));
+            break;
+        }
+        out.push_str(&row);
+    }
+    if end < total && !out.contains("…[truncated") {
+        out.push_str(&format!("…[showing lines {start}..{end} of {total}]
+"));
+    }
+    out
+}
+
+async fn repo_read(st: &WebState, channel: &str, spec: &str) -> String {
+    let (req_path, range) = parse_read_spec(spec);
+    if req_path.is_empty() {
+        return "empty file path".into();
+    }
+    let (entries, _) = collect_channel_entries(st, channel).await;
+    let needle = req_path.to_ascii_lowercase();
+    let found = entries
+        .iter()
+        .find(|e| e.source_path.eq_ignore_ascii_case(req_path))
+        .or_else(|| {
+            entries.iter().find(|e| {
+                let p = e.source_path.to_ascii_lowercase();
+                p.ends_with(&format!("/{needle}")) || p == needle
+            })
+        });
+    match found {
+        Some(e) => {
+            let body = format_line_slice(&e.content, range, 7_000);
+            format!("### [CODE: {} @ {}]
+{body}", e.source_path, e.origin_node)
+        }
+        None => format!("File `{req_path}` not found in channel `{channel}`."),
+    }
+}
+
+async fn repo_grep(st: &WebState, channel: &str, pattern: &str) -> String {
+    let needle = pattern.trim();
+    if needle.is_empty() {
+        return "empty search pattern".into();
+    }
+    let needle_low = needle.to_ascii_lowercase();
+    let (entries, _) = collect_channel_entries(st, channel).await;
+    let mut hits = Vec::new();
+    for e in &entries {
+        if e.entry_type != EntryType::Dynamic as i32 || e.source_path.starts_with("@diff:") {
+            continue;
+        }
+        for (idx, line) in e.content.lines().enumerate() {
+            if line.to_ascii_lowercase().contains(&needle_low) {
+                hits.push(format!("{}:{:>5}|{}", e.source_path, idx + 1, line.trim()));
+                if hits.len() >= 40 {
+                    break;
+                }
+            }
+        }
+        if hits.len() >= 40 {
+            break;
+        }
+    }
+    if hits.is_empty() {
+        format!("No matches for `{needle}` in channel `{channel}`.")
+    } else {
+        hits.join("
+")
+    }
 }
 
 fn number_harvest_code(text: &str) -> String {
@@ -1500,34 +1607,48 @@ async fn run_one_reply(
     let started = now_ms();
     let (author, final_text) =
         match dispatch_chat(&st, &model, &ctx, &turns, local_tx.clone(), audit).await {
-            Ok((reply, used)) => {
-                let (clean, tools) = crate::browse::take_requests(&reply);
-                if tools.is_empty() || used == "error" {
-                    (used, reply)
-                } else {
+            Ok((mut reply, mut used)) => {
+                let mut loop_turns = turns.clone();
+                for _step in 0..4 {
+                    let (clean, tools) = crate::browse::take_requests(&reply);
+                    if tools.is_empty() || used == "error" {
+                        break;
+                    }
+                    let status_label = match tools.first().map(|t| t.kind.as_str()) {
+                        Some("read") => format!("Reading {}...", tools[0].query),
+                        Some("grep") => format!("Searching repo for `{}`...", tools[0].query),
+                        _ => "Fetching the web...".into(),
+                    };
                     let _ = local_tx
                         .send(StreamEvent::Status {
-                            text: "Fetching the web...".into(),
+                            text: status_label,
                             model: String::new(),
                         })
                         .await;
-                    let pages = run_lookups(&st, &tools).await;
-                    let mut next = turns.clone();
-                    next.push(ChatTurn {
+                    let pages = run_lookups(&st, &channel, &tools).await;
+                    loop_turns.push(ChatTurn {
                         role: "assistant".into(),
                         text: clean.clone(),
                         attachments: vec![],
                     });
-                    next.push(ChatTurn {
+                    loop_turns.push(ChatTurn {
                         role: "user".into(),
-                        text: format!("Web results:\n{pages}"),
+                        text: format!("Tool results:\n{pages}"),
                         attachments: vec![],
                     });
-                    match dispatch_chat(&st, &model, &ctx, &next, local_tx.clone(), None).await {
-                        Ok((second, used2)) => (used2, second),
-                        Err(err) => (used, format!("{clean}\n\n[web lookup failed: {err:#}]")),
+                    match dispatch_chat(&st, &model, &ctx, &loop_turns, local_tx.clone(), None).await {
+                        Ok((next_reply, next_used)) => {
+                            reply = next_reply;
+                            used = next_used;
+                        }
+                        Err(err) => {
+                            reply = format!("{clean}\n\n[tool lookup failed: {err:#}]");
+                            break;
+                        }
                     }
                 }
+                let (final_clean, _) = crate::browse::take_requests(&reply);
+                (used, if final_clean.is_empty() { reply } else { final_clean })
             }
             Err(err) => {
                 let err_txt = format!("[ERROR] {err:#}");
@@ -3283,8 +3404,9 @@ async fn prefetch_pages(st: &WebState, prompt: &str) -> String {
     for url in crate::browse::urls_in(prompt) {
         let page = run_lookup(
             st,
+            "",
             &crate::browse::Lookup {
-                kind: "fetch",
+                kind: "fetch".into(),
                 query: url.clone(),
             },
         )
@@ -3294,16 +3416,21 @@ async fn prefetch_pages(st: &WebState, prompt: &str) -> String {
     out
 }
 
-async fn run_lookups(st: &WebState, tools: &[crate::browse::Lookup]) -> String {
+async fn run_lookups(st: &WebState, channel: &str, tools: &[crate::browse::Lookup]) -> String {
     let mut out = String::new();
     for tool in tools.iter().take(2) {
-        let page = run_lookup(st, tool).await;
+        let page = run_lookup(st, channel, tool).await;
         out.push_str(&format!("\n### {} {}\n{page}\n", tool.kind, tool.query));
     }
     out
 }
 
-async fn run_lookup(st: &WebState, lookup: &crate::browse::Lookup) -> String {
+async fn run_lookup(st: &WebState, channel: &str, lookup: &crate::browse::Lookup) -> String {
+    match lookup.kind.as_str() {
+        "read" => return repo_read(st, channel, &lookup.query).await,
+        "grep" => return repo_grep(st, channel, &lookup.query).await,
+        _ => {}
+    }
     if let Some(base) = master_http(&st.cfg) {
         if let Some(text) = remote_lookup(base, lookup).await {
             return text;
@@ -3344,7 +3471,7 @@ struct WebBody {
 
 async fn handle_internal_web(Json(body): Json<WebBody>) -> Json<serde_json::Value> {
     let lookup = crate::browse::Lookup {
-        kind: if body.kind == "fetch" { "fetch" } else { "web" },
+        kind: if body.kind == "fetch" { "fetch".into() } else { "web".into() },
         query: body.query,
     };
     let text = crate::browse::run(&lookup)
