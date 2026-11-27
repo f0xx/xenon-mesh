@@ -72,6 +72,10 @@ Web search uses `browse.searx_url` when it is set (`GET /search?format=json`). A
 
 A running reply can be steered. `POST /api/chat/steer` queues a clarification for every model still generating in that channel and thread. The current model call finishes first. The next call reuses the system context already built for that reply. It does not retrieve the project again. At most four clarifications are applied. `POST /api/chat/cancel` with `{channel, thread, model}` stops that model. The timer in the UI stops only after the daemon confirms, and the stored reply is marked `[cancelled]`. Another model in the same turn keeps going. A user message is not cancellable.
 
+A selected model is not replaced when it fails. A 500 or an empty reply stays on that model and is stored as an error. The previous sibling fallback was answering as a model nobody selected and loading a second set of weights onto a full GPU.
+
+A reasoning model often hides ```read and ```grep fences in its private trace. Those fences are copied into the visible reply so the daemon can fetch the file. The prompt ends by telling the model to ask for a missing file instead of inventing one.
+
 Roles stored in history are the literal author (`user` or `provider/model`). They are mapped per protocol: Gemini wants `user` and `model`, and consecutive turns of the same role are merged; OpenAI-compatible and Ollama want `user` and `assistant`. A non-generic author is prefixed on the Gemini turn so the collapsed role still shows who spoke.
 
 When `models.debate_max_rounds` is greater than 0 and the UI debate box is checked, the selected models answer in parallel and then critique each other, one at a time, for that many rounds. A round ends the debate only when every surviving model starts its reply with `CONSENSUS:`. That text can be distilled into a learned note. A failed model drops out. The checkbox stays hidden while the cap is 0.

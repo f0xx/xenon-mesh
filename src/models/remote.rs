@@ -495,6 +495,7 @@ pub async fn ollama_stream(
         return Err(error_from(resp).await);
     }
     let mut full = String::new();
+    let mut thoughts = String::new();
     let mut buf = String::new();
     let mut resp = resp;
     loop {
@@ -521,6 +522,7 @@ pub async fn ollama_stream(
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 let (content, thinking, _done) = ollama_parts(&v);
                 if !thinking.is_empty() {
+                    thoughts.push_str(&thinking);
                     emit(tx, StreamEvent::Thought { text: thinking, model: String::new() }).await;
                 }
                 if !content.is_empty() {
@@ -530,6 +532,11 @@ pub async fn ollama_stream(
             }
         }
     }
+    if let Some(extra) = missed_tool_fences(&full, &thoughts) {
+        full.push('\n');
+        full.push_str(&extra);
+        emit(tx, StreamEvent::Delta { text: format!("\n{extra}"), model: String::new() }).await;
+    }
     Ok(full)
 }
 
@@ -537,14 +544,23 @@ async fn emit(tx: &tokio::sync::mpsc::Sender<StreamEvent>, ev: StreamEvent) {
     let _ = tx.send(ev).await;
 }
 
-fn apply_openai_data(data: &str, full: &mut String, pending: &mut Vec<StreamEvent>) {
+fn apply_openai_data(
+    data: &str,
+    full: &mut String,
+    thoughts: &mut String,
+    pending: &mut Vec<StreamEvent>,
+) {
     if data == "[DONE]" {
         return;
     }
     if let Ok(v) = serde_json::from_str::<Value>(data) {
         let (content, reasoning) = openai_delta_parts(&v);
         if !reasoning.is_empty() {
-            pending.push(StreamEvent::Thought { text: reasoning, model: String::new() });
+            thoughts.push_str(&reasoning);
+            pending.push(StreamEvent::Thought {
+                text: reasoning,
+                model: String::new(),
+            });
         }
         if !content.is_empty() {
             full.push_str(&content);
@@ -559,6 +575,7 @@ async fn read_openai_sse(
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<String> {
     let mut full = String::new();
+    let mut thoughts = String::new();
     let mut buf = String::new();
     loop {
         let chunk = match next_chunk(&mut resp, idle).await {
@@ -578,14 +595,14 @@ async fn read_openai_sse(
         };
         let mut pending = Vec::new();
         feed_sse(&mut buf, &String::from_utf8_lossy(&chunk), |data| {
-            apply_openai_data(data, &mut full, &mut pending);
+            apply_openai_data(data, &mut full, &mut thoughts, &mut pending);
         });
         // Some servers send one JSON object, or NDJSON, instead of SSE.
         while let Some(pos) = buf.find('\n') {
             let line = buf[..pos].trim().to_string();
             buf.drain(..=pos);
             if line.starts_with('{') {
-                apply_openai_data(&line, &mut full, &mut pending);
+                apply_openai_data(&line, &mut full, &mut thoughts, &mut pending);
             }
         }
         for ev in pending {
@@ -595,18 +612,42 @@ async fn read_openai_sse(
     let tail = buf.trim();
     if let Some(rest) = tail.strip_prefix("data:") {
         let mut pending = Vec::new();
-        apply_openai_data(rest.trim(), &mut full, &mut pending);
+        apply_openai_data(rest.trim(), &mut full, &mut thoughts, &mut pending);
         for ev in pending {
             emit(tx, ev).await;
         }
     } else if full.is_empty() && tail.starts_with('{') {
         let mut pending = Vec::new();
-        apply_openai_data(tail, &mut full, &mut pending);
+        apply_openai_data(tail, &mut full, &mut thoughts, &mut pending);
         for ev in pending {
             emit(tx, ev).await;
         }
     }
+    if let Some(extra) = missed_tool_fences(&full, &thoughts) {
+        full.push('\n');
+        full.push_str(&extra);
+        emit(
+            tx,
+            StreamEvent::Delta {
+                text: format!("\n{extra}"),
+                model: String::new(),
+            },
+        )
+        .await;
+    }
     Ok(full)
+}
+
+fn missed_tool_fences(answer: &str, thoughts: &str) -> Option<String> {
+    if thoughts.is_empty() || !crate::browse::tool_fence_text(answer).is_empty() {
+        return None;
+    }
+    let extra = crate::browse::tool_fence_text(thoughts);
+    if extra.trim().is_empty() {
+        None
+    } else {
+        Some(extra)
+    }
 }
 
 pub async fn detect_kind(http: &Client, base: &str, openapi_url: &str) -> Result<ConcreteKind> {

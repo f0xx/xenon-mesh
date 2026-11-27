@@ -145,6 +145,41 @@ pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
     (kept.trim().to_string(), tools)
 }
 
+/// Tool fences buried in a reasoning trace. The visible reply often omits them.
+pub fn tool_fence_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        let lang_end = after.find('\n').unwrap_or(after.len());
+        let lang = after[..lang_end].trim().to_ascii_lowercase();
+        let keep = matches!(
+            lang.as_str(),
+            "read" | "file" | "grep" | "find" | "web" | "search" | "fetch" | "url" | "agent"
+                | "delegate"
+        );
+        let body_from = if after[..lang_end].contains('\n') {
+            lang_end + 1
+        } else {
+            lang_end
+        };
+        let body = &after[body_from..];
+        let Some(close) = body.find("```") else {
+            break;
+        };
+        let next = &body[close + 3..];
+        if keep {
+            let block_end = rest.len() - next.len();
+            out.push_str(&rest[start..block_end]);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        rest = next;
+    }
+    out
+}
+
 pub async fn search(query: &str, searx_url: &str) -> Result<String> {
     let base = searx_url.trim().trim_end_matches('/');
     if !base.is_empty() {
@@ -437,6 +472,15 @@ mod tests {
         let text = "давай http://example.com/a и ещё";
         assert_eq!(urls_in(text), vec!["http://example.com/a".to_string()]);
         assert!(urls_in("привет, без ссылки").is_empty());
+    }
+
+    #[test]
+    fn reasoning_can_hide_a_read_fence() {
+        let hidden = "I should look.\n```read\nsrc/lib.rs:1-20\n```\nthen answer";
+        let lifted = tool_fence_text(hidden);
+        assert!(lifted.contains("```read"));
+        assert!(lifted.contains("src/lib.rs:1-20"));
+        assert!(tool_fence_text("```cpp\nint x;\n```").is_empty());
     }
 
     #[test]

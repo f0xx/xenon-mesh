@@ -361,22 +361,12 @@ fn split_ref<'a>(providers: &[ProviderState], requested: &'a str) -> (&'a str, &
 }
 
 fn candidates(provider: &ProviderState, model: &str) -> Vec<String> {
-    let mut out = vec![model.to_string()];
-    let mut rest: Vec<String> = provider
-        .models
-        .iter()
-        .filter(|m| m.as_str() != model)
-        .cloned()
-        .collect();
-    if provider.coding_bias {
-        rest.sort_by_key(|m| Reverse(coding_rank(m)));
-    }
-    for m in rest.into_iter().take(2) {
-        if !out.contains(&m) {
-            out.push(m);
-        }
-    }
-    out
+    // A named model stays that model. Swapping in a sibling after a 500 loaded
+    // a second large model onto a full GPU and answered as someone the user
+    // did not select. `provider` is kept so a future explicit fallback policy
+    // still sees the catalog.
+    let _ = provider;
+    vec![model.to_string()]
 }
 
 impl ModelHub {
@@ -678,7 +668,7 @@ impl ModelHub {
             }
             let result = self.one(&provider, m, &system, turns, tx.as_ref()).await;
             match result {
-                Ok(text) => {
+                Ok(text) if !text.trim().is_empty() && text.trim() != "</think>" => {
                     if let Some(tx) = &tx {
                         let _ = tx
                             .send(StreamEvent::Done {
@@ -688,6 +678,10 @@ impl ModelHub {
                             .await;
                     }
                     return Ok((text, format!("{}/{}", provider.id, m)));
+                }
+                Ok(_) => {
+                    last_err = format!("{m} returned an empty reply");
+                    break;
                 }
                 Err(err) => {
                     last_err = err.to_string();
@@ -858,6 +852,37 @@ fn embed_target(state: &ModelState) -> Option<(ProviderState, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_named_model_is_not_swapped_for_a_sibling() {
+        let provider = ProviderState {
+            id: "creative".into(),
+            host: "creative".into(),
+            kind: ConcreteKind::OpenAi,
+            configured_kind: "openai".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            api_key_env: String::new(),
+            chat_model: String::new(),
+            embed_model: String::new(),
+            models: vec![
+                "deepseek-r1:14b".into(),
+                "qwen2.5:14b-instruct-q4_K_M".into(),
+            ],
+            coding_bias: true,
+            timeout: Duration::from_secs(30),
+            openapi_url: String::new(),
+            discover: true,
+            command: Vec::new(),
+            user_agent: String::new(),
+            api_key: String::new(),
+            sampling: Sampling::default(),
+            proxied: false,
+        };
+        assert_eq!(
+            candidates(&provider, "deepseek-r1:14b"),
+            vec!["deepseek-r1:14b".to_string()]
+        );
+    }
 
     #[test]
     fn coding_rank_prefers_coder_models() {

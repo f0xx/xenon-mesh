@@ -1214,6 +1214,11 @@ async fn prompt_for(
         outline = project_outline(&st.cfg, dir).await;
     }
     let mut text = format!("{}\n\n{outline}\n\n{retrieved}", coding_preamble(channel));
+    text.push_str(
+        "\n\nThe slice above is not the whole project. If a file or symbol you need is missing, \
+         reply with only ```read or ```grep fences and stop. Do not invent filenames, APIs, or \
+         code you were not shown. Put those fences in the visible reply, not only in private reasoning.\n",
+    );
     if crate::calendar::wants_agenda(query) {
         if let Some(agenda) = load_agenda(&st.cfg).await {
             text.push_str("\n\n## Agenda\n");
