@@ -42,6 +42,7 @@ The hub table `audit_events` records public and shared activity:
 | `channel.share` / `channel.join` | Membership changes |
 | `task.execute` | An approved diff or pipeline runs |
 | `git.push` / `git.force_push` | A pipeline whose argv is `git push`. The detail stores the ref, the sha before, the sha after, and `force`. Force is `--force`, `--force-with-lease`, a `+refspec`, or `git_force: true` on the pipeline |
+| `adapt.lora` | A pipeline printed `XMESH_LORA`. The detail is the adapter name and the pair count. The selected chat model is unchanged |
 
 Private channel traffic is not written there. The log is how the lab answers "which node asked the hub to do this" after a force-push pipeline or a public chat. It is not a substitute for git reflogs. The node id is the label the caller sent.
 

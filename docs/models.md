@@ -78,7 +78,7 @@ A reasoning model often hides ```read and ```grep fences in its private trace. T
 
 Roles stored in history are the literal author (`user` or `provider/model`). They are mapped per protocol: Gemini wants `user` and `model`, and consecutive turns of the same role are merged; OpenAI-compatible and Ollama want `user` and `assistant`. A non-generic author is prefixed on the Gemini turn so the collapsed role still shows who spoke.
 
-When `models.debate_max_rounds` is greater than 0 and the UI debate box is checked, the selected models answer in parallel and then critique each other, one at a time, for that many rounds. A round ends the debate only when every surviving model starts its reply with `CONSENSUS:`. That text can be distilled into a learned note. A failed model drops out. The checkbox stays hidden while the cap is 0.
+When `models.debate_max_rounds` is greater than 0 and the UI debate box is checked, the selected models answer in parallel and then critique each other, one at a time, for that many rounds. A round ends the debate only when every surviving model starts its reply with `CONSENSUS:`. That text can be distilled into a learned note. A failed model drops out. The checkbox stays hidden while the cap is 0. A debate by itself does not become a preference pair. The operator marks Useful or Avoid on a reply. See [adaptation.md](adaptation.md).
 
 ## DR-22. Probe
 

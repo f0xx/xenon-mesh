@@ -16,6 +16,7 @@ enum EntryType
   ENTRY_TYPE_DYNAMIC = 1;
   ENTRY_TYPE_PINNED = 2;
   ENTRY_TYPE_LEARNED = 3;
+  ENTRY_TYPE_EXEMPLAR = 4;
 }
 
 message ContextEntry

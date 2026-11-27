@@ -4,13 +4,13 @@ Schema version on the wire is 2. Protobuf field numbers only grow, so a version 
 
 ## DR-23. Tables
 
-`context_entries` holds source chunks, pins, and learned notes.
+`context_entries` holds source chunks, pins, learned notes, and exemplars. `preference_pairs` and `entry_stats` stay on the daemon that recorded the vote. They are not in the sync envelope.
 
 | Column | Notes |
 | --- | --- |
 | `id` | BLAKE3 hex, primary key |
 | `namespace` | Channel or repository name |
-| `entry_type` | 1 dynamic, 2 pinned, 3 learned. Pinned rows are not replaced unless the write sets force |
+| `entry_type` | 1 dynamic, 2 pinned, 3 learned, 4 exemplar. Pinned rows are not replaced unless the write sets force |
 | `embedding` | Raw little-endian `f32` bytes. Empty when embeddings are off |
 | `origin_node` | `node.id` of the writer |
 
@@ -63,6 +63,9 @@ The UI is `GET /`. JSON routes:
 | `POST` | `/api/chat` | SSE. `agentic: false` stores the message and does not call a model. The field defaults to true. A `status` event whose text is `cancelled` means that model stopped |
 | `POST` | `/api/chat/cancel` | `{channel, thread, model}` stops that pending agent reply. `409` when nothing is running |
 | `POST` | `/api/chat/steer` | `{channel, thread, text, model?}`. `model` empty steers every running reply in the thread. Applied after the current call, same context. `409` when nothing is running |
+| `POST` | `/api/chat/feedback` | `{channel, thread, seq, vote, note}`. `vote` is `1` or `-1` on a model reply. A note becomes a learned entry. An upvote that contains a diff fence becomes an exemplar |
+| `GET` | `/api/preferences?channel=` | Preference pairs on this daemon. Does not mark them exported |
+| `POST` | `/api/preferences/export` | `{channel}` returns `{count, jsonl}` and stamps rows that were not yet exported |
 | `GET`/`POST` | `/api/internal/load` | In-flight reply counts. Daemons post `{node, inflight, capacity, models, updated_ms}`. The hub is the board |
 | `POST` | `/api/internal/delegate` | `{model, task}` runs one sub-agent. `429` when this daemon is at `models.max_inflight`. `403` when sub-agents are off |
 | `GET` | `/api/memory?channel=` | Pins and learned notes |

@@ -34,6 +34,28 @@ CREATE TABLE IF NOT EXISTS channels (
     updated_at_ms BIGINT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS preference_pairs (
+    id VARCHAR(64) PRIMARY KEY,
+    channel_id VARCHAR(128) NOT NULL,
+    thread_id VARCHAR(128) NOT NULL,
+    prompt_seq BIGINT NOT NULL,
+    prompt TEXT NOT NULL,
+    chosen_seq BIGINT NOT NULL,
+    rejected_seq BIGINT NOT NULL,
+    chosen TEXT NOT NULL,
+    rejected TEXT NOT NULL,
+    source VARCHAR(32) NOT NULL,
+    exported_at_ms BIGINT NOT NULL DEFAULT 0,
+    created_at_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pref_channel ON preference_pairs(channel_id, exported_at_ms);
+
+CREATE TABLE IF NOT EXISTS entry_stats (
+    id VARCHAR(64) PRIMARY KEY,
+    score INTEGER NOT NULL,
+    hits INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS threads (
     channel_id VARCHAR(128) NOT NULL,
     thread_id VARCHAR(128) NOT NULL,

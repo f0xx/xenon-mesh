@@ -29,6 +29,7 @@ A missing `schema` key means v1. `schema: 1` and `schema: v1` are the same. Any 
 | `deploy_pipelines` | empty | map of name → pipeline |
 | `calendar` | empty | read-only iCalendar feed, below |
 | `browse` | empty | optional SearxNG origin, below |
+| `adapt` | empty | learned-note decay, below |
 
 ```yaml
 schema: 1
@@ -216,6 +217,14 @@ calendar:
   ics_url: "https://calendar.example/team.ics"
   token_env: "XMESH_CALENDAR_TOKEN"
 ```
+
+## `adapt`
+
+Empty means learned notes and exemplars do not age. `learned_half_life_days` above zero halves a note's utility after that many days from `updated_at_ms`. A score below -3 is already omitted. See [adaptation.md](adaptation.md).
+
+| Key | Default | Format |
+| --- | --- | --- |
+| `learned_half_life_days` | `0` | number of days |
 
 ## `browse`
 

@@ -35,6 +35,7 @@ Packaging sketches for Gentoo, Debian, and Alpine live in [`packaging/`](packagi
 | [docs/security.md](docs/security.md) | Trust boundary, channels, audit, and what the daemon does not authenticate |
 | [docs/integrations.md](docs/integrations.md) | Proposed company tools around the chat, not shipped adapters |
 | [docs/remote-access.md](docs/remote-access.md) | Reach a hub over SSH local forwards |
+| [docs/adaptation.md](docs/adaptation.md) | Votes, exemplars, and optional LoRA export |
 | [docs/roadmap.md](docs/roadmap.md) | What is in the tree and what comes later |
 
 Read [docs/purpose.md](docs/purpose.md) first if you are changing behavior. Read [docs/operations.md](docs/operations.md) if you are installing a machine.

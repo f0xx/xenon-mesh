@@ -88,6 +88,24 @@ pub struct AppConfig {
     /// Optional SearxNG base URL. Empty keeps the DuckDuckGo HTML search.
     #[serde(default)]
     pub browse: BrowseSection,
+    /// Learned-note decay. Omitted means notes do not age out.
+    #[serde(default)]
+    pub adapt: AdaptSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdaptSection {
+    /// Days for a learned note's utility to fall by half. `0` disables decay.
+    pub learned_half_life_days: f32,
+}
+
+impl Default for AdaptSection {
+    fn default() -> Self {
+        Self {
+            learned_half_life_days: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

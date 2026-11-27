@@ -136,7 +136,7 @@
   <b data-i18n="memTitle">CONTEXT & MEMORY</b>
   <input id="mTitle" data-i18n-ph="keyPh">
   <textarea id="mText" style="flex:none;height:54px" data-i18n-ph="memPh"></textarea>
-  <div style="display:flex;gap:6px"><button onclick="saveMem(true)" data-i18n="pinBtn">Pin Raw</button><button onclick="saveMem(false)" data-i18n="learnBtn">Distill Learn</button></div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap"><button onclick="saveMem(true)" data-i18n="pinBtn">Pin Raw</button><button onclick="saveMem(false)" data-i18n="learnBtn">Distill Learn</button><button onclick="exportVotes()">Export votes</button></div>
   <div id="memList" style="max-height:95px;overflow-y:auto;background:#0b0d10;border:1px solid #2d3748;padding:4px;font-size:12px"></div>
   <hr style="border-color:#2d3748;width:100%">
   <b data-i18n="deployTitle">DIFF INSPECTOR & DEPLOY</b>
@@ -463,7 +463,7 @@ async function loadHistory() {
   const rows = await (await fetch(`/api/history?channel=${encodeURIComponent(forCh)}&thread=${encodeURIComponent(forTh)}`)).json();
   if (gen !== histGen || ch !== forCh || thread !== forTh) return;
   if (!Array.isArray(rows)) return;
-  const key = forCh + '|' + forTh + '|' + rows.map(m => `${m.seq}:${m.text.length}:${m.edited_at_ms || 0}:${m.reply_thread || ''}:${m.thread_total || 0}:${m.thread_unread || 0}:${m.finished_at_ms || 0}`).join(',');
+  const key = forCh + '|' + forTh + '|' + rows.map(m => `${m.seq}:${m.text.length}:${m.edited_at_ms || 0}:${m.reply_thread || ''}:${m.thread_total || 0}:${m.thread_unread || 0}:${m.finished_at_ms || 0}:${m.vote || 0}`).join(',');
   if (key === histKey && log.childElementCount) return;
   histKey = key;
   log.innerHTML = '';
@@ -648,6 +648,30 @@ function armTick(node, started) {
 }
 window.addEventListener('pagehide', disarmTick);
 const deep = Object.fromEntries(new URLSearchParams(location.search));
+function modelAuthor(who) {
+  if (!who || who === 'system' || who === 'deploy') return false;
+  if (who.indexOf('/') >= 0) return true;
+  return who === 'assistant' || who === 'model' || who === 'bot' || who === 'error';
+}
+async function voteMessage(seq, vote) {
+  const r = await fetch('/api/chat/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread, seq, vote, note: '' }) });
+  if (!r.ok) return;
+  histKey = '';
+  await loadHistory();
+}
+async function exportVotes() {
+  const r = await fetch('/api/preferences/export', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch }) });
+  if (!r.ok) return;
+  const data = await r.json();
+  if (!data.count) {
+    memList.insertAdjacentHTML('afterbegin', '<div style="color:#718096">no voted pairs yet</div>');
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([data.jsonl || ''], { type: 'application/x-ndjson' }));
+  a.download = 'preferences.jsonl';
+  a.click();
+}
 function appendBubble(who, txt, ts, seq, edited, meta) {
   meta = meta || {};
   const box = document.createElement('div');
@@ -708,7 +732,17 @@ function appendBubble(who, txt, ts, seq, edited, meta) {
   if (seq) {
     const tools = document.createElement('div');
     tools.className = 'msgtools';
-    [['Link', () => copyPermalink(seq)], ['Thread', () => replyInThread(seq)], ['Repeat', () => send(txt)], ['Edit', () => editMessage(seq, txt)], ['Clone', () => cloneMessage(seq, 'from')], ['Debug', () => debugMessage(seq)], ['Hide', () => hideMessage(seq)]].filter(item => item[0] !== 'Thread' || thread === 'main')
+    const toolItems = [['Link', () => copyPermalink(seq)], ['Thread', () => replyInThread(seq)], ['Repeat', () => send(txt)], ['Edit', () => editMessage(seq, txt)], ['Clone', () => cloneMessage(seq, 'from')], ['Debug', () => debugMessage(seq)], ['Hide', () => hideMessage(seq)]].filter(item => item[0] !== 'Thread' || thread === 'main');
+    if (modelAuthor(who)) {
+      [['Useful', 1], ['Avoid', -1]].forEach(([label, vote]) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        if (meta.vote === vote) b.style.color = vote > 0 ? '#68d391' : '#fc8181';
+        b.onclick = () => voteMessage(seq, vote);
+        tools.appendChild(b);
+      });
+    }
+    toolItems.filter(item => item[0] !== 'Thread' || thread === 'main')
       .filter(Boolean)
       .forEach(([label, fn]) => {
         const b = document.createElement('button');

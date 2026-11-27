@@ -9,14 +9,19 @@ use std::collections::HashSet;
 pub const ENTRY_DYNAMIC: i32 = 1;
 pub const ENTRY_PINNED: i32 = 2;
 pub const ENTRY_LEARNED: i32 = 3;
+pub const ENTRY_EXEMPLAR: i32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
+    pub id: String,
     pub entry_type: i32,
     pub source_path: String,
     pub origin: String,
     pub content: String,
     pub embedding: Vec<f32>,
+    /// Multiplier for a learned note. Below 0.2 the note is omitted.
+    pub utility: f32,
+    pub updated_at_ms: i64,
 }
 
 pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -41,6 +46,32 @@ pub fn tokens(text: &str) -> HashSet<String> {
         .filter(|t| t.len() >= 2)
         .map(|t| t.to_ascii_lowercase())
         .collect()
+}
+
+/// Cosine when dimensions match, mixed with token overlap. Lexical only otherwise.
+pub fn rank_score(
+    query: &str,
+    content: &str,
+    path: &str,
+    embedding: &[f32],
+    query_emb: &[f32],
+) -> f32 {
+    let lexical = lexical_score(query, content).max(lexical_score(query, path));
+    if !query_emb.is_empty() && embedding.len() == query_emb.len() && !embedding.is_empty() {
+        let dense = cosine_sim(embedding, query_emb).max(0.0);
+        0.7 * dense + 0.3 * lexical
+    } else {
+        lexical
+    }
+}
+
+/// `half_life_days` of 0, or a missing timestamp, leaves utility unchanged.
+pub fn decayed_utility(utility: f32, updated_at_ms: i64, now_ms: i64, half_life_days: f32) -> f32 {
+    if half_life_days <= 0.0 || updated_at_ms <= 0 || now_ms <= updated_at_ms {
+        return utility;
+    }
+    let days = (now_ms - updated_at_ms) as f32 / 86_400_000.0;
+    utility * (-std::f32::consts::LN_2 * days / half_life_days).exp()
 }
 
 pub fn lexical_score(query: &str, content: &str) -> f32 {
@@ -96,6 +127,12 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn remember(touched: &mut Vec<String>, entry: &PromptEntry) {
+    if !entry.id.is_empty() {
+        touched.push(entry.id.clone());
+    }
+}
+
 fn is_always_included(entry: &PromptEntry) -> bool {
     entry.entry_type == ENTRY_PINNED || entry.source_path.starts_with("@diff:")
 }
@@ -106,6 +143,8 @@ fn is_always_included(entry: &PromptEntry) -> bool {
 /// are always included and do not consume `top_k`. Learned notes are ranked
 /// against the question and at most five that overlap it are included.
 /// `chunk_chars` is the per-file cap for numbered source.
+/// Learned notes are at most five. Exemplars, verified diffs from an
+/// upvoted reply, are at most two. `used` receives the ids of those notes.
 pub fn assemble_context(
     entries: &[PromptEntry],
     query: &str,
@@ -113,6 +152,7 @@ pub fn assemble_context(
     top_k: usize,
     char_budget: usize,
     chunk_chars: usize,
+    touched: &mut Vec<String>,
 ) -> String {
     let mut blocks: Vec<String> = Vec::new();
     let mut used = 0usize;
@@ -139,18 +179,12 @@ pub fn assemble_context(
         );
     }
 
-    let embeddings_ok = !query_emb.is_empty();
     let mut learned: Vec<(f32, &PromptEntry)> = entries
         .iter()
-        .filter(|e| e.entry_type == ENTRY_LEARNED)
+        .filter(|e| e.entry_type == ENTRY_LEARNED && e.utility >= 0.2)
         .map(|e| {
-            let s =
-                if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty()
-                {
-                    cosine_sim(&e.embedding, query_emb)
-                } else {
-                    lexical_score(query, &e.content).max(lexical_score(query, &e.source_path))
-                };
+            let s = rank_score(query, &e.content, &e.source_path, &e.embedding, query_emb)
+                * e.utility;
             (s, e)
         })
         .collect();
@@ -165,11 +199,44 @@ pub fn assemble_context(
             break;
         }
         let body = truncate(&e.content, 1_500);
+        let heading = if e.content.trim_start().starts_with("[AVOID]") {
+            "LEARNED ANTI-PATTERN"
+        } else {
+            "LEARNED PATTERN"
+        };
         push(
             &mut blocks,
             &mut used,
-            format!("### [LEARNED] {}\n{body}", e.source_path),
+            format!("### [{heading}] {}\n{body}", e.source_path),
         );
+        remember(touched, e);
+    }
+
+    let mut exemplars: Vec<(f32, &PromptEntry)> = entries
+        .iter()
+        .filter(|e| e.entry_type == ENTRY_EXEMPLAR && e.utility >= 0.2)
+        .map(|e| {
+            let s = rank_score(query, &e.content, &e.source_path, &e.embedding, query_emb)
+                * e.utility;
+            (s, e)
+        })
+        .collect();
+    exemplars.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, e) in exemplars
+        .into_iter()
+        .filter(|(score, _)| query_blank || *score > 0.0)
+        .take(if query_blank { 1 } else { 2 })
+    {
+        if used >= char_budget {
+            break;
+        }
+        let body = truncate(&e.content, 2_000);
+        push(
+            &mut blocks,
+            &mut used,
+            format!("### [EXEMPLAR] {}\n{body}", e.source_path),
+        );
+        remember(touched, e);
     }
 
     let mut ranked: Vec<(f32, &PromptEntry)> = Vec::new();
@@ -182,13 +249,7 @@ pub fn assemble_context(
         let file_name = path_lower.rsplit('/').next().unwrap_or(&path_lower);
         let explicit_mention = (!path_lower.is_empty() && q_lower.contains(&path_lower))
             || (file_name.len() >= 4 && file_name.contains('.') && q_lower.contains(file_name));
-        let lexical = lexical_score(query, &e.content).max(lexical_score(query, &e.source_path));
-        let base_score =
-            if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty() {
-                cosine_sim(&e.embedding, query_emb)
-            } else {
-                lexical
-            };
+        let base_score = rank_score(query, &e.content, &e.source_path, &e.embedding, query_emb);
         let score = if explicit_mention {
             base_score + 2.0
         } else {
@@ -285,11 +346,14 @@ pub fn map_entries<'a>(
     entries
         .into_iter()
         .map(|e| PromptEntry {
+            id: e.id.clone(),
             entry_type: e.entry_type,
             source_path: e.source_path.clone(),
             origin: e.origin_node.clone(),
             content: e.content.clone(),
             embedding: e.embedding.clone(),
+            utility: 1.0,
+            updated_at_ms: e.updated_at_ms,
         })
         .collect()
 }
@@ -300,11 +364,14 @@ mod tests {
 
     fn entry(kind: i32, path: &str, content: &str) -> PromptEntry {
         PromptEntry {
+            id: String::new(),
             entry_type: kind,
             source_path: path.into(),
             origin: "node".into(),
             content: content.into(),
             embedding: vec![],
+            utility: 1.0,
+            updated_at_ms: 0,
         }
     }
 
@@ -349,6 +416,7 @@ mod tests {
             1,
             20_000,
             6_000,
+            &mut Vec::new(),
         );
         assert!(ctx.contains("PINNED"));
         assert!(ctx.contains("never disable auth"));
@@ -371,6 +439,7 @@ mod tests {
             4,
             20_000,
             6_000,
+            &mut Vec::new(),
         );
         assert!(ctx.contains("README.md"), "{ctx}");
         assert!(ctx.contains("src/main.rs"), "{ctx}");
@@ -389,6 +458,7 @@ mod tests {
             1,
             20_000,
             6_000,
+            &mut Vec::new(),
         );
         assert!(ctx.contains("src/a.rs"));
         assert!(!ctx.contains("src/b.rs"));
@@ -400,7 +470,7 @@ mod tests {
             entry(ENTRY_DYNAMIC, "src/other.rs", "executor apply diff"),
             entry(ENTRY_DYNAMIC, "src/executor.rs", "zzzz"),
         ];
-        let ctx = assemble_context(&entries, "look at executor.rs", &[], 1, 20_000, 6_000);
+        let ctx = assemble_context(&entries, "look at executor.rs", &[], 1, 20_000, 6_000, &mut Vec::new());
         assert!(ctx.contains("src/executor.rs"), "{ctx}");
         assert!(!ctx.contains("src/other.rs"), "{ctx}");
     }
@@ -411,8 +481,84 @@ mod tests {
             entry(ENTRY_LEARNED, "memory/auth", "never disable auth checks"),
             entry(ENTRY_LEARNED, "memory/paint", "pixels use a linear buffer"),
         ];
-        let ctx = assemble_context(&entries, "auth checks", &[], 5, 20_000, 6_000);
+        let ctx = assemble_context(&entries, "auth checks", &[], 5, 20_000, 6_000, &mut Vec::new());
+        assert!(ctx.contains("LEARNED PATTERN"), "{ctx}");
         assert!(ctx.contains("never disable auth"), "{ctx}");
         assert!(!ctx.contains("linear buffer"), "{ctx}");
+    }
+
+    #[test]
+    fn an_identifier_outranks_a_weak_embedding() {
+        let mut conceptual = entry(ENTRY_DYNAMIC, "src/a.rs", "zzzz unrelated words");
+        conceptual.embedding = vec![0.4, 1.0];
+        let mut named = entry(
+            ENTRY_DYNAMIC,
+            "src/b.rs",
+            "verify task sig checks the hmac",
+        );
+        named.embedding = vec![0.0, 1.0];
+        let ctx = assemble_context(
+            &[conceptual, named],
+            "verify task sig",
+            &[1.0, 0.0],
+            1,
+            20_000,
+            6_000,
+            &mut Vec::new(),
+        );
+        assert!(ctx.contains("src/b.rs"), "{ctx}");
+        assert!(!ctx.contains("src/a.rs"), "{ctx}");
+    }
+
+    #[test]
+    fn an_avoid_note_is_labeled_and_a_weak_note_is_dropped() {
+        let mut weak = entry(ENTRY_LEARNED, "memory/old", "auth checks stay on");
+        weak.utility = 0.1;
+        let avoid = entry(ENTRY_LEARNED, "memory/fail", "[AVOID] do not invent headers");
+        let ctx = assemble_context(
+            &[weak, avoid],
+            "invent headers",
+            &[],
+            5,
+            20_000,
+            6_000,
+            &mut Vec::new(),
+        );
+        assert!(ctx.contains("LEARNED ANTI-PATTERN"), "{ctx}");
+        assert!(!ctx.contains("auth checks stay"), "{ctx}");
+    }
+
+    #[test]
+    fn utility_halves_after_one_half_life() {
+        let updated = 1_000_000_i64;
+        let later = updated + 10 * 86_400_000;
+        let score = decayed_utility(1.0, updated, later, 10.0);
+        assert!((score - 0.5).abs() < 1e-5, "{score}");
+        assert_eq!(decayed_utility(1.0, updated, later, 0.0), 1.0);
+    }
+
+    #[test]
+    fn an_upvoted_diff_is_an_exemplar_when_the_question_overlaps() {
+        let mut kept = entry(
+            ENTRY_EXEMPLAR,
+            "memory/exemplar-3",
+            "Task: fix the parser\n\ndiff --git a/src/parser.rs",
+        );
+        kept.id = "ex1".into();
+        let other = entry(ENTRY_EXEMPLAR, "memory/exemplar-9", "Task: paint pixels");
+        let mut used = Vec::new();
+        let ctx = assemble_context(
+            &[kept, other],
+            "fix the parser",
+            &[],
+            2,
+            20_000,
+            6_000,
+            &mut used,
+        );
+        assert!(ctx.contains("EXEMPLAR"), "{ctx}");
+        assert!(ctx.contains("src/parser.rs"), "{ctx}");
+        assert!(!ctx.contains("paint pixels"), "{ctx}");
+        assert_eq!(used, vec!["ex1".to_string()]);
     }
 }

@@ -2,7 +2,9 @@ use crate::config::{AppConfig, NodeMode};
 use crate::git_sync::{discover_bare_repos, scan_bare_repo, scan_workdir};
 use crate::hub;
 use crate::models::{Attachment, ChatTurn, ModelChoice, ModelHub, StreamEvent};
-use crate::retrieve::{assemble_context, coding_preamble, map_entries};
+use crate::retrieve::{
+    assemble_context, coding_preamble, decayed_utility, map_entries, ENTRY_EXEMPLAR, ENTRY_LEARNED,
+};
 use crate::storage::pb::cluster_service_client::ClusterServiceClient;
 use crate::storage::pb::{ContextEntry, EntryType, NodeTaskRequest, SessionMessage, SyncEnvelope};
 use crate::storage::{
@@ -171,6 +173,9 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/chat", post(handle_persistent_chat))
         .route("/api/chat/cancel", post(handle_cancel))
         .route("/api/chat/steer", post(handle_steer))
+        .route("/api/chat/feedback", post(handle_feedback))
+        .route("/api/preferences", get(handle_preferences))
+        .route("/api/preferences/export", post(handle_preferences_export))
         .route(
             "/api/internal/load",
             get(handle_load_get).post(handle_load_post),
@@ -692,6 +697,7 @@ async fn handle_history(
                     reply_thread: if linked { child } else { String::new() },
                     thread_total: if linked { total.max(0) as u64 } else { 0 },
                     thread_unread: if linked { unread.max(0) as u64 } else { 0 },
+                    vote: m.vote,
                 }
             })
             .collect(),
@@ -716,6 +722,8 @@ struct HistoryItem {
     thread_total: u64,
     #[serde(default)]
     thread_unread: u64,
+    #[serde(default)]
+    vote: i32,
 }
 
 async fn handle_list_threads(
@@ -843,6 +851,15 @@ async fn handle_approve(
                 "new": git.get("new").cloned().unwrap_or(serde_json::Value::String(String::new()))
             });
         }
+    }
+    if let Some(lora) = crate::adapt::parse_lora_marker(&res.stdout_log) {
+        action = "adapt.lora";
+        detail = serde_json::json!({
+            "pipeline": pipeline_name,
+            "exit": res.exit_code,
+            "adapter": lora.get("adapter_name").cloned().unwrap_or(serde_json::Value::Null),
+            "pairs_used": lora.get("pairs_used").cloned().unwrap_or(serde_json::Value::Null)
+        });
     }
     publish_audit(&st, action, &repo_name, "", &detail.to_string()).await;
     if !res.success {
@@ -1201,14 +1218,36 @@ async fn prompt_for(
     let (entries, outline_dir) = collect_channel_entries(st, channel).await;
     let q_emb = st.models.embed_text(query).await.unwrap_or_default();
     let (top_k, budget, chunk) = disclosure_budget(model);
+    let mut mapped = map_entries(&entries);
+    if let Ok(scores) = st.db.entry_scores().await {
+        for entry in &mut mapped {
+            if let Some(score) = scores.get(&entry.id) {
+                entry.utility = if *score < -3 {
+                    0.0
+                } else {
+                    (*score as f32).max(0.2)
+                };
+            }
+        }
+    }
+    let now = now_ms();
+    let half = st.cfg.adapt.learned_half_life_days;
+    for entry in &mut mapped {
+        if entry.entry_type == ENTRY_LEARNED || entry.entry_type == ENTRY_EXEMPLAR {
+            entry.utility = decayed_utility(entry.utility, entry.updated_at_ms, now, half);
+        }
+    }
+    let mut used = Vec::new();
     let retrieved = assemble_context(
-        &map_entries(&entries),
+        &mapped,
         query,
         &q_emb,
         top_k,
         budget,
         chunk,
+        &mut used,
     );
+    let _ = st.db.bump_hits(&used).await;
     let mut outline = String::new();
     if let Some(dir) = outline_dir {
         outline = project_outline(&st.cfg, dir).await;
@@ -2062,6 +2101,171 @@ async fn handle_steer(
         return Err(StatusCode::CONFLICT);
     }
     Ok(Json(serde_json::json!({ "steered": n })))
+}
+
+#[derive(Deserialize)]
+struct FeedbackBody {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    seq: u64,
+    vote: i32,
+    #[serde(default)]
+    note: String,
+}
+
+#[derive(Deserialize)]
+struct PrefQuery {
+    channel: String,
+}
+
+async fn handle_feedback(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<FeedbackBody>,
+) -> Result<StatusCode, StatusCode> {
+    if body.vote != 1 && body.vote != -1 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let thread = if body.thread.is_empty() {
+        "main".into()
+    } else {
+        body.thread
+    };
+    let note: String = body.note.chars().take(800).collect();
+    let shown = st
+        .db
+        .load_shown(&body.channel, &thread, 2000)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let msg = shown
+        .iter()
+        .find(|m| m.message.seq == body.seq)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if crate::models::is_human_role(&msg.message.author) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let prompt = shown
+        .iter()
+        .rev()
+        .skip_while(|m| m.message.seq > body.seq)
+        .find(|m| crate::models::is_human_role(&m.message.author))
+        .map(|m| m.message.content.clone())
+        .unwrap_or_default();
+    let reply = msg.message.content.clone();
+    st.db
+        .record_operator_vote(&body.channel, &thread, body.seq, body.vote, &note)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(text) = crate::adapt::feedback_note(body.vote, &note) {
+        let id = blake3::hash(format!("feedback:{}:{thread}:{}", body.channel, body.seq).as_bytes())
+            .to_hex()
+            .to_string();
+        store_scored_entry(&st, &body.channel, &id, ENTRY_LEARNED, &format!("memory/feedback-{}", body.seq), &text, body.vote).await;
+    }
+    let exemplar_id =
+        blake3::hash(format!("exemplar:{}:{thread}:{}", body.channel, body.seq).as_bytes())
+            .to_hex()
+            .to_string();
+    if body.vote > 0 {
+        if let Some(text) = crate::adapt::exemplar_from_reply(&prompt, &reply) {
+            store_scored_entry(
+                &st,
+                &body.channel,
+                &exemplar_id,
+                ENTRY_EXEMPLAR,
+                &format!("memory/exemplar-{}", body.seq),
+                &text,
+                body.vote,
+            )
+            .await;
+        }
+    } else {
+        let _ = st.db.delete_entry(&exemplar_id).await;
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn store_scored_entry(
+    st: &WebState,
+    channel: &str,
+    id: &str,
+    kind: i32,
+    path: &str,
+    text: &str,
+    vote: i32,
+) {
+    let next = crate::adapt::next_score(st.db.entry_score(id).await.ok().flatten(), vote);
+    if !crate::adapt::score_survives(next) {
+        let _ = st.db.delete_entry(id).await;
+        return;
+    }
+    let _ = st.db.put_entry_score(id, next).await;
+    let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+    let emb = st.models.embed_text(text).await.unwrap_or_default();
+    let entry = ContextEntry {
+        id: id.to_string(),
+        namespace: channel.to_string(),
+        entry_type: kind,
+        source_path: path.to_string(),
+        content: text.to_string(),
+        content_hash: hash,
+        embedding: emb,
+        origin_node: st.cfg.node.id.clone(),
+        updated_at_ms: now_ms(),
+        ..Default::default()
+    };
+    if st.db.upsert_proto(&entry, true).await.is_err() {
+        return;
+    }
+    if channel_is_public(st, channel).await {
+        if let Some(url) = master_url(&st.cfg) {
+            let env = SyncEnvelope {
+                schema_version: 2,
+                source_node: st.cfg.node.id.clone(),
+                timestamp_ms: now_ms(),
+                entries: vec![entry],
+                ..Default::default()
+            };
+            let _ = hub::push_envelope(url, env, &st.cfg.node.id, st.node_key.as_ref()).await;
+        }
+    }
+}
+
+async fn handle_preferences(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<PrefQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rows = st
+        .db
+        .list_preferences(&q.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({
+        "count": rows.len(),
+        "pairs": rows.iter().map(|row| serde_json::json!({
+            "thread": row.thread_id,
+            "prompt_seq": row.prompt_seq,
+            "chosen_seq": row.chosen_seq,
+            "rejected_seq": row.rejected_seq,
+            "source": row.source,
+            "exported_at_ms": row.exported_at_ms
+        })).collect::<Vec<_>>()
+    })))
+}
+
+async fn handle_preferences_export(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<PrefQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if body.channel.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (jsonl, count) = st
+        .db
+        .export_preferences_jsonl(&body.channel)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "count": count, "jsonl": jsonl })))
 }
 
 async fn handle_load_post(
@@ -3689,11 +3893,14 @@ async fn handle_message_edit(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let edited_at_ms = now_ms();
-    let detail =
-        serde_json::json!({ "edited_at_ms": edited_at_ms, "actions": ["edit"] }).to_string();
     let _ = st
         .db
-        .save_message_detail(&body.channel, &thread, body.seq, &detail)
+        .merge_message_detail(
+            &body.channel,
+            &thread,
+            body.seq,
+            serde_json::json!({ "edited_at_ms": edited_at_ms, "actions": ["edit"] }),
+        )
         .await;
     publish_edit(
         &st,

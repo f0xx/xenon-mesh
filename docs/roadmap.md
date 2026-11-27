@@ -19,6 +19,7 @@
 - Agentic review is a per-channel switch next to Send. Off stores the message and does not call a model. The default is on.
 - A public reply's thread link shows `thread (total/unread)`. The unread count is the red bubble. Opening the thread marks it read on this node.
 - inotify on `git.project_roots` and `git.bare_repos_root` when `git.watch_changes` is true (the default). A save outside the browser reindexes that project. A deleted or renamed directory drops the channel the scanner created. `git.watch_changes: false` leaves the startup scan and turns the watch off.
+- Operator votes on a model reply. A useful and an avoid vote on the same prompt become a preference pair stored on that daemon. An upvote that contains a diff becomes an exemplar in the next prompt. Export is `POST /api/preferences/export`. Training stays outside the binary. See [adaptation.md](adaptation.md).
 - Hub-proxied models, including Gemini, are selectable on every node. The menu groups them under the hub's node id because the API key stays on the hub.
 - Chat times are epoch milliseconds in the database. The UI draws a day divider and a clock without seconds on each bubble.
 - HTTP and HTTPS for the same UI. Desktop notifications work in a secure context: localhost, or HTTPS after the browser allows the certificate.

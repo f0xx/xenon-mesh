@@ -1,3 +1,4 @@
+mod adapt;
 mod browse;
 mod cli;
 mod config;

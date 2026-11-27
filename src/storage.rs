@@ -213,11 +213,26 @@ fn message_id(channel: &str, thread: &str, seq: u64) -> String {
 }
 
 #[derive(Clone, Debug)]
+pub struct StoredPreference {
+    pub id: String,
+    pub thread_id: String,
+    pub prompt_seq: i64,
+    pub prompt: String,
+    pub chosen_seq: i64,
+    pub rejected_seq: i64,
+    pub chosen: String,
+    pub rejected: String,
+    pub source: String,
+    pub exported_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
 pub struct ShownMessage {
     pub message: pb::SessionMessage,
     pub edited_at_ms: i64,
     pub started_at_ms: i64,
     pub finished_at_ms: i64,
+    pub vote: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +262,13 @@ fn edited_at(detail: &str) -> i64 {
     detail_ms(detail, "edited_at_ms")
 }
 
+fn detail_vote(detail: &str) -> i32 {
+    serde_json::from_str::<serde_json::Value>(detail)
+        .ok()
+        .and_then(|v| v.get("feedback")?.get("operator_vote")?.as_i64())
+        .unwrap_or(0) as i32
+}
+
 fn shown_from_row(row: &sqlx::any::AnyRow) -> ShownMessage {
     let seq: i64 = row.get("seq");
     let detail: String = row.try_get("detail").unwrap_or_default();
@@ -262,6 +284,7 @@ fn shown_from_row(row: &sqlx::any::AnyRow) -> ShownMessage {
         edited_at_ms: edited_at(&detail),
         started_at_ms: detail_ms(&detail, "started_at_ms"),
         finished_at_ms: detail_ms(&detail, "finished_at_ms"),
+        vote: detail_vote(&detail),
     }
 }
 
@@ -524,6 +547,38 @@ impl Storage {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS preference_pairs (
+                id VARCHAR(64) PRIMARY KEY,
+                channel_id VARCHAR(128) NOT NULL,
+                thread_id VARCHAR(128) NOT NULL,
+                prompt_seq BIGINT NOT NULL,
+                prompt TEXT NOT NULL,
+                chosen_seq BIGINT NOT NULL,
+                rejected_seq BIGINT NOT NULL,
+                chosen TEXT NOT NULL,
+                rejected TEXT NOT NULL,
+                source VARCHAR(32) NOT NULL,
+                exported_at_ms BIGINT NOT NULL DEFAULT 0,
+                created_at_ms BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pref_channel ON preference_pairs(channel_id, exported_at_ms)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS entry_stats (
+                id VARCHAR(64) PRIMARY KEY,
+                score INTEGER NOT NULL,
+                hits INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -716,7 +771,7 @@ impl Storage {
     pub async fn list_channel_memory(&self, namespace: &str) -> Result<Vec<MemoryItem>> {
         let sql = self.q(
             "SELECT id, entry_type, source_path, content FROM context_entries
-             WHERE namespace = $1 AND entry_type IN (2, 3) ORDER BY source_path ASC",
+             WHERE namespace = $1 AND entry_type IN (2, 3, 4) ORDER BY source_path ASC",
         );
         let rows = sqlx::query(&sql)
             .bind(namespace)
@@ -730,6 +785,8 @@ impl Storage {
                     id: r.get("id"),
                     kind: if et == pb::EntryType::Pinned as i32 {
                         "PIN".into()
+                    } else if et == crate::retrieve::ENTRY_EXEMPLAR {
+                        "EXEMPLAR".into()
                     } else {
                         "LEARN".into()
                     },
@@ -743,6 +800,54 @@ impl Storage {
     pub async fn delete_entry(&self, id: &str) -> Result<()> {
         let sql = self.q("DELETE FROM context_entries WHERE id = $1");
         sqlx::query(&sql).bind(id).execute(&self.pool).await?;
+        let sql = self.q("DELETE FROM entry_stats WHERE id = $1");
+        sqlx::query(&sql).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn entry_score(&self, id: &str) -> Result<Option<i32>> {
+        let sql = self.q("SELECT score FROM entry_stats WHERE id = $1");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("score")))
+    }
+
+    pub async fn put_entry_score(&self, id: &str, score: i32) -> Result<()> {
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO entry_stats (id, score, hits) VALUES ($1, $2, 0)
+                 ON DUPLICATE KEY UPDATE score = VALUES(score)",
+            ),
+            _ => self.q(
+                "INSERT INTO entry_stats (id, score, hits) VALUES ($1, $2, 0)
+                 ON CONFLICT(id) DO UPDATE SET score = $2",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(id)
+            .bind(score)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn entry_scores(&self) -> Result<std::collections::HashMap<String, i32>> {
+        let rows = sqlx::query("SELECT id, score FROM entry_stats")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("id"), r.get("score")))
+            .collect())
+    }
+
+    pub async fn bump_hits(&self, ids: &[String]) -> Result<()> {
+        let sql = self.q("UPDATE entry_stats SET hits = hits + 1 WHERE id = $1");
+        for id in ids {
+            sqlx::query(&sql).bind(id).execute(&self.pool).await?;
+        }
         Ok(())
     }
 }
@@ -1764,6 +1869,177 @@ impl Storage {
         Ok(extra.is_some())
     }
 
+    pub async fn message_detail(&self, channel: &str, thread: &str, seq: u64) -> Result<String> {
+        let id = message_id(channel, thread, seq);
+        let sql = self.q("SELECT detail FROM message_meta WHERE id = $1");
+        let row = sqlx::query(&sql)
+            .bind(&id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("detail")).unwrap_or_default())
+    }
+
+    pub async fn merge_message_detail(
+        &self,
+        channel: &str,
+        thread: &str,
+        seq: u64,
+        patch: serde_json::Value,
+    ) -> Result<()> {
+        let current = self.message_detail(channel, thread, seq).await?;
+        let mut base = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&current)
+            .unwrap_or_default();
+        if let Some(obj) = patch.as_object() {
+            for (key, value) in obj {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        let text = serde_json::Value::Object(base).to_string();
+        self.save_message_detail(channel, thread, seq, &text).await
+    }
+
+    pub async fn list_preferences(&self, channel: &str) -> Result<Vec<StoredPreference>> {
+        let sql = self.q(
+            "SELECT id, thread_id, prompt_seq, prompt, chosen_seq, rejected_seq, chosen, rejected, source, exported_at_ms
+             FROM preference_pairs WHERE channel_id = $1 ORDER BY prompt_seq ASC",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(channel)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| StoredPreference {
+                id: r.get("id"),
+                thread_id: r.get("thread_id"),
+                prompt_seq: r.get("prompt_seq"),
+                prompt: r.get("prompt"),
+                chosen_seq: r.get("chosen_seq"),
+                rejected_seq: r.get("rejected_seq"),
+                chosen: r.get("chosen"),
+                rejected: r.get("rejected"),
+                source: r.get("source"),
+                exported_at_ms: r.get("exported_at_ms"),
+            })
+            .collect())
+    }
+
+    pub async fn record_operator_vote(
+        &self,
+        channel: &str,
+        thread: &str,
+        seq: u64,
+        vote: i32,
+        note: &str,
+    ) -> Result<()> {
+        self.merge_message_detail(
+            channel,
+            thread,
+            seq,
+            serde_json::json!({
+                "feedback": { "operator_vote": vote, "operator_note": note }
+            }),
+        )
+        .await?;
+        let shown = self.load_shown(channel, thread, 2000).await?;
+        let turns: Vec<crate::adapt::RatedTurn> = shown
+            .iter()
+            .map(|m| crate::adapt::RatedTurn {
+                seq: m.message.seq,
+                human: crate::models::is_human_role(&m.message.author),
+                content: m.message.content.clone(),
+                vote: m.vote,
+            })
+            .collect();
+        let drafts = crate::adapt::synthesize_pairs(&turns);
+        self.replace_operator_pairs(channel, thread, &drafts).await
+    }
+
+    async fn replace_operator_pairs(
+        &self,
+        channel: &str,
+        thread: &str,
+        drafts: &[crate::adapt::PreferenceDraft],
+    ) -> Result<()> {
+        let existing = self.list_preferences(channel).await?;
+        let keep: Vec<_> = existing
+            .into_iter()
+            .filter(|row| row.thread_id == thread && row.source == "operator_vote")
+            .collect();
+        let del = self.q(
+            "DELETE FROM preference_pairs WHERE channel_id = $1 AND thread_id = $2 AND source = $3",
+        );
+        sqlx::query(&del)
+            .bind(channel)
+            .bind(thread)
+            .bind("operator_vote")
+            .execute(&self.pool)
+            .await?;
+        for draft in drafts {
+            let id = crate::adapt::pair_id(channel, thread, draft.prompt_seq);
+            let exported = keep
+                .iter()
+                .find(|row| {
+                    row.id == id
+                        && row.chosen_seq == draft.chosen_seq as i64
+                        && row.rejected_seq == draft.rejected_seq as i64
+                })
+                .map(|row| row.exported_at_ms)
+                .unwrap_or(0);
+            let sql = self.q(
+                "INSERT INTO preference_pairs
+                 (id, channel_id, thread_id, prompt_seq, prompt, chosen_seq, rejected_seq, chosen, rejected, source, exported_at_ms, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            );
+            sqlx::query(&sql)
+                .bind(&id)
+                .bind(channel)
+                .bind(thread)
+                .bind(draft.prompt_seq as i64)
+                .bind(&draft.prompt)
+                .bind(draft.chosen_seq as i64)
+                .bind(draft.rejected_seq as i64)
+                .bind(&draft.chosen)
+                .bind(&draft.rejected)
+                .bind("operator_vote")
+                .bind(exported)
+                .bind(now_ms())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// JSONL of every pair on this channel. Rows that have not been exported
+    /// are stamped. A later export of the same votes keeps the old stamp.
+    pub async fn export_preferences_jsonl(&self, channel: &str) -> Result<(String, i64)> {
+        let rows = self.list_preferences(channel).await?;
+        let mut lines = String::new();
+        for row in &rows {
+            if !lines.is_empty() {
+                lines.push('\n');
+            }
+            lines.push_str(&crate::adapt::preference_line(
+                channel,
+                &row.thread_id,
+                &row.prompt,
+                &row.chosen,
+                &row.rejected,
+            ));
+        }
+        if rows.iter().any(|row| row.exported_at_ms == 0) {
+            let sql = self.q(
+                "UPDATE preference_pairs SET exported_at_ms = $1 WHERE channel_id = $2 AND exported_at_ms = 0",
+            );
+            sqlx::query(&sql)
+                .bind(now_ms())
+                .bind(channel)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok((lines, rows.len() as i64))
+    }
+
     pub async fn namespace_is_public(&self, namespace: &str) -> Result<bool> {
         Ok(self
             .list_channel_rows()
@@ -1979,5 +2255,64 @@ mod tests {
 
         let full = db.export_envelope("hub", Some("demo")).await.unwrap();
         assert!(full.messages.iter().any(|m| m.thread_id == "scratch"));
+    }
+
+    fn chat(seq: u64, author: &str, content: &str) -> pb::SessionMessage {
+        pb::SessionMessage {
+            channel_id: "demo".into(),
+            thread_id: "main".into(),
+            seq,
+            author: author.into(),
+            content: content.into(),
+            created_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_vote_pair_exports_once_and_a_note_can_be_dropped() {
+        let db = temp_db().await;
+        db.append_message(&chat(1, "ada", "fix the parser"))
+            .await
+            .unwrap();
+        db.append_message(&chat(2, "local/coder", "bad diff"))
+            .await
+            .unwrap();
+        db.append_message(&chat(3, "local/coder", "good diff"))
+            .await
+            .unwrap();
+        db.save_message_detail("demo", "main", 2, r#"{"started_at_ms":5}"#)
+            .await
+            .unwrap();
+        db.record_operator_vote("demo", "main", 2, -1, "")
+            .await
+            .unwrap();
+        assert!(db.list_preferences("demo").await.unwrap().is_empty());
+        let shown = db.load_shown("demo", "main", 20).await.unwrap();
+        assert_eq!(shown[1].vote, -1);
+        assert_eq!(shown[1].started_at_ms, 5);
+        db.record_operator_vote("demo", "main", 3, 1, "keep the match")
+            .await
+            .unwrap();
+        let rows = db.list_preferences("demo").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chosen, "good diff");
+        assert_eq!(rows[0].rejected, "bad diff");
+        assert_eq!(rows[0].exported_at_ms, 0);
+        let (jsonl, n) = db.export_preferences_jsonl("demo").await.unwrap();
+        assert_eq!(n, 1);
+        assert!(jsonl.contains("good diff"));
+        let stamped = db.list_preferences("demo").await.unwrap()[0].exported_at_ms;
+        assert!(stamped > 0);
+        db.record_operator_vote("demo", "main", 3, 1, "keep the match")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.list_preferences("demo").await.unwrap()[0].exported_at_ms,
+            stamped
+        );
+        db.put_entry_score("note", 1).await.unwrap();
+        db.bump_hits(&["note".into()]).await.unwrap();
+        assert_eq!(db.entry_score("note").await.unwrap(), Some(1));
+        assert_eq!(db.entry_scores().await.unwrap().get("note"), Some(&1));
     }
 }

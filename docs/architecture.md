@@ -31,7 +31,7 @@ Sub-agent admission is one scheduler. Daemons POST their in-flight count to the 
 1. The UI `POST /api/chat` names a channel, a thread, a model id (`provider/model` or a bare model name), and the user text.
 2. The daemon decides whether the thread is public. Public threads on a node are appended through the hub's `AppendMessage` RPC, which assigns the sequence. A private thread, or a hub outage, stays in the local database.
 3. Context is assembled from local rows, hub rows for public namespaces, and a bounded scan of a matching watched worktree (200 files, 32 KiB each, no symlink that leaves the root, no `target/`, `.git/`, `node_modules/`, or similar).
-4. Ranking uses cosine similarity when the query and the chunk share an embedding. Otherwise it uses token overlap, including overlap with the file path. Embeddings are optional. If the model server does not implement them, retrieval still works and the UI status shows `lexical`.
+4. Ranking mixes cosine similarity and token overlap when the query and the chunk share an embedding (`0.7` cosine, `0.3` lexical, including the file path). Otherwise it uses token overlap alone. Embeddings are optional. If the model server does not implement them, retrieval still works and the UI status shows `lexical`. Learned notes and upvoted diffs are ranked the same way. See [adaptation.md](adaptation.md).
 5. The model streams `status`, `thought`, `delta`, and `done` events as SSE. Thinking models surface `reasoning` or Gemini thought parts as `thought` events; those are not stored as the answer.
 6. The answer is stored with the author set to the provider and model that actually answered.
 
