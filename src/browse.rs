@@ -149,6 +149,75 @@ pub async fn fetch_page(url: &str) -> Result<String> {
     Ok(clip(&text, 8_000))
 }
 
+/// A repository read request. `..`, absolute paths, and backslashes are refused.
+pub fn parse_read_spec(spec: &str) -> Result<(String, Option<(usize, usize)>)> {
+    let trimmed = spec.trim().trim_start_matches("./");
+    if trimmed.is_empty() {
+        bail!("empty file path");
+    }
+    let (path, range) = if let Some((path, range)) = trimmed.rsplit_once(':') {
+        if let Some((a, b)) = range.split_once('-') {
+            if let (Ok(start), Ok(end)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                let start = start.max(1);
+                let end = end.max(start);
+                (path.trim(), Some((start, end.min(start + 400))))
+            } else {
+                (trimmed, None)
+            }
+        } else if let Ok(line) = range.trim().parse::<usize>() {
+            let line = line.max(1);
+            let start = line.saturating_sub(30).max(1);
+            (path.trim(), Some((start, line + 60)))
+        } else {
+            (trimmed, None)
+        }
+    } else {
+        (trimmed, None)
+    };
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("refused path");
+    }
+    Ok((path.to_string(), range))
+}
+
+/// Numbered lines. `range` is 1-based and inclusive. Output stops at `max_chars`.
+pub fn format_line_slice(text: &str, range: Option<(usize, usize)>, max_chars: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    if total == 0 {
+        return "(empty file)\n".into();
+    }
+    let (start, end) = match range {
+        Some((s, e)) => {
+            let end = e.min(total);
+            let start = s.min(end).max(1);
+            (start, end)
+        }
+        None => (1, total),
+    };
+    if start > total {
+        return format!("file has {total} lines\n");
+    }
+    let mut out = String::new();
+    for idx in start..=end {
+        let Some(line) = lines.get(idx - 1) else { break };
+        let row = format!("{idx:>5}|{line}\n");
+        if out.len() + row.len() > max_chars && !out.is_empty() {
+            out.push_str(&format!("…[truncated at line {idx} of {total}]\n"));
+            break;
+        }
+        out.push_str(&row);
+    }
+    if end < total && !out.contains("…[truncated") {
+        out.push_str(&format!("…[showing lines {start}..{end} of {total}]\n"));
+    }
+    out
+}
+
 pub async fn run(lookup: &Lookup) -> Result<String> {
     match lookup.kind.as_str() {
         "fetch" => fetch_page(&lookup.query).await,
@@ -287,6 +356,30 @@ mod tests {
         assert_eq!(tools2.len(), 2);
         assert_eq!(tools2[0].kind, "read");
         assert_eq!(tools2[1].kind, "grep");
+    }
+
+    #[test]
+    fn read_specs_keep_a_relative_path_and_refuse_escapes() {
+        let (path, range) = parse_read_spec("src/storage.rs:10-50").unwrap();
+        assert_eq!(path, "src/storage.rs");
+        assert_eq!(range, Some((10, 50)));
+        let (path, range) = parse_read_spec("./src/main.rs:80").unwrap();
+        assert_eq!(path, "src/main.rs");
+        assert_eq!(range, Some((50, 140)));
+        assert!(parse_read_spec("../etc/passwd").is_err());
+        assert!(parse_read_spec("/etc/passwd").is_err());
+        assert!(parse_read_spec("src//secret.rs").is_err());
+    }
+
+    #[test]
+    fn line_slices_use_real_line_numbers_and_stop_at_the_budget() {
+        let text = "alpha\nbeta\ngamma\n";
+        let slice = format_line_slice(text, Some((2, 3)), 10_000);
+        assert!(slice.contains("    2|beta"), "{slice}");
+        assert!(slice.contains("    3|gamma"), "{slice}");
+        assert!(!slice.contains("alpha"));
+        let short = format_line_slice(text, None, 12);
+        assert!(short.contains("truncated") || short.contains("showing"), "{short}");
     }
 
     #[test]

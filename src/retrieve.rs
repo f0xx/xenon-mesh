@@ -64,12 +64,12 @@ pub fn coding_preamble(channel: &str) -> String {
          Prefer small reviewable edits. Pinned and learned notes are invariants.\n\
          The daemon process runs as its operating-system user. You decide whether an action is safe to propose. The operating system enforces that user's rights.\n\
          Facts that are not in the project blocks or in a Web results block are not known to you. Do not invent web pages, versions, or current events.\n\
-         The initial context only includes a small subset of files. Check `[TREE]` for all paths in the repository.\n\
-         When you need to inspect other files or trace dependencies before answering, end your reply with fenced blocks:\n\
-         - ```read with `<path>` or `<path>:<start>-<end>` (up to 3 paths per step)\n\
-         - ```grep with a symbol, function name, or pattern to search across the repository\n\
+         The first context is a slice of the project, not the whole tree. Paths you were not shown are still in the repository.\n\
+         When you need another file or a symbol before answering, end the reply with fenced blocks:\n\
+         - ```read with `<path>` or `<path>:<start>-<end>` (up to 3 paths per step). Paths stay inside the project.\n\
+         - ```grep with a substring to search across the repository. This is not a regular expression.\n\
          - ```web with a search query, or ```fetch with one http(s) URL\n\
-         The daemon will fetch the exact numbered lines and call you again automatically."
+         The daemon fetches the numbered lines and calls you again. Stop asking once you can answer."
     )
 }
 
