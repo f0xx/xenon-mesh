@@ -91,9 +91,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 fn is_always_included(entry: &PromptEntry) -> bool {
-    entry.entry_type == ENTRY_PINNED
-        || entry.entry_type == ENTRY_LEARNED
-        || entry.source_path.starts_with("@diff:")
+    entry.entry_type == ENTRY_PINNED || entry.source_path.starts_with("@diff:")
 }
 
 /// Build the system context block.
@@ -121,10 +119,8 @@ pub fn assemble_context(
     for e in entries.iter().filter(|e| is_always_included(e)) {
         let label = if e.source_path.starts_with("@diff:") {
             "DIFF"
-        } else if e.entry_type == ENTRY_PINNED {
-            "PINNED"
         } else {
-            "LEARNED"
+            "PINNED"
         };
         let body = truncate(&e.content, 8_000);
         push(
@@ -134,8 +130,33 @@ pub fn assemble_context(
         );
     }
 
-    let mut ranked: Vec<(f32, &PromptEntry)> = Vec::new();
     let embeddings_ok = !query_emb.is_empty();
+    let mut learned: Vec<(f32, &PromptEntry)> = entries
+        .iter()
+        .filter(|e| e.entry_type == ENTRY_LEARNED)
+        .map(|e| {
+            let s = if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty() {
+                cosine_sim(&e.embedding, query_emb)
+            } else {
+                lexical_score(query, &e.content).max(lexical_score(query, &e.source_path))
+            };
+            (s, e)
+        })
+        .collect();
+    learned.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, e) in learned.into_iter().take(5) {
+        if used >= char_budget {
+            break;
+        }
+        let body = truncate(&e.content, 1_500);
+        push(
+            &mut blocks,
+            &mut used,
+            format!("### [LEARNED] {}\n{body}", e.source_path),
+        );
+    }
+
+    let mut ranked: Vec<(f32, &PromptEntry)> = Vec::new();
     let q_lower = query.to_ascii_lowercase();
     for e in entries
         .iter()

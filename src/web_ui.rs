@@ -639,6 +639,7 @@ async fn handle_learn(
             .await
             .map_err(|_| StatusCode::BAD_GATEWAY)?
     };
+    let emb = st.models.embed_text(&summary).await.unwrap_or_default();
     let id = blake3::hash(format!("mem:{}:{}", req.channel, req.title).as_bytes())
         .to_hex()
         .to_string();
@@ -654,6 +655,7 @@ async fn handle_learn(
         source_path: format!("memory/{}", req.title),
         content: summary,
         content_hash: hash,
+        embedding: emb,
         origin_node: st.cfg.node.id.clone(),
         updated_at_ms: now_ms(),
         ..Default::default()
@@ -692,6 +694,7 @@ async fn handle_approve(
     let sig = blake3::keyed_hash(&st.hmac_key, payload.as_bytes())
         .as_bytes()
         .to_vec();
+    let diff_snip: String = req.unified_diff.chars().take(2000).collect();
     let mut client = ClusterServiceClient::connect(req.node_grpc_url)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -734,9 +737,74 @@ async fn handle_approve(
         }
     }
     publish_audit(&st, action, &repo_name, "", &detail.to_string()).await;
+    if !res.success {
+        let st_learn = st.clone();
+        let ns = Path::new(&repo_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&repo_name)
+            .to_string();
+        let err_snip: String = res.stderr_log.chars().take(2000).collect();
+        let out_snip: String = res.stdout_log.chars().take(1000).collect();
+        let pipe = pipeline_name.clone();
+        tokio::spawn(async move {
+            record_auto_lesson(
+                &st_learn,
+                &ns,
+                &format!("fail-{}", now_ms() / 1000),
+                &format!(
+                    "Patch or pipeline `{pipe}` failed on repository `{ns}`.\nSTDERR:\n{err_snip}\nSTDOUT:\n{out_snip}\nDIFF:\n{diff_snip}"
+                ),
+            )
+            .await;
+        });
+    }
     Ok(Json(
         serde_json::json!({ "success": res.success, "code": res.exit_code, "out": res.stdout_log, "err": res.stderr_log }),
     ))
+}
+
+async fn record_auto_lesson(st: &WebState, namespace: &str, key: &str, raw_event: &str) {
+    if namespace.trim().is_empty() {
+        return;
+    }
+    let Ok(lesson) = st.models.distill(raw_event).await else {
+        return;
+    };
+    let lesson = lesson.trim().to_string();
+    if lesson.is_empty() {
+        return;
+    }
+    let emb = st.models.embed_text(&lesson).await.unwrap_or_default();
+    let id = blake3::hash(format!("auto-learn:{namespace}:{key}").as_bytes())
+        .to_hex()
+        .to_string();
+    let hash = blake3::hash(lesson.as_bytes()).to_hex().to_string();
+    let entry = ContextEntry {
+        id,
+        namespace: namespace.to_string(),
+        entry_type: EntryType::Learned as i32,
+        source_path: format!("memory/auto-{key}"),
+        content: lesson,
+        content_hash: hash,
+        embedding: emb,
+        origin_node: st.cfg.node.id.clone(),
+        updated_at_ms: now_ms(),
+        ..Default::default()
+    };
+    let _ = st.db.upsert_proto(&entry, true).await;
+    if channel_is_public(st, namespace).await {
+        if let Some(url) = master_url(&st.cfg) {
+            let env = SyncEnvelope {
+                schema_version: 2,
+                source_node: st.cfg.node.id.clone(),
+                timestamp_ms: now_ms(),
+                entries: vec![entry],
+                ..Default::default()
+            };
+            let _ = hub::push_envelope(url, env).await;
+        }
+    }
 }
 
 async fn handle_list_memory(
@@ -1776,6 +1844,22 @@ async fn handle_persistent_chat(
                         .last()
                         .map(|m| m.content.trim_start().starts_with("CONSENSUS:"))
                         .unwrap_or(false);
+                    if agreed {
+                        if let Some(final_msg) = latest.last() {
+                            let st_learn = st_bg.clone();
+                            let ch_learn = req.channel.clone();
+                            let txt_learn: String = final_msg.content.chars().take(4000).collect();
+                            tokio::spawn(async move {
+                                record_auto_lesson(
+                                    &st_learn,
+                                    &ch_learn,
+                                    &format!("consensus-{}", now_ms() / 1000),
+                                    &txt_learn,
+                                )
+                                .await;
+                            });
+                        }
+                    }
                     if agreed || is_final_turn {
                         let last_seq = latest.last().map(|m| m.seq).unwrap_or(0);
                         let _ = tx
