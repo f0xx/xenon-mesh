@@ -61,10 +61,12 @@ The system text is, in order:
 
 1. `models.system_prompt`, when set
 2. A short coding preamble that names the channel and asks for a single unified diff when code changes
-3. Pinned notes, learned notes, and `@diff:` snapshots
-4. A path index of the associated project, plus overview files, then up to 8 ranked source chunks. A question that shares no tokens with the source still receives that outline. `git.harvest_command` replaces the built-in walk with a script; the project path is the last argument. A `google` model receives a one-line note and a short summary of the chat instead of source.
+3. Pinned notes and `@diff:` snapshots. Learned notes are ranked against the question; at most five that share tokens (or a vector) are included, each truncated to 1,500 characters
+4. A path index of the associated project, plus overview files, then up to 8 ranked source chunks (10 for a Gemini model). A file the question names is boosted ahead of a looser token match. A question that shares no tokens with the source still receives that outline. Local models get about 28,000 characters of retrieved source; Gemini gets about 64,000. `git.harvest_command` replaces the built-in walk with a script; the project path is the last argument. A `google` model receives a one-line note and a short summary of the chat instead of source.
 
-Roles stored in history are the literal author (`user` or `provider/model`). They are mapped per protocol: Gemini wants `user` and `model`; OpenAI-compatible and Ollama want `user` and `assistant`.
+Roles stored in history are the literal author (`user` or `provider/model`). They are mapped per protocol: Gemini wants `user` and `model`, and consecutive turns of the same role are merged; OpenAI-compatible and Ollama want `user` and `assistant`. A non-generic author is prefixed on the Gemini turn so the collapsed role still shows who spoke.
+
+When `models.debate_max_rounds` is greater than 0 and the UI debate box is checked, the selected models answer in parallel and then critique each other, one at a time, for that many rounds. A round ends the debate only when every surviving model starts its reply with `CONSENSUS:`. That text can be distilled into a learned note. A failed model drops out. The checkbox stays hidden while the cap is 0.
 
 ## DR-22. Probe
 

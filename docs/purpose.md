@@ -14,7 +14,7 @@ The user picks a channel. That choice is what the daemon and the model are allow
 
 - The channel namespace is the repository name used when the hub indexed bare repos (`git/bare_repos_root`).
 - `context_namespaces` may list more than one namespace when a discussion needs more than one tree. That is the cross-repo context.
-- Pinned and learned notes in the same namespace are invariants. They are always placed in the prompt.
+- Pinned notes in the same namespace are invariants and are always placed in the prompt. Learned notes are ranked against the question and only the overlapping ones are included.
 - Uncommitted work on a node is stored as an `@diff:` entry and is also always placed in the prompt.
 
 ## DR-3. Public and private memory stay apart

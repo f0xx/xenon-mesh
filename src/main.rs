@@ -3,9 +3,9 @@ mod cli;
 mod config;
 mod discover;
 mod executor;
-mod identity;
 mod git_sync;
 mod hub;
+mod identity;
 mod migrate;
 mod models;
 mod retrieve;
@@ -55,15 +55,7 @@ impl ClusterService for NodeRpcServer {
             .unwrap_or("")
             .to_string();
         let env = req.into_inner();
-        let body = identity::canonical(
-            "sync",
-            &[
-                &env.source_node,
-                &env.entries.len().to_string(),
-                &env.messages.len().to_string(),
-                &env.channels.len().to_string(),
-            ],
-        );
+        let body = hub::sync_body(&env);
         let verified_node = identity::resolve_peer(&self.peer_keys, &node_claim, ts, &sig, &body)
             .map_err(Status::permission_denied)?;
         let (mut ok, mut skip) = (0u32, 0u32);

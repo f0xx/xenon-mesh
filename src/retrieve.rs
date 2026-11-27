@@ -96,14 +96,17 @@ fn is_always_included(entry: &PromptEntry) -> bool {
 
 /// Build the system context block.
 ///
-/// `top_k` limits ranked source files. Pinned notes, learned notes, and
-/// `@diff:` snapshots are always included and do not consume `top_k`.
+/// `top_k` limits ranked source files. Pinned notes and `@diff:` snapshots
+/// are always included and do not consume `top_k`. Learned notes are ranked
+/// against the question and at most five that overlap it are included.
+/// `chunk_chars` is the per-file cap for numbered source.
 pub fn assemble_context(
     entries: &[PromptEntry],
     query: &str,
     query_emb: &[f32],
     top_k: usize,
     char_budget: usize,
+    chunk_chars: usize,
 ) -> String {
     let mut blocks: Vec<String> = Vec::new();
     let mut used = 0usize;
@@ -135,16 +138,23 @@ pub fn assemble_context(
         .iter()
         .filter(|e| e.entry_type == ENTRY_LEARNED)
         .map(|e| {
-            let s = if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty() {
-                cosine_sim(&e.embedding, query_emb)
-            } else {
-                lexical_score(query, &e.content).max(lexical_score(query, &e.source_path))
-            };
+            let s =
+                if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty()
+                {
+                    cosine_sim(&e.embedding, query_emb)
+                } else {
+                    lexical_score(query, &e.content).max(lexical_score(query, &e.source_path))
+                };
             (s, e)
         })
         .collect();
     learned.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (_, e) in learned.into_iter().take(5) {
+    let query_blank = query.trim().is_empty();
+    for (_, e) in learned
+        .into_iter()
+        .filter(|(score, _)| query_blank || *score > 0.0)
+        .take(if query_blank { 3 } else { 5 })
+    {
         if used >= char_budget {
             break;
         }
@@ -191,7 +201,7 @@ pub fn assemble_context(
         if used >= char_budget {
             break;
         }
-        let room = char_budget.saturating_sub(used).min(4_000);
+        let room = char_budget.saturating_sub(used).min(chunk_chars);
         if room < 200 {
             break;
         }
@@ -234,7 +244,7 @@ pub fn assemble_context(
         if used >= char_budget {
             break;
         }
-        let room = char_budget.saturating_sub(used).min(8_000);
+        let room = char_budget.saturating_sub(used).min(chunk_chars);
         if room < 200 {
             break;
         }
@@ -326,7 +336,14 @@ mod tests {
             ),
             entry(ENTRY_DYNAMIC, "@diff:node", "diff --git a/src/executor.rs"),
         ];
-        let ctx = assemble_context(&entries, "apply unified diff in executor", &[], 1, 20_000);
+        let ctx = assemble_context(
+            &entries,
+            "apply unified diff in executor",
+            &[],
+            1,
+            20_000,
+            6_000,
+        );
         assert!(ctx.contains("PINNED"));
         assert!(ctx.contains("never disable auth"));
         assert!(ctx.contains("DIFF"));
@@ -341,7 +358,14 @@ mod tests {
             entry(ENTRY_DYNAMIC, "README.md", "xenon mesh hub and node"),
             entry(ENTRY_DYNAMIC, "src/main.rs", "fn main() {}"),
         ];
-        let ctx = assemble_context(&entries, "дай описание о чем этот проект", &[], 4, 20_000);
+        let ctx = assemble_context(
+            &entries,
+            "дай описание о чем этот проект",
+            &[],
+            4,
+            20_000,
+            6_000,
+        );
         assert!(ctx.contains("README.md"), "{ctx}");
         assert!(ctx.contains("src/main.rs"), "{ctx}");
     }
@@ -358,8 +382,31 @@ mod tests {
             &[1.0, 0.0],
             1,
             20_000,
+            6_000,
         );
         assert!(ctx.contains("src/a.rs"));
         assert!(!ctx.contains("src/b.rs"));
+    }
+
+    #[test]
+    fn a_named_file_outranks_a_token_match_elsewhere() {
+        let entries = vec![
+            entry(ENTRY_DYNAMIC, "src/other.rs", "executor apply diff"),
+            entry(ENTRY_DYNAMIC, "src/executor.rs", "zzzz"),
+        ];
+        let ctx = assemble_context(&entries, "look at executor.rs", &[], 1, 20_000, 6_000);
+        assert!(ctx.contains("src/executor.rs"), "{ctx}");
+        assert!(!ctx.contains("src/other.rs"), "{ctx}");
+    }
+
+    #[test]
+    fn a_learned_note_is_kept_only_when_it_overlaps_the_question() {
+        let entries = vec![
+            entry(ENTRY_LEARNED, "memory/auth", "never disable auth checks"),
+            entry(ENTRY_LEARNED, "memory/paint", "pixels use a linear buffer"),
+        ];
+        let ctx = assemble_context(&entries, "auth checks", &[], 5, 20_000, 6_000);
+        assert!(ctx.contains("never disable auth"), "{ctx}");
+        assert!(!ctx.contains("linear buffer"), "{ctx}");
     }
 }

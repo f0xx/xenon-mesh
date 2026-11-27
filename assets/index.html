@@ -530,6 +530,7 @@ function renderMarkdown(raw) {
 
 let hubHttp = '';
 let defaultModel = '';
+let debateRounds = 0;
 let applyingPref = false;
 let prefGen = 0;
 let editingSeq = 0;
@@ -553,8 +554,8 @@ function selectedModels() {
 function applyMultiMode() {
   modelSelect.multiple = multiToggle.checked;
   modelSelect.size = multiToggle.checked ? Math.min(8, Math.max(modelSelect.options.length, 2)) : 1;
-  debateWrap.style.display = multiToggle.checked ? 'flex' : 'none';
-  if (!multiToggle.checked) debateToggle.checked = false;
+  debateWrap.style.display = (multiToggle.checked && debateRounds > 0) ? 'flex' : 'none';
+  if (debateWrap.style.display === 'none') debateToggle.checked = false;
 }
 async function loadChatPref() {
   const gen = ++prefGen;
@@ -1033,6 +1034,7 @@ window.onload = async () => {
   dNode.value = localStorage.dNode || ''; dRepo.value = localStorage.dRepo || ''; dPipe.value = localStorage.dPipe || '';
   langSelect.value = lang; setLang(lang);
   const cfg = await (await fetch('/api/config')).json();
+  debateRounds = Number(cfg.debate_max_rounds) || 0;
   hubHttp = cfg.hub_http || '';
   selfName = cfg.node_id || selfName;
   await loadAlias();

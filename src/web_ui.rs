@@ -264,7 +264,8 @@ async fn handle_config(State(st): State<Arc<WebState>>) -> Json<serde_json::Valu
         "mode": mode_name(&st.cfg.node.mode),
         "node_id": st.cfg.node.id,
         "hub_http": master_http(&st.cfg).unwrap_or(""),
-        "embeddings": st.models.embeddings_configured().await
+        "embeddings": st.models.embeddings_configured().await,
+        "debate_max_rounds": st.cfg.models.debate_max_rounds.min(6)
     }))
 }
 
@@ -355,9 +356,8 @@ async fn handle_list_channels(
             .lock()
             .ok()
             .and_then(|map| {
-                map.get(&row.name).and_then(|(kind, until)| {
-                    (*until > now_ms()).then(|| kind.clone())
-                })
+                map.get(&row.name)
+                    .and_then(|(kind, until)| (*until > now_ms()).then(|| kind.clone()))
             })
             .unwrap_or_default();
         let live = if local_live.is_empty() {
@@ -365,13 +365,7 @@ async fn handle_list_channels(
         } else {
             local_live
         };
-        let p2p = st
-            .db
-            .get_p2p(&row.name)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+        let p2p = st.db.get_p2p(&row.name).await.ok().flatten().is_some();
         sidebar.push(SidebarChannel {
             group: channel_group(&row.name, &row.visibility),
             pinned: pref.pinned,
@@ -509,7 +503,9 @@ async fn handle_upsert_channel(
                 channels: vec![stored.to_proto()],
                 ..Default::default()
             };
-            if let Err(err) = hub::push_envelope(url, env, &st.cfg.node.id, st.node_key.as_ref()).await {
+            if let Err(err) =
+                hub::push_envelope(url, env, &st.cfg.node.id, st.node_key.as_ref()).await
+            {
                 warn!("public channel was saved locally but not published: {err}");
             }
         }
@@ -572,11 +568,7 @@ async fn handle_history(
         .load_shown(&q.channel, &q.thread, 200)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let threads = st
-        .db
-        .list_threads(&q.channel)
-        .await
-        .unwrap_or_default();
+    let threads = st.db.list_threads(&q.channel).await.unwrap_or_default();
     Ok(Json(
         msgs.into_iter()
             .map(|m| {
@@ -710,17 +702,23 @@ async fn handle_approve(
         .await
         .map_err(|_| StatusCode::FORBIDDEN)?
         .into_inner();
-    let mut action = if pipeline_name.contains("--force") || pipeline_name.contains("force-with-lease")
-    {
-        "git.force_push"
-    } else if pipeline_name.contains("push") {
-        "git.push"
-    } else {
-        "task.execute"
-    };
+    let mut action =
+        if pipeline_name.contains("--force") || pipeline_name.contains("force-with-lease") {
+            "git.force_push"
+        } else if pipeline_name.contains("push") {
+            "git.push"
+        } else {
+            "task.execute"
+        };
     let mut detail = serde_json::json!({"pipeline": pipeline_name, "exit": res.exit_code});
-    if let Some(line) = res.stdout_log.lines().find(|line| line.starts_with("XMESH_GIT ")) {
-        if let Ok(git) = serde_json::from_str::<serde_json::Value>(line.trim_start_matches("XMESH_GIT ")) {
+    if let Some(line) = res
+        .stdout_log
+        .lines()
+        .find(|line| line.starts_with("XMESH_GIT "))
+    {
+        if let Ok(git) =
+            serde_json::from_str::<serde_json::Value>(line.trim_start_matches("XMESH_GIT "))
+        {
             action = if git.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
                 "git.force_push"
             } else {
@@ -751,7 +749,6 @@ async fn handle_approve(
             record_auto_lesson(
                 &st_learn,
                 &ns,
-                &format!("fail-{}", now_ms() / 1000),
                 &format!(
                     "Patch or pipeline `{pipe}` failed on repository `{ns}`.\nSTDERR:\n{err_snip}\nSTDOUT:\n{out_snip}\nDIFF:\n{diff_snip}"
                 ),
@@ -764,27 +761,41 @@ async fn handle_approve(
     ))
 }
 
-async fn record_auto_lesson(st: &WebState, namespace: &str, key: &str, raw_event: &str) {
+async fn record_auto_lesson(st: &WebState, namespace: &str, raw_event: &str) {
     if namespace.trim().is_empty() {
         return;
     }
-    let Ok(lesson) = st.models.distill(raw_event).await else {
+    let turns = [ChatTurn {
+        role: "user".into(),
+        text: raw_event.to_string(),
+        attachments: vec![],
+    }];
+    let Ok(lesson) = st
+        .models
+        .generate(
+            "",
+            "Extract at most five reusable engineering invariants from this event. If it is a one-off failure with no lasting rule, reply NONE.",
+            &turns,
+        )
+        .await
+    else {
         return;
     };
     let lesson = lesson.trim().to_string();
-    if lesson.is_empty() {
+    if lesson.is_empty() || lesson.eq_ignore_ascii_case("NONE") || lesson.chars().count() < 40 {
         return;
     }
     let emb = st.models.embed_text(&lesson).await.unwrap_or_default();
-    let id = blake3::hash(format!("auto-learn:{namespace}:{key}").as_bytes())
+    let digest = blake3::hash(lesson.as_bytes()).to_hex().to_string();
+    let id = blake3::hash(format!("auto-learn:{namespace}:{digest}").as_bytes())
         .to_hex()
         .to_string();
-    let hash = blake3::hash(lesson.as_bytes()).to_hex().to_string();
+    let hash = digest.clone();
     let entry = ContextEntry {
         id,
         namespace: namespace.to_string(),
         entry_type: EntryType::Learned as i32,
-        source_path: format!("memory/auto-{key}"),
+        source_path: format!("memory/auto-{}", &digest[..12]),
         content: lesson,
         content_hash: hash,
         embedding: emb,
@@ -919,7 +930,9 @@ async fn handle_alias_set(
     } else {
         alias.clone()
     };
-    Ok(Json(serde_json::json!({ "alias": alias, "display": display })))
+    Ok(Json(
+        serde_json::json!({ "alias": alias, "display": display }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -944,7 +957,11 @@ async fn handle_chat_pref_get(
     State(st): State<Arc<WebState>>,
     Query(q): Query<ChatPrefQuery>,
 ) -> Json<serde_json::Value> {
-    let thread = if q.thread.is_empty() { "main" } else { &q.thread };
+    let thread = if q.thread.is_empty() {
+        "main"
+    } else {
+        &q.thread
+    };
     let (models, multi) = st
         .db
         .get_chat_models(&q.channel, thread)
@@ -969,7 +986,12 @@ async fn handle_chat_pref_set(
         .filter(|m| !m.is_empty())
         .collect();
     st.db
-        .set_chat_models(&req.channel, &thread, &models, req.multi && models.len() > 1)
+        .set_chat_models(
+            &req.channel,
+            &thread,
+            &models,
+            req.multi && models.len() > 1,
+        )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::OK)
@@ -1031,6 +1053,14 @@ async fn handle_oai_compat(
         "object": "chat.completion",
         "choices": [{ "index": 0, "message": { "role": "assistant", "content": reply }, "finish_reason": "stop" }]
     })))
+}
+
+fn retrieval_budget(model: &str) -> (usize, usize, usize) {
+    if model.to_ascii_lowercase().contains("gemini") {
+        (10, 64_000, 12_000)
+    } else {
+        (8, 28_000, 6_000)
+    }
 }
 
 async fn prompt_for(
@@ -1106,7 +1136,8 @@ async fn prompt_for(
     }
     let entries: Vec<_> = merged.into_values().collect();
     let q_emb = st.models.embed_text(query).await.unwrap_or_default();
-    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, 6, 28_000);
+    let (top_k, budget, chunk) = retrieval_budget(model);
+    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, top_k, budget, chunk);
     let mut outline = String::new();
     if let Some(dir) = outline_dir {
         outline = project_outline(&st.cfg, dir).await;
@@ -1149,13 +1180,14 @@ async fn project_outline(cfg: &AppConfig, dir: std::path::PathBuf) -> String {
             .args(&args)
             .arg(&path)
             .output();
-        if let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(20), harvested).await
+        if let Ok(Ok(out)) =
+            tokio::time::timeout(std::time::Duration::from_secs(20), harvested).await
         {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !text.is_empty() {
                     let numbered = number_harvest_code(&text);
-                    return numbered.chars().take(10_000).collect();
+                    return numbered.chars().take(28_000).collect();
                 }
             }
         }
@@ -1175,7 +1207,8 @@ async fn store_message(
 ) -> SessionMessage {
     let stored = if sync_hub {
         if let Some(url) = master_url(&st.cfg) {
-            match hub::append_public(url, msg.clone(), &st.cfg.node.id, st.node_key.as_ref()).await {
+            match hub::append_public(url, msg.clone(), &st.cfg.node.id, st.node_key.as_ref()).await
+            {
                 Ok(stored) => {
                     let _ = st.db.append_message(&stored).await;
                     stored
@@ -1455,7 +1488,7 @@ async fn run_one_reply(
     sync_hub: bool,
     left: Arc<AtomicUsize>,
     send_saved: bool,
-) {
+) -> bool {
     let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
     let forward = tx.clone();
     let label = model.clone();
@@ -1465,49 +1498,53 @@ async fn run_one_reply(
         }
     });
     let started = now_ms();
-    let (author, final_text) = match dispatch_chat(&st, &model, &ctx, &turns, local_tx.clone(), audit).await
-    {
-        Ok((reply, used)) => {
-            let (clean, tools) = crate::browse::take_requests(&reply);
-            if tools.is_empty() || used == "error" {
-                (used, reply)
-            } else {
+    let (author, final_text) =
+        match dispatch_chat(&st, &model, &ctx, &turns, local_tx.clone(), audit).await {
+            Ok((reply, used)) => {
+                let (clean, tools) = crate::browse::take_requests(&reply);
+                if tools.is_empty() || used == "error" {
+                    (used, reply)
+                } else {
+                    let _ = local_tx
+                        .send(StreamEvent::Status {
+                            text: "Fetching the web...".into(),
+                            model: String::new(),
+                        })
+                        .await;
+                    let pages = run_lookups(&st, &tools).await;
+                    let mut next = turns.clone();
+                    next.push(ChatTurn {
+                        role: "assistant".into(),
+                        text: clean.clone(),
+                        attachments: vec![],
+                    });
+                    next.push(ChatTurn {
+                        role: "user".into(),
+                        text: format!("Web results:\n{pages}"),
+                        attachments: vec![],
+                    });
+                    match dispatch_chat(&st, &model, &ctx, &next, local_tx.clone(), None).await {
+                        Ok((second, used2)) => (used2, second),
+                        Err(err) => (used, format!("{clean}\n\n[web lookup failed: {err:#}]")),
+                    }
+                }
+            }
+            Err(err) => {
+                let err_txt = format!("[ERROR] {err:#}");
                 let _ = local_tx
-                    .send(StreamEvent::Status {
-                        text: "Fetching the web...".into(),
+                    .send(StreamEvent::Delta {
+                        text: err_txt.clone(),
                         model: String::new(),
                     })
                     .await;
-                let pages = run_lookups(&st, &tools).await;
-                let mut next = turns.clone();
-                next.push(ChatTurn {
-                    role: "assistant".into(),
-                    text: clean.clone(),
-                    attachments: vec![],
-                });
-                next.push(ChatTurn {
-                    role: "user".into(),
-                    text: format!("Web results:\n{pages}"),
-                    attachments: vec![],
-                });
-                match dispatch_chat(&st, &model, &ctx, &next, local_tx.clone(), None).await {
-                    Ok((second, used2)) => (used2, second),
-                    Err(err) => (used, format!("{clean}\n\n[web lookup failed: {err:#}]")),
-                }
+                ("error".into(), err_txt)
             }
-        }
-        Err(err) => {
-            let err_txt = format!("[ERROR] {err:#}");
-            let _ = local_tx
-                .send(StreamEvent::Delta {
-                    text: err_txt.clone(),
-                    model: String::new(),
-                })
-                .await;
-            ("error".into(), err_txt)
-        }
+        };
+    let author = if author.is_empty() {
+        model.clone()
+    } else {
+        author
     };
-    let author = if author.is_empty() { model.clone() } else { author };
     let finished = now_ms();
     let detail = serde_json::json!({
         "started_at_ms": started,
@@ -1536,6 +1573,7 @@ async fn run_one_reply(
     drop(local_tx);
     let _ = pump.await;
     let last = left.fetch_sub(1, Ordering::SeqCst) == 1;
+    let ok = author != "error";
     if send_saved {
         let _ = tx
             .send(StreamEvent::Saved {
@@ -1546,6 +1584,7 @@ async fn run_one_reply(
             })
             .await;
     }
+    ok
 }
 
 async fn handle_persistent_chat(
@@ -1761,36 +1800,61 @@ async fn handle_persistent_chat(
         let reply_name = reply_thread.unwrap_or_default();
         let mut pending = tokio::task::JoinSet::new();
         for model in &models_bg {
-            pending.spawn(run_one_reply(
-                st_bg.clone(),
-                model.clone(),
-                ctx.clone(),
-                turns.clone(),
-                tx.clone(),
-                audit.clone(),
-                req.channel.clone(),
-                model_thread.clone(),
-                reply_name.clone(),
-                sync_hub,
-                left.clone(),
-                !has_debate,
-            ));
+            let model = model.clone();
+            let st_one = st_bg.clone();
+            let ctx_one = ctx.clone();
+            let turns_one = turns.clone();
+            let tx_one = tx.clone();
+            let audit_one = audit.clone();
+            let channel_one = req.channel.clone();
+            let thread_one = model_thread.clone();
+            let reply_one = reply_name.clone();
+            let left_one = left.clone();
+            let save = !has_debate;
+            pending.spawn(async move {
+                let ok = run_one_reply(
+                    st_one,
+                    model.clone(),
+                    ctx_one,
+                    turns_one,
+                    tx_one,
+                    audit_one,
+                    channel_one,
+                    thread_one,
+                    reply_one,
+                    sync_hub,
+                    left_one,
+                    save,
+                )
+                .await;
+                (model, ok)
+            });
         }
-        while pending.join_next().await.is_some() {}
-
-        if has_debate {
-            let alive_models: Vec<String> = {
-                let hist = st_bg.db.load_thread(&req.channel, &model_thread, 100).await.unwrap_or_default();
-                let failed: HashSet<String> = hist.iter().filter(|m| m.author == "error").map(|m| m.content.clone()).collect();
-                models_bg.iter().filter(|m| !failed.iter().any(|e| e.contains(m.as_str()))).cloned().collect()
-            };
-            'debate: for round in 1..=max_rounds {
-                if alive_models.len() < 2 { break 'debate; }
-                for (idx, model) in alive_models.iter().enumerate() {
-                    let is_final_turn = round == max_rounds && idx + 1 == alive_models.len();
+        let mut failed = HashSet::new();
+        while let Some(joined) = pending.join_next().await {
+            if let Ok((model, ok)) = joined {
+                if !ok {
+                    failed.insert(model);
+                }
+            }
+        }
+        let mut alive: Vec<String> = models_bg
+            .iter()
+            .filter(|m| !failed.contains(*m))
+            .cloned()
+            .collect();
+        let mut closed = !has_debate;
+        if has_debate && alive.len() >= 2 {
+            for round in 1..=max_rounds {
+                let mut still = Vec::new();
+                let mut agreed_all = true;
+                let mut consensus_text = String::new();
+                for model in &alive {
                     let _ = tx
                         .send(StreamEvent::Status {
-                            text: format!("Debate round {round}/{max_rounds}: {model} reviewing..."),
+                            text: format!(
+                                "Debate round {round}/{max_rounds}: {model} reviewing..."
+                            ),
                             model: model.clone(),
                         })
                         .await;
@@ -1803,7 +1867,7 @@ async fn handle_persistent_chat(
                         .into_iter()
                         .filter(|m| m.author != "error" && !m.content.trim().is_empty())
                         .map(|m| ChatTurn {
-                            role: m.author,
+                            role: m.author.clone(),
                             text: m.content,
                             attachments: vec![],
                         })
@@ -1811,16 +1875,15 @@ async fn handle_persistent_chat(
                     debate_turns.push(ChatTurn {
                         role: "user".into(),
                         text: format!(
-                            "You are participating in a peer code/architecture review (round {round} of {max_rounds}) as `{model}`.\n\
+                            "You are participating in a peer review (round {round} of {max_rounds}) as `{model}`.\n\
                              Critically examine the previous responses from other models in this thread.\n\
                              Point out concrete bugs, edge cases, race conditions, or flawed assumptions.\n\
-                             If all issues are resolved and you fully agree on the final solution, start your reply with `CONSENSUS:` and provide the clean unified ```diff.\n\
-                             Otherwise, explain the flaws and propose an improved solution or ```diff."
+                             If you fully agree with the latest shared solution, start your reply with `CONSENSUS:`.\n\
+                             Otherwise explain the flaw. Do not emit a diff unless it is the correction."
                         ),
                         attachments: vec![],
                     });
-                    let one_left = Arc::new(AtomicUsize::new(1));
-                    run_one_reply(
+                    let ok = run_one_reply(
                         st_bg.clone(),
                         model.clone(),
                         ctx.clone(),
@@ -1831,49 +1894,66 @@ async fn handle_persistent_chat(
                         model_thread.clone(),
                         reply_name.clone(),
                         sync_hub,
-                        one_left,
+                        Arc::new(AtomicUsize::new(1)),
                         false,
                     )
                     .await;
+                    if !ok {
+                        agreed_all = false;
+                        continue;
+                    }
+                    still.push(model.clone());
                     let latest = st_bg
                         .db
                         .load_thread(&req.channel, &model_thread, 100)
                         .await
                         .unwrap_or_default();
-                    let agreed = latest
-                        .last()
-                        .map(|m| m.content.trim_start().starts_with("CONSENSUS:"))
-                        .unwrap_or(false);
-                    if agreed {
-                        if let Some(final_msg) = latest.last() {
-                            let st_learn = st_bg.clone();
-                            let ch_learn = req.channel.clone();
-                            let txt_learn: String = final_msg.content.chars().take(4000).collect();
-                            tokio::spawn(async move {
-                                record_auto_lesson(
-                                    &st_learn,
-                                    &ch_learn,
-                                    &format!("consensus-{}", now_ms() / 1000),
-                                    &txt_learn,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                    if agreed || is_final_turn {
-                        let last_seq = latest.last().map(|m| m.seq).unwrap_or(0);
-                        let _ = tx
-                            .send(StreamEvent::Saved {
-                                seq: last_seq,
-                                thread: reply_name.clone(),
-                                model: model.clone(),
-                                last: true,
-                            })
-                            .await;
-                        break 'debate;
+                    let text = latest.last().map(|m| m.content.clone()).unwrap_or_default();
+                    if text.trim_start().starts_with("CONSENSUS:") {
+                        consensus_text = text.chars().take(4000).collect();
+                    } else {
+                        agreed_all = false;
                     }
                 }
+                alive = still;
+                let done = agreed_all && !consensus_text.is_empty();
+                if done {
+                    let st_learn = st_bg.clone();
+                    let ch_learn = req.channel.clone();
+                    tokio::spawn(async move {
+                        record_auto_lesson(&st_learn, &ch_learn, &consensus_text).await;
+                    });
+                }
+                if done || alive.len() < 2 || round == max_rounds {
+                    let last_seq = st_bg
+                        .db
+                        .load_thread(&req.channel, &model_thread, 100)
+                        .await
+                        .ok()
+                        .and_then(|rows| rows.last().map(|m| m.seq))
+                        .unwrap_or(0);
+                    let _ = tx
+                        .send(StreamEvent::Saved {
+                            seq: last_seq,
+                            thread: reply_name.clone(),
+                            model: String::new(),
+                            last: true,
+                        })
+                        .await;
+                    closed = true;
+                    break;
+                }
             }
+        }
+        if has_debate && !closed {
+            let _ = tx
+                .send(StreamEvent::Saved {
+                    seq: 0,
+                    thread: reply_name.clone(),
+                    model: String::new(),
+                    last: true,
+                })
+                .await;
         }
     });
 
@@ -1984,7 +2064,8 @@ fn authorize(st: &WebState, headers: &HeaderMap, body: &[u8]) -> Result<String, 
         .get("x-xmesh-sig")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    crate::identity::resolve_peer(&st.peer_keys, &node, ts, sig, body).map_err(|_| StatusCode::FORBIDDEN)
+    crate::identity::resolve_peer(&st.peer_keys, &node, ts, sig, body)
+        .map_err(|_| StatusCode::FORBIDDEN)
 }
 
 async fn signed_post(
@@ -2366,7 +2447,12 @@ async fn handle_mesh_share(
     Ok(StatusCode::OK)
 }
 
-async fn apply_join(st: &WebState, node_id: &str, channel: &str, token: &str) -> Result<(), StatusCode> {
+async fn apply_join(
+    st: &WebState,
+    node_id: &str,
+    channel: &str,
+    token: &str,
+) -> Result<(), StatusCode> {
     let member = st
         .db
         .member_state(channel, node_id)
@@ -2374,12 +2460,8 @@ async fn apply_join(st: &WebState, node_id: &str, channel: &str, token: &str) ->
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if member.is_none() {
         let hash = blake3::hash(token.as_bytes()).to_hex().to_string();
-        let invited = !token.is_empty()
-            && st
-                .db
-                .invite_matches(channel, &hash)
-                .await
-                .unwrap_or(false);
+        let invited =
+            !token.is_empty() && st.db.invite_matches(channel, &hash).await.unwrap_or(false);
         if !invited {
             return Err(StatusCode::FORBIDDEN);
         }
@@ -2614,7 +2696,11 @@ async fn handle_message_debug(
     State(st): State<Arc<WebState>>,
     Query(q): Query<MsgBody>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let thread = if q.thread.is_empty() { "main" } else { &q.thread };
+    let thread = if q.thread.is_empty() {
+        "main"
+    } else {
+        &q.thread
+    };
     st.db
         .message_record(&q.channel, thread, q.seq)
         .await
@@ -2661,12 +2747,21 @@ async fn handle_message_edit(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let edited_at_ms = now_ms();
-    let detail = serde_json::json!({ "edited_at_ms": edited_at_ms, "actions": ["edit"] }).to_string();
+    let detail =
+        serde_json::json!({ "edited_at_ms": edited_at_ms, "actions": ["edit"] }).to_string();
     let _ = st
         .db
         .save_message_detail(&body.channel, &thread, body.seq, &detail)
         .await;
-    publish_edit(&st, &body.channel, &thread, body.seq, &body.text, edited_at_ms).await;
+    publish_edit(
+        &st,
+        &body.channel,
+        &thread,
+        body.seq,
+        &body.text,
+        edited_at_ms,
+    )
+    .await;
     Ok(StatusCode::OK)
 }
 
@@ -2738,11 +2833,7 @@ async fn handle_clone_channel(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     if visibility == "shared" {
-        let members = st
-            .db
-            .list_members(&body.channel)
-            .await
-            .unwrap_or_default();
+        let members = st.db.list_members(&body.channel).await.unwrap_or_default();
         let rows = members
             .into_iter()
             .map(|node| (node, "member".into(), "active".into()))
@@ -2788,10 +2879,7 @@ pub async fn publish_shared_outlines(st: Arc<WebState>) {
 async fn push_entries(st: &WebState, channel: &str, entries: &[ShareEntry]) {
     let Some(base) = master_http(&st.cfg) else {
         for entry in entries {
-            let _ = st
-                .db
-                .upsert_proto(&entry_proto(st, entry), false)
-                .await;
+            let _ = st.db.upsert_proto(&entry_proto(st, entry), false).await;
         }
         return;
     };
@@ -3109,7 +3197,14 @@ fn urlencoding(text: &str) -> String {
     out
 }
 
-async fn publish_edit(st: &WebState, channel: &str, thread: &str, seq: u64, text: &str, edited_at_ms: i64) {
+async fn publish_edit(
+    st: &WebState,
+    channel: &str,
+    thread: &str,
+    seq: u64,
+    text: &str,
+    edited_at_ms: i64,
+) {
     if let Some(base) = master_http(&st.cfg) {
         let payload = ShareMsg {
             thread_id: thread.into(),
@@ -3234,7 +3329,9 @@ async fn remote_lookup(base: &str, lookup: &crate::browse::Lookup) -> Option<Str
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("text").and_then(|v| v.as_str()).map(str::to_string)
+    body.get("text")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[derive(Deserialize)]
@@ -3610,7 +3707,11 @@ async fn handle_p2p_pull(
     if link.token != q.token {
         return Err(StatusCode::FORBIDDEN);
     }
-    let thread = if q.thread.is_empty() { "main" } else { &q.thread };
+    let thread = if q.thread.is_empty() {
+        "main"
+    } else {
+        &q.thread
+    };
     let rows = st
         .db
         .load_sync(&q.channel, thread, 400)
@@ -3632,13 +3733,7 @@ async fn handle_p2p_pull(
 }
 
 fn local_http_base(st: &WebState) -> String {
-    let port = st
-        .cfg
-        .node
-        .http_addr
-        .rsplit(':')
-        .next()
-        .unwrap_or("8080");
+    let port = st.cfg.node.http_addr.rsplit(':').next().unwrap_or("8080");
     if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
             if let Ok(addr) = socket.local_addr() {
@@ -3676,7 +3771,12 @@ async fn pull_p2p(link: &crate::storage::P2pLink, thread: &str) -> Option<Vec<Sh
         .ok()
 }
 
-async fn push_one(link: &crate::storage::P2pLink, msg: &SessionMessage, deleted: bool, edited_at_ms: i64) {
+async fn push_one(
+    link: &crate::storage::P2pLink,
+    msg: &SessionMessage,
+    deleted: bool,
+    edited_at_ms: i64,
+) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()

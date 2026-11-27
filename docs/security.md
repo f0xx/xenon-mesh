@@ -6,7 +6,7 @@ This is the trust model for a small lab that shares one HMAC key and does not ha
 
 Every machine that has `/etc/xmeshd/hmac.key` is a peer. The daemon hashes that file and uses it to sign task execution. There is no login, password, or per-person nickname.
 
-`node.node_key_path` is a second file, one per machine. The hub reads `node.peer_keys_dir`, a directory of `<node-id>.key` copies. Share, join, audit, and public message append then require a BLAKE3 MAC over a canonical string, with a five-minute timestamp. The audit stores that verified id. If the directory is missing or empty, the hub still accepts the label the caller sends, so keys can be installed after the binary. A peer that has the shared HMAC key and another node's key file can still speak as that node. The key file is what stops a casual relabel.
+`node.node_key_path` is a second file, one per machine. The hub reads `node.peer_keys_dir`, a directory of `<node-id>.key` copies. Share, join, audit, public message append, and `SyncContexts` then require a BLAKE3 MAC over a canonical string, with a five-minute timestamp. The sync MAC covers a digest of the entries, messages, and channels, so a captured header cannot be reused with a different payload. The stored origin is the verified id. If the directory is missing or empty, the hub still accepts the label the caller sends, so keys can be installed after the binary. A peer that has the shared HMAC key and another node's key file can still speak as that node. The key file is what stops a casual relabel.
 
 The practical boundary is the network plus that shared key:
 
@@ -60,4 +60,6 @@ SSH local forwards, described in [remote-access.md](remote-access.md), are the s
 - It does not encrypt private project text while a node is asking the hub to run a model. The prompt is sent to the configured model host. It is not copied into the audit log.
 - It does not treat a self-signed certificate as a public CA.
 
-Mutual TLS, so the transport itself names the node, is still an open decision. The node key above is an application MAC on the calls that change membership, audit, and public transcripts.
+Mutual TLS, so the transport itself names the node, is still an open decision. The node key above is an application MAC on the calls that change membership, audit, public transcripts, and synced context.
+
+A pipeline with `use_bwrap: true` runs under bubblewrap. The workspace is the read-write bind. `/etc/xmeshd` and `/root` are covered by a tmpfs so the sandbox does not read the daemon config or root's home, and `--die-with-parent` stops the command if the daemon exits. The rest of the filesystem is still visible read-only, so a pipeline should only be approved for a workspace you trust.

@@ -34,7 +34,7 @@ node:
   id: "hub"
   mode: "master"
   listen_addr: "0.0.0.0:8443"
-  http_addr: "0.0.0.0:8080"
+  http_addr: "127.0.0.1:8080"
   hmac_secret_path: "/etc/xmeshd/hmac.key"
 storage:
   primary_url: null
@@ -50,7 +50,7 @@ git:
 | `id` | required, not blank | string. Stored as the author of messages this machine sends. Leading and trailing spaces are removed |
 | `mode` | required | `master` or `node` |
 | `listen_addr` | required | `host:port`, gRPC |
-| `http_addr` | empty → `0.0.0.0:8080` | `host:port`, the chat UI |
+| `http_addr` | empty → `127.0.0.1:8080` | `host:port`, the chat UI. Set `0.0.0.0:8080` to publish it on the LAN |
 | `https_addr` | empty | `host:port` for the same UI over TLS. Do not reuse the gRPC port |
 | `tls_cert_path` | empty | PEM path. A self-signed certificate is enough once the browser allows it |
 | `tls_key_path` | empty | PEM private key |
@@ -110,6 +110,7 @@ When `models.providers` is non-empty, it is the whole provider list. The legacy 
 | `sampling.temperature` | unset | sent on chat requests. Unset keeps the built-in 0.2 for OpenAI-compatible and Gemini calls. Unset leaves Ollama on the model file, which is often 0.8. Set `0.2` on an Ollama provider when coding answers wander |
 | `sampling.top_p` | unset | sent only when set |
 | `sampling.repeat_penalty` | unset | Ollama `options.repeat_penalty` when set |
+| `debate_max_rounds` | `0` | extra critique rounds after a multi-model reply. `0` hides the debate checkbox. The server caps this at 6 |
 
 Each provider (`#[serde(default)]` on the whole map, so a short entry is valid):
 

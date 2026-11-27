@@ -22,7 +22,7 @@ Both modes serve the same HTTP UI and the same gRPC `ClusterService`. The mode f
 | Watcher | On `git.watched_repos`, debounces 10 seconds, stores the worktree diff, and uploads it only when that namespace has a public channel. A second watch, on by default, follows `git.project_roots` and `git.bare_repos_root` and updates the channel list |
 | Model hub | Discovers models, streams tokens, embeds when the endpoint supports it |
 
-The HTTP listener defaults to `0.0.0.0:8080`. gRPC defaults to whatever `node.listen_addr` says (the examples use `0.0.0.0:8443`). Treat both as trusted-network ports. There is no user login on the UI.
+The HTTP listener defaults to `127.0.0.1:8080`. Set `node.http_addr` to `0.0.0.0:8080` when other machines on the LAN should open the UI. gRPC defaults to whatever `node.listen_addr` says (the examples use `0.0.0.0:8443`). Treat both as trusted-network ports. There is no user login on the UI.
 
 ## DR-9. Chat flow
 
@@ -38,7 +38,7 @@ The HTTP listener defaults to `0.0.0.0:8080`. gRPC defaults to whatever `node.li
 1. The UI extracts a `diff` fence into the inspector. The user fills the node gRPC URL, the workspace path, and an optional pipeline name from `deploy_pipelines`.
 2. `POST /api/task/approve` signs the task with the local HMAC key and calls `ExecuteTask`.
 3. The node checks expiry and the signature, then `git apply`. On failure it returns stderr and does not run the pipeline.
-4. A pipeline runs either directly or under `bwrap` with an optional network unshare. The command list must be non-empty. The workspace must already exist and must sit inside `allowed_workspaces`.
+4. A pipeline runs either directly or under `bwrap` with an optional network unshare. The bubblewrap command bind-mounts the workspace, hides `/etc/xmeshd` and `/root` with a tmpfs, and exits if the daemon does. The command list must be non-empty. The workspace must already exist and must sit inside `allowed_workspaces`.
 
 ## DR-11. Failure behavior
 
