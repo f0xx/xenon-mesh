@@ -4,7 +4,7 @@ These are adapters for a small IT company. The diff inspector in DR-40 is in the
 
 ## DR-38. Calendars and reminders
 
-A calendar provider speaks CalDAV or Google Calendar's HTTP API. The chat can ask "what is on the desk tomorrow" and the daemon inserts a short agenda into the context. Reminders are the other direction: a due item opens or badges a channel, using the same per-node unread counter as a model reply the operator has not looked at.
+A read-only iCalendar feed is configured as `calendar.ics_url`. A question about the calendar, the schedule, a meeting, today, or tomorrow makes the daemon fetch that feed and insert the next seven days into the prompt. A bearer token, if the feed needs one, is the environment variable named by `calendar.token_env`. The value is not written to git. Reminders that open a channel are not built yet.
 
 Personal reminders stay on the node. A shared channel can subscribe to a team calendar the owner named. The daemon stores the calendar URL and a token in the environment, the same way model API keys are stored, not in git.
 
@@ -19,9 +19,9 @@ Personal reminders stay on the node. A shared channel can subscribe to a team ca
 
 ## DR-40. Code and automation
 
-The side panel inspects the unified diff before approve. Built-in findings are the file count, added and removed lines, conflict markers, and a warning when the diff is large. `git.inspect_command` is an optional argv. The daemon writes the diff to its stdin and appends up to twenty stdout lines. A non-zero exit is itself a finding. Nothing is written until the operator approves.
+The side panel inspects the unified diff before approve. Built-in findings are the file count, added and removed lines, conflict markers, a warning when the diff is large, and trailing whitespace or over-long added lines. `git.inspect_command` is an optional argv. `scripts/inspect-diff.sh` prints one lint finding per line and can wrap another checker. `git.status_command` is a second read-only argv. `scripts/status-check.sh` prints `status:` lines from `XMESH_STATUS_URL`. The daemon writes the diff to stdin and appends up to twenty stdout lines. A non-zero exit is itself a finding. Nothing is written until the operator approves, and findings do not disable the button.
 
-External inspectors (a linter, CodeQL, a CI status API) should use that command, or a small wrapper around it. They do not get a second write path.
+External inspectors (a linter, CodeQL, a CI status API) should use one of those commands. They do not get a second write path.
 
 Automation stays a named deploy pipeline: a name in YAML, an argv, a workdir inside `allowed_workspaces`. A pipeline whose command is `git push` records the ref, the old sha, the new sha, and whether the update was forced. `git_ref` and `git_force` on the pipeline are the explicit form of that record. The chat selects the pipeline name. It does not send a shell string.
 
@@ -49,4 +49,4 @@ An adapter is configuration, not a new chat product:
 3. Reads can enter the model context. Writes go through the existing approve button and the hub audit.
 4. Private channels may use an adapter locally. The hub learns about it only when the channel is shared or the action is public.
 
-The diff inspector is in place. Calendar read is the remaining daily-chat adapter, and it is waiting on a decision. Neither one should take a second system of record away from the board the company already uses.
+The diff inspector and the read-only calendar feed are in place. Neither one should take a second system of record away from the board the company already uses.

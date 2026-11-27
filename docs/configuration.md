@@ -27,6 +27,7 @@ A missing `schema` key means v1. `schema: 1` and `schema: v1` are the same. Any 
 | `gemini` | empty | legacy map, used only when `models.providers` is empty |
 | `models` | empty | map, below |
 | `deploy_pipelines` | empty | map of name → pipeline |
+| `calendar` | empty | read-only iCalendar feed, below |
 
 ```yaml
 schema: 1
@@ -54,8 +55,13 @@ git:
 | `https_addr` | empty | `host:port` for the same UI over TLS. Do not reuse the gRPC port |
 | `tls_cert_path` | empty | PEM path. A self-signed certificate is enough once the browser allows it |
 | `tls_key_path` | empty | PEM private key |
-| `master_url` | empty | node only. Hub gRPC URL, including the scheme (`http://hub.example:8443`) |
-| `master_http` | empty | node only. Hub HTTP URL. Each chat is its own request. The hub does not run those requests one behind another |
+| `master_url` | empty | node only. Hub gRPC URL, including the scheme (`http://hub.example:8443`). Use `https://` once mutual TLS is on |
+| `master_http` | empty | node only. Hub HTTP URL for the UI, model list, and completions. Each chat is its own request |
+| `master_mesh` | empty | node only. Mutual-TLS URL for `/api/mesh/*`. Empty uses `master_http`, which accepts those routes only from localhost |
+| `mtls_ca_path` | empty | PEM CA that signed the node certificates. Required together with the cert and key |
+| `mtls_cert_path` | empty | this machine's certificate, signed by that CA |
+| `mtls_key_path` | empty | matching private key |
+| `mesh_tls_addr` | empty | `host:port` that requires a client certificate and serves `/api/mesh/*` |
 | `hmac_secret_path` | required | path to the shared key file. The daemon hashes the file with BLAKE3. Copy the file, not a generated string |
 | `node_key_path` | empty | this machine's identity key. The daemon hashes the file. Do not commit it |
 | `peer_keys_dir` | empty | hub. Directory of `<node-id>.key` files. When it contains at least one key, mutating hub calls must be signed |
@@ -80,7 +86,8 @@ git:
 | `project_roots` | empty → `[]` | list of `{path, visibility}`. Each immediate child directory becomes a channel. `visibility` defaults to `private`. `public` publishes the thread to the hub |
 | `watch_changes` | empty → `true` | bool. inotify on project roots and bare repos. A change reindexes that tree. Set `false` to keep the startup scan only |
 | `harvest_command` | empty → `[]` | argv. The project path is appended. Stdout becomes the chat's project outline. `scripts/harvest-context-cloc.sh` uses `cloc` when it is installed and otherwise runs `scripts/harvest-context.sh` |
-| `inspect_command` | empty → `[]` | argv. The diff is written to stdin. Stdout lines are findings in the side panel |
+| `inspect_command` | empty → `[]` | argv. The diff is written to stdin. Stdout lines are findings. `scripts/inspect-diff.sh` prints one lint finding per line and can wrap another command |
+| `status_command` | empty → `[]` | argv. Read-only coverage or CI status. `scripts/status-check.sh` reads `XMESH_STATUS_URL` and prints `status:` lines. Findings never disable approve |
 
 ```yaml
 git:
@@ -190,6 +197,21 @@ deploy_pipelines:
     allow_network: false
     git_ref: ""
     git_force: false
+```
+
+## `calendar`
+
+Empty means no agenda. When the question mentions a calendar, schedule, meeting, today, or tomorrow, the daemon fetches the feed and adds the next seven days to the prompt. The token stays in the environment.
+
+| Key | Default | Format |
+| --- | --- | --- |
+| `ics_url` | empty | HTTPS URL of an `.ics` document |
+| `token_env` | empty | name of the environment variable that holds a bearer token |
+
+```yaml
+calendar:
+  ics_url: "https://calendar.example/team.ics"
+  token_env: "XMESH_CALENDAR_TOKEN"
 ```
 
 ## Secrets

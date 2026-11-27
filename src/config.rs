@@ -82,6 +82,19 @@ pub struct AppConfig {
     pub models: ModelsSection,
     #[serde(default)]
     pub deploy_pipelines: HashMap<String, DeployPipeline>,
+    /// Read-only iCalendar feed. Empty disables it.
+    #[serde(default)]
+    pub calendar: CalendarSection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalendarSection {
+    /// HTTPS URL of an `.ics` feed.
+    #[serde(default)]
+    pub ics_url: String,
+    /// Environment variable that holds a bearer token. The value is not stored here.
+    #[serde(default)]
+    pub token_env: String,
 }
 
 fn default_http_addr() -> String {
@@ -116,6 +129,21 @@ pub struct NodeSection {
     /// Hub only. Directory of `<node-id>.key` files, one per peer.
     #[serde(default)]
     pub peer_keys_dir: Option<String>,
+    /// CA that signs node certificates. Together with the cert and key,
+    /// this turns on mutual TLS for gRPC and for `mesh_tls_addr`.
+    #[serde(default)]
+    pub mtls_ca_path: Option<String>,
+    #[serde(default)]
+    pub mtls_cert_path: Option<String>,
+    #[serde(default)]
+    pub mtls_key_path: Option<String>,
+    /// Listener that requires a client certificate and serves `/api/mesh/*`.
+    #[serde(default)]
+    pub mesh_tls_addr: Option<String>,
+    /// Where this node calls another node's mesh API. Use the mutual-TLS URL.
+    /// Empty falls back to `master_http`, which only accepts mesh from localhost.
+    #[serde(default)]
+    pub master_mesh: Option<String>,
     /// Advertise this daemon on the local network and list neighbours.
     #[serde(default = "default_true")]
     pub discover: bool,
@@ -144,8 +172,13 @@ pub struct GitSection {
     pub watch_changes: bool,
     /// Optional argv. The unified diff is written to its stdin.
     /// Findings are appended to the built-in diff inspection.
+    /// `scripts/inspect-diff.sh` prints one lint finding per line.
     #[serde(default)]
     pub inspect_command: Vec<String>,
+    /// Optional argv. Read-only coverage or CI status. The diff is written
+    /// to stdin. Stdout lines are findings. They do not block approve.
+    #[serde(default)]
+    pub status_command: Vec<String>,
     /// Optional argv. The project path is the last argument. Stdout replaces
     /// the built-in project outline in chat context.
     #[serde(default)]

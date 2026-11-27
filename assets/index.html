@@ -13,7 +13,7 @@
   aside .item.unread .nm { font-weight:700; }
   .badge { background:#e53e3e; color:#fff; border-radius:10px; padding:0 6px; font-size:11px; }
   .sec { color:#a0aec0; font-size:11px; letter-spacing:.04em; margin:10px 4px 4px; cursor:pointer; }
-  #chFilter { width:100%; box-sizing:border-box; margin:6px 0; }
+  #aliasBox, #chFilter { width:100%; box-sizing:border-box; display:block; margin:6px 0; }
   #ctx { position:fixed; z-index:20; background:#1a202c; border:1px solid #4a5568; border-radius:6px; min-width:180px; padding:4px; box-shadow:0 8px 24px #0008; }
   #ctx button { display:block; width:100%; text-align:left; background:transparent; color:#e2e8f0; }
   #ctx button:hover { background:#2b6cb0; }
@@ -61,7 +61,7 @@
   code.numbered { display:block; }
   #modelSelect[multiple] { min-width:220px; max-height:9em; }
   .multi-note { color:#a0aec0; font-size:11px; margin:0 8px 4px; }
-  #aliasBox { width:100%; margin:0 0 8px; }
+  .threadlink .badge { margin-left:4px; }
   .dots { color:#63b3ed; letter-spacing:1px; }
   #msgCtx { position:fixed; background:#1a1d23; border:1px solid #2d3748; z-index:30; min-width:160px; }
   #msgCtx button { display:block; width:100%; text-align:left; padding:6px 10px; }
@@ -120,7 +120,10 @@
         </div>
         <div id="composer" contenteditable="true" data-ph="Message to thread..." onpaste="handlePaste(event)"></div>
       </div>
-      <button class="send-btn" onclick="send()" data-i18n="send">Send</button>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <label title="When off, the message is stored and no model is asked. Remembered per channel." style="font-size:11px;color:#a0aec0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="agenticToggle" checked> agentic review</label>
+        <button class="send-btn" onclick="send()" data-i18n="send">Send</button>
+      </div>
     </div>
   </div>
 </main>
@@ -138,6 +141,7 @@
   <input id="dPipe" placeholder="Pipeline name (local.yaml)" onchange="localStorage.dPipe=this.value">
   <div style="display:flex;justify-content:space-between"><span id="diffStats" data-i18n="noDiff">No diff</span><button onclick="pasteDiff()" data-i18n="paste">Paste</button></div>
   <div id="findings"></div>
+  <div style="color:#718096;font-size:11px">Findings stay visible and do not disable approve.</div>
   <div id="diffView" data-i18n="awaitDiff">Awaiting diff...</div>
   <button id="btnApprove" style="background:#2f855a" disabled onclick="approveTask()" data-i18n="approve">Approve & Execute</button>
 </div>
@@ -364,6 +368,16 @@ async function refreshMemory() {
 async function setPresence(viewing) {
   await fetch('/api/presence', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel: ch, viewing}) });
 }
+async function loadAgentic() {
+  const forCh = ch;
+  let enabled = true;
+  try {
+    const data = await (await fetch('/api/agentic?channel=' + encodeURIComponent(forCh))).json();
+    if (typeof data.enabled === 'boolean') enabled = data.enabled;
+  } catch {}
+  if (ch !== forCh) return;
+  agenticToggle.checked = enabled;
+}
 async function setCh(c, keepThread) {
   ch = c;
   if (!keepThread) thread = 'main';
@@ -372,7 +386,7 @@ async function setCh(c, keepThread) {
   log.innerHTML = '';
   disarmTick();
   await setPresence(document.visibilityState === 'visible');
-  await refreshThreads(); await refreshMemory(); await loadHistory(); await loadChatPref();
+  await refreshThreads(); await refreshMemory(); await loadHistory(); await loadChatPref(); await loadAgentic();
   await fetch('/api/channel-state', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:c, mark_read:true, bump_use:true}) });
   await refreshChannels();
 }
@@ -418,6 +432,9 @@ async function openThread(name) {
   await refreshThreads();
   await loadHistory();
   await loadChatPref();
+  if (name && name !== 'main') {
+    await fetch('/api/thread-read', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread: name }) });
+  }
 }
 async function replyInThread(seq) {
   const resp = await fetch('/api/threads/open', {
@@ -441,7 +458,7 @@ async function loadHistory() {
   const rows = await (await fetch(`/api/history?channel=${encodeURIComponent(forCh)}&thread=${encodeURIComponent(forTh)}`)).json();
   if (gen !== histGen || ch !== forCh || thread !== forTh) return;
   if (!Array.isArray(rows)) return;
-  const key = forCh + '|' + forTh + '|' + rows.map(m => `${m.seq}:${m.text.length}:${m.edited_at_ms || 0}:${m.reply_thread || ''}:${m.finished_at_ms || 0}`).join(',');
+  const key = forCh + '|' + forTh + '|' + rows.map(m => `${m.seq}:${m.text.length}:${m.edited_at_ms || 0}:${m.reply_thread || ''}:${m.thread_total || 0}:${m.thread_unread || 0}:${m.finished_at_ms || 0}`).join(',');
   if (key === histKey && log.childElementCount) return;
   histKey = key;
   log.innerHTML = '';
@@ -618,7 +635,12 @@ function appendBubble(who, txt, ts, seq, edited, meta) {
   if (meta.reply_thread && thread === 'main') {
     const link = document.createElement('button');
     link.className = 'threadlink';
-    link.textContent = '#' + ch + ' / ' + meta.reply_thread;
+    link.append(document.createTextNode('thread (' + (meta.thread_total || 0) + '/'));
+    const unread = document.createElement('span');
+    unread.className = 'badge';
+    unread.textContent = String(meta.thread_unread || 0);
+    if (!(meta.thread_unread > 0)) unread.style.background = '#4a5568';
+    link.append(unread, document.createTextNode(')'));
     const dest = meta.reply_thread;
     link.onclick = () => openThread(dest);
     hdr.appendChild(link);
@@ -859,7 +881,9 @@ async function send(existing, rerun) {
   const sentOn = ch;
   const sentThread = thread;
   const ids = selectedModels();
-  if (inflight.has(sentOn)) return;
+  const ask = agenticToggle.checked;
+  if (ask && inflight.has(sentOn)) return;
+  if (ask) inflight.add(sentOn);
   inflight.add(sentOn);
   const atts = pendingAtts; pendingAtts = []; renderAtts();
   if (fromComposer && !rerun) box.innerHTML = '';
@@ -887,14 +911,16 @@ async function send(existing, rerun) {
     cards.set(key, slot);
     return slot;
   }
-  if (!ids.length) ensureCard(defaultModel || 'model');
-  else ids.forEach(ensureCard);
+  if (ask) {
+    if (!ids.length) ensureCard(defaultModel || 'model');
+    else ids.forEach(ensureCard);
+  }
   log.scrollTop = log.scrollHeight;
 
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: ids[0] || '', models: ids, attachments: rerun ? [] : atts, rerun: !!rerun, debate: multiToggle.checked && debateToggle.checked })
+      body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: ids[0] || '', models: ids, attachments: rerun ? [] : atts, rerun: !!rerun, debate: multiToggle.checked && debateToggle.checked, agentic: ask })
     });
     if (!resp.ok || !resp.body) {
       const slot = ensureCard(ids[0] || '');
@@ -1075,6 +1101,9 @@ window.onload = async () => {
     saveChatPref();
   });
   modelSelect.addEventListener('change', saveChatPref);
+  agenticToggle.addEventListener('change', () => {
+    fetch('/api/agentic', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, enabled: agenticToggle.checked }) });
+  });
   const composer = document.getElementById('composer');
   composer.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }

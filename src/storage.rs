@@ -465,6 +465,16 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS thread_reads (
+                channel_name VARCHAR(128) NOT NULL,
+                thread_id VARCHAR(128) NOT NULL,
+                last_read_seq BIGINT NOT NULL,
+                PRIMARY KEY (channel_name, thread_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS channel_prefs (
                 channel_name VARCHAR(128) PRIMARY KEY,
                 pinned INTEGER NOT NULL,
@@ -1478,6 +1488,76 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn thread_progress(&self, channel: &str, thread: &str) -> Result<(i64, i64)> {
+        let total_sql = self.q(
+            "SELECT COUNT(*) AS n FROM session_messages s
+             WHERE s.channel_id = $1 AND s.thread_id = $2
+             AND s.id NOT IN (SELECT id FROM message_meta WHERE deleted != 0)",
+        );
+        let total: i64 = sqlx::query(&total_sql)
+            .bind(channel)
+            .bind(thread)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| sql_i64(&row, "n"))
+            .unwrap_or(0);
+        let read_sql = self.q(
+            "SELECT last_read_seq FROM thread_reads WHERE channel_name = $1 AND thread_id = $2",
+        );
+        let seen: i64 = sqlx::query(&read_sql)
+            .bind(channel)
+            .bind(thread)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| sql_i64(&row, "last_read_seq"))
+            .unwrap_or(0);
+        let unread_sql = self.q(
+            "SELECT COUNT(*) AS n FROM session_messages s
+             WHERE s.channel_id = $1 AND s.thread_id = $2 AND s.seq > $3
+             AND s.id NOT IN (SELECT id FROM message_meta WHERE deleted != 0)",
+        );
+        let unread: i64 = sqlx::query(&unread_sql)
+            .bind(channel)
+            .bind(thread)
+            .bind(seen)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| sql_i64(&row, "n"))
+            .unwrap_or(0);
+        let _ = total;
+        Ok((total, unread.max(0)))
+    }
+
+    pub async fn mark_thread_read(&self, channel: &str, thread: &str) -> Result<i64> {
+        let max_sql = self.q(
+            "SELECT COALESCE(MAX(seq), 0) AS n FROM session_messages WHERE channel_id = $1 AND thread_id = $2",
+        );
+        let max_seq: i64 = sqlx::query(&max_sql)
+            .bind(channel)
+            .bind(thread)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| sql_i64(&row, "n"))
+            .unwrap_or(0);
+        let sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT INTO thread_reads (channel_name, thread_id, last_read_seq) VALUES ($1, $2, $3)
+                 ON DUPLICATE KEY UPDATE last_read_seq = VALUES(last_read_seq)",
+            ),
+            _ => self.q(
+                "INSERT INTO thread_reads (channel_name, thread_id, last_read_seq) VALUES ($1, $2, $3)
+                 ON CONFLICT(channel_name, thread_id) DO UPDATE SET last_read_seq = excluded.last_read_seq",
+            ),
+        };
+        sqlx::query(&sql)
+            .bind(channel)
+            .bind(thread)
+            .bind(max_seq)
+            .execute(&self.pool)
+            .await?;
+        Ok(max_seq)
     }
 
     pub async fn mark_read(&self, name: &str, seq: i64) -> Result<()> {

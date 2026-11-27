@@ -6,6 +6,8 @@ mod executor;
 mod git_sync;
 mod hub;
 mod identity;
+mod calendar;
+mod mesh_tls;
 mod migrate;
 mod models;
 mod retrieve;
@@ -370,7 +372,9 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         web_ui::publish_shared_outlines(publish).await;
     });
-    let app = web_ui::router(web);
+    let mtls = mesh_tls::load(&cfg.node);
+    hub::set_client_tls(mtls.clone());
+    let app = web_ui::ui_router(web.clone());
     let listener = tokio::net::TcpListener::bind(&cfg.node.http_addr).await?;
     let http_addr = listener.local_addr()?;
     if cfg.node.discover {
@@ -378,7 +382,12 @@ async fn main() -> Result<()> {
     }
     let http_app = app.clone();
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, http_app).await {
+        if let Err(err) = axum::serve(
+            listener,
+            http_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
             error!("HTTP server stopped: {err}");
         }
     });
@@ -399,7 +408,7 @@ async fn main() -> Result<()> {
             Ok(tls) => match addr.parse::<std::net::SocketAddr>() {
                 Ok(https) => {
                     info!("HTTPS UI listening on https://{https}");
-                    let https_app = app.into_make_service();
+                    let https_app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
                     tokio::spawn(async move {
                         if let Err(err) =
                             axum_server::bind_rustls(https, tls).serve(https_app).await
@@ -599,14 +608,52 @@ async fn main() -> Result<()> {
         });
     }
 
+    if let (Some(addr), Some(mat)) = (
+        cfg.node
+            .mesh_tls_addr
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+        mtls.clone(),
+    ) {
+        match (addr.parse::<std::net::SocketAddr>(), mesh_tls::server_config(&mat)) {
+            (Ok(sock), Ok(tls_cfg)) => {
+                let mesh_tls = axum_server::tls_rustls::RustlsConfig::from_config(tls_cfg);
+                let mesh_app = web_ui::mesh_router(web).into_make_service();
+                info!("mesh mutual TLS listening on https://{sock}");
+                tokio::spawn(async move {
+                    if let Err(err) = axum_server::bind_rustls(sock, mesh_tls).serve(mesh_app).await
+                    {
+                        error!("mesh TLS server stopped: {err}");
+                    }
+                });
+            }
+            (Err(err), _) => warn!("mesh TLS address {addr} is invalid: {err}"),
+            (_, Err(err)) => warn!("mesh TLS disabled: {err}"),
+        }
+    }
+
     let addr = cfg.node.listen_addr.parse()?;
-    Server::builder()
-        .add_service(ClusterServiceServer::new(NodeRpcServer {
-            cfg,
-            db,
-            hmac_key,
-            peer_keys,
-        }))
+    let rpc = NodeRpcServer {
+        cfg: cfg.clone(),
+        db,
+        hmac_key,
+        peer_keys,
+    };
+    let mut grpc = Server::builder();
+    if let Some(mat) = mtls {
+        match mesh_tls::tonic_server(&mat) {
+            Ok(tls) => {
+                info!("gRPC mutual TLS on {}", cfg.node.listen_addr);
+                grpc = grpc
+                    .tls_config(tls)
+                    .context("gRPC TLS configuration")?;
+            }
+            Err(err) => warn!("gRPC staying plaintext, TLS material failed: {err}"),
+        }
+    } else {
+        warn!("gRPC is plaintext; set mtls_ca_path, mtls_cert_path, and mtls_key_path to require client certificates");
+    }
+    grpc.add_service(ClusterServiceServer::new(rpc))
         .serve(addr)
         .await?;
     Ok(())

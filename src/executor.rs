@@ -238,6 +238,52 @@ pub fn inspect_diff(diff: &str) -> Vec<String> {
     if adds + dels > 2000 {
         notes.push("large diff; review it before approving".into());
     }
+    notes.extend(lint_added_lines(diff));
+    notes
+}
+
+/// One finding per added line that looks wrong. This does not apply the diff.
+pub fn lint_added_lines(diff: &str) -> Vec<String> {
+    let mut file = String::new();
+    let mut new_line = 0usize;
+    let mut notes = Vec::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            file = rest
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .trim_start_matches("b/")
+                .to_string();
+            new_line = 0;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@@") {
+            if let Some(plus) = rest.split_whitespace().find(|p| p.starts_with('+')) {
+                let n = plus.trim_start_matches('+').split(',').next().unwrap_or("0");
+                new_line = n.parse().unwrap_or(0);
+            }
+            continue;
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            let body = &line[1..];
+            if body.ends_with(' ') || body.ends_with('\t') {
+                notes.push(format!("lint: {file}:{new_line}: trailing whitespace"));
+            }
+            if body.chars().count() > 160 {
+                notes.push(format!(
+                    "lint: {file}:{new_line}: line is longer than 160 characters"
+                ));
+            }
+            new_line = new_line.saturating_add(1);
+        } else if line.starts_with('-') && !line.starts_with("---") {
+        } else if !line.starts_with('\\') && new_line > 0 {
+            new_line = new_line.saturating_add(1);
+        }
+        if notes.len() >= 20 {
+            break;
+        }
+    }
     notes
 }
 
@@ -269,6 +315,11 @@ mod tests {
         let notes = inspect_diff("diff --git a/a.rs b/a.rs\n+<<<<<<< ours\n+ok\n");
         assert!(notes.iter().any(|n| n.contains("conflict")));
         assert!(inspect_diff("").iter().any(|n| n.contains("empty")));
+        let lint = lint_added_lines(
+            "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+kept \n+short\n",
+        );
+        assert!(lint.iter().any(|n| n.contains("trailing whitespace")), "{lint:?}");
+        assert!(!lint.iter().any(|n| n.contains("short")));
     }
 
     fn signed(req: &mut NodeTaskRequest, key: &[u8; 32]) {

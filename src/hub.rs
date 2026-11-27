@@ -3,14 +3,25 @@ use crate::storage::pb::{
     ChannelRecord, ContextQuery, ListChannelsRequest, SessionMessage, SyncEnvelope,
 };
 use anyhow::Result;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+static CLIENT_TLS: OnceLock<Option<crate::mesh_tls::Material>> = OnceLock::new();
+
+pub fn set_client_tls(material: Option<crate::mesh_tls::Material>) {
+    let _ = CLIENT_TLS.set(material);
+}
+
 fn endpoint(master_url: &str) -> Result<tonic::transport::Endpoint> {
-    Ok(
-        tonic::transport::Endpoint::from_shared(master_url.to_string())?
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30)),
-    )
+    let mut ep = tonic::transport::Endpoint::from_shared(master_url.to_string())?
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30));
+    if master_url.starts_with("https://") {
+        if let Some(Some(mat)) = CLIENT_TLS.get() {
+            ep = ep.tls_config(crate::mesh_tls::tonic_client(mat)?)?;
+        }
+    }
+    Ok(ep)
 }
 
 pub async fn list_public(master_url: &str) -> Result<Vec<ChannelRecord>> {

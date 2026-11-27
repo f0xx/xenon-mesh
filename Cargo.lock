@@ -3221,6 +3221,7 @@ dependencies = [
  "prost",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sqlx",

@@ -13,7 +13,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -75,6 +75,22 @@ pub struct ChatReq {
     pub rerun: bool,
     #[serde(default)]
     pub debate: bool,
+    /// When false, store the message and do not call a model.
+    #[serde(default = "default_true")]
+    pub agentic: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn agentic_key(channel: &str) -> String {
+    let raw = format!("ag:{channel}");
+    if raw.len() <= 64 {
+        raw
+    } else {
+        format!("ag:{}", &blake3::hash(channel.as_bytes()).to_hex()[..32])
+    }
 }
 
 #[derive(Deserialize)]
@@ -192,12 +208,43 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/mesh/share", post(handle_mesh_share))
         .route("/api/mesh/join", post(handle_mesh_join))
         .route("/api/mesh/history", get(handle_mesh_history))
+        .route("/api/agentic", get(handle_agentic_get).post(handle_agentic_set))
+        .route("/api/thread-read", post(handle_thread_read))
         .route("/api/status", get(|State(st): State<Arc<WebState>>| async move {
             Json(st.status.read().await.clone())
         }))
         .route("/v1/chat/completions", post(handle_oai_compat))
         .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state)
+}
+
+pub fn ui_router(state: Arc<WebState>) -> Router {
+    router(state).layer(axum::middleware::from_fn(mesh_loopback_only))
+}
+
+pub fn mesh_router(state: Arc<WebState>) -> Router {
+    router(state)
+}
+
+async fn mesh_loopback_only(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.uri().path().starts_with("/api/mesh/") {
+        let loopback = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|info| info.0.ip().is_loopback())
+            .unwrap_or(false);
+        if !loopback {
+            return (
+                StatusCode::FORBIDDEN,
+                "mesh routes on this port are only reachable from localhost; use mesh_tls_addr or an SSH forward",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 fn mode_name(mode: &NodeMode) -> &'static str {
@@ -212,6 +259,31 @@ fn master_url(cfg: &AppConfig) -> Option<&str> {
         NodeMode::Node => cfg.node.master_url.as_deref().filter(|s| !s.is_empty()),
         NodeMode::Master => None,
     }
+}
+
+fn mesh_base(cfg: &AppConfig) -> Option<&str> {
+    cfg.node
+        .master_mesh
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| master_http(cfg))
+}
+
+fn hub_client(cfg: &AppConfig, timeout_secs: u64) -> reqwest::Client {
+    let mut builder =
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(timeout_secs));
+    if let Some(mat) = crate::mesh_tls::load(&cfg.node) {
+        if let (Ok(id), Ok(ca)) = (
+            reqwest::Identity::from_pem(mat.identity_pem().as_bytes()),
+            reqwest::Certificate::from_pem(mat.ca_pem.as_bytes()),
+        ) {
+            builder = builder.identity(id).add_root_certificate(ca);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn master_http(cfg: &AppConfig) -> Option<&str> {
@@ -295,8 +367,8 @@ async fn handle_list_channels(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut remote_seq = std::collections::HashMap::new();
-    if let Some(base) = master_http(&st.cfg) {
-        if let Some(mesh) = fetch_mesh(base, &st.cfg.node.id).await {
+    if mesh_base(&st.cfg).is_some() {
+        if let Some(mesh) = fetch_mesh(&st.cfg, &st.cfg.node.id).await {
             remote_seq = mesh.activity;
             for ch in mesh.channels {
                 if !rows.iter().any(|r| r.name == ch.name) {
@@ -335,8 +407,8 @@ async fn handle_list_channels(
             },
         );
     }
-    let remote_live = if let Some(base) = master_http(&st.cfg) {
-        fetch_remote_live(base).await.unwrap_or_default()
+    let remote_live = if let Some(base) = mesh_base(&st.cfg) {
+        fetch_remote_live(&st.cfg, base).await.unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -432,11 +504,9 @@ struct MeshView {
     activity: std::collections::HashMap<String, i64>,
 }
 
-async fn fetch_mesh(base: &str, node_id: &str) -> Option<MeshView> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
+async fn fetch_mesh(cfg: &AppConfig, node_id: &str) -> Option<MeshView> {
+    let base = mesh_base(cfg)?;
+    let client = hub_client(cfg, 8);
     let root = base.trim_end_matches('/');
     let channels: Vec<ChannelRow> = client
         .get(format!("{root}/api/mesh/channels"))
@@ -546,9 +616,9 @@ async fn handle_history(
         }
     }
     if channel_visibility(&st, &q.channel).await == "shared" {
-        if let Some(base) = master_http(&st.cfg) {
+        if let Some(base) = mesh_base(&st.cfg) {
             if let Some(msgs) =
-                fetch_shared_history(base, &st.cfg.node.id, &q.channel, &q.thread).await
+                fetch_shared_history(&st.cfg, base, &st.cfg.node.id, &q.channel, &q.thread).await
             {
                 for msg in msgs {
                     apply_synced(&st, &q.channel, msg).await;
@@ -569,10 +639,23 @@ async fn handle_history(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let threads = st.db.list_threads(&q.channel).await.unwrap_or_default();
+    let mut counts = HashMap::new();
+    if q.thread == "main" {
+        for m in &msgs {
+            let child = format!("m{}", m.message.seq);
+            if threads.iter().any(|t| t == &child) {
+                if let Ok(pair) = st.db.thread_progress(&q.channel, &child).await {
+                    counts.insert(child, pair);
+                }
+            }
+        }
+    }
     Ok(Json(
         msgs.into_iter()
             .map(|m| {
                 let child = format!("m{}", m.message.seq);
+                let linked = q.thread == "main" && counts.contains_key(&child);
+                let (total, unread) = counts.get(&child).copied().unwrap_or((0, 0));
                 HistoryItem {
                     role: m.message.author,
                     text: m.message.content,
@@ -581,11 +664,9 @@ async fn handle_history(
                     edited_at_ms: m.edited_at_ms,
                     started_at_ms: m.started_at_ms,
                     finished_at_ms: m.finished_at_ms,
-                    reply_thread: if q.thread == "main" && threads.iter().any(|t| t == &child) {
-                        child
-                    } else {
-                        String::new()
-                    },
+                    reply_thread: if linked { child } else { String::new() },
+                    thread_total: if linked { total.max(0) as u64 } else { 0 },
+                    thread_unread: if linked { unread.max(0) as u64 } else { 0 },
                 }
             })
             .collect(),
@@ -606,6 +687,10 @@ struct HistoryItem {
     finished_at_ms: i64,
     #[serde(default)]
     reply_thread: String,
+    #[serde(default)]
+    thread_total: u64,
+    #[serde(default)]
+    thread_unread: u64,
 }
 
 async fn handle_list_threads(
@@ -1103,10 +1188,36 @@ async fn prompt_for(
     if let Some(dir) = outline_dir {
         outline = project_outline(&st.cfg, dir).await;
     }
-    Ok(format!(
-        "{}\n\n{outline}\n\n{retrieved}",
-        coding_preamble(channel)
-    ))
+    let mut text = format!("{}\n\n{outline}\n\n{retrieved}", coding_preamble(channel));
+    if crate::calendar::wants_agenda(query) {
+        if let Some(agenda) = load_agenda(&st.cfg).await {
+            text.push_str("\n\n## Agenda\n");
+            text.push_str(&agenda);
+        }
+    }
+    Ok(text)
+}
+
+async fn load_agenda(cfg: &AppConfig) -> Option<String> {
+    let url = cfg.calendar.ics_url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let client = hub_client(cfg, 8);
+    let mut req = client.get(url);
+    if !cfg.calendar.token_env.trim().is_empty() {
+        if let Ok(token) = std::env::var(cfg.calendar.token_env.trim()) {
+            if !token.trim().is_empty() {
+                req = req.bearer_auth(token.trim());
+            }
+        }
+    }
+    let body = req.send().await.ok()?.text().await.ok()?;
+    let now = now_ms();
+    let horizon = 7 * 24 * 60 * 60 * 1000;
+    Some(crate::calendar::format_agenda(&crate::calendar::upcoming(
+        &body, now, horizon,
+    )))
 }
 
 async fn collect_channel_entries(
@@ -1830,6 +1941,18 @@ async fn handle_persistent_chat(
                 .await;
             stored_user = Some(store_message(&st_bg, user_msg, sync_hub, "").await);
         }
+        if !req.agentic {
+            let seq = stored_user.as_ref().map(|m| m.seq).unwrap_or(0);
+            let _ = tx
+                .send(StreamEvent::Saved {
+                    seq,
+                    thread: req.thread.clone(),
+                    model: String::new(),
+                    last: true,
+                })
+                .await;
+            return;
+        }
         let reply_thread = if visibility == "public" && req.thread == "main" {
             if let Some(parent) = stored_user.as_ref() {
                 Some(open_reply_thread(&st_bg, &req.channel, parent, sync_hub).await)
@@ -2210,10 +2333,7 @@ async fn signed_post(
     let body = serde_json::to_vec(payload).map_err(|_| StatusCode::BAD_REQUEST)?;
     let canon = crate::identity::canonical(kind, parts);
     let ts = now_ms();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let client = hub_client(&st.cfg, 60);
     let mut req = client
         .post(url)
         .header("content-type", "application/json")
@@ -2452,15 +2572,13 @@ async fn handle_mesh_history(
 }
 
 async fn fetch_shared_history(
+    cfg: &AppConfig,
     base: &str,
     node_id: &str,
     channel: &str,
     thread: &str,
 ) -> Option<Vec<ShareMsg>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
+    let client = hub_client(cfg, 8);
     let msgs: Vec<ShareMsg> = client
         .get(format!("{}/api/mesh/history", base.trim_end_matches('/')))
         .query(&[
@@ -2653,7 +2771,7 @@ async fn handle_join(
     State(st): State<Arc<WebState>>,
     Json(body): Json<NodeQuery>,
 ) -> Result<StatusCode, StatusCode> {
-    if let Some(base) = master_http(&st.cfg) {
+    if let Some(base) = mesh_base(&st.cfg) {
         let payload = NodeQuery {
             node_id: st.cfg.node.id.clone(),
             channel: body.channel.clone(),
@@ -2691,41 +2809,92 @@ async fn handle_inspect(
     Json(body): Json<InspectBody>,
 ) -> Json<serde_json::Value> {
     let mut findings = crate::executor::inspect_diff(&body.diff);
-    if let Some(bin) = st.cfg.git.inspect_command.first() {
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(st.cfg.git.inspect_command.iter().skip(1));
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = stdin.write_all(body.diff.as_bytes()).await;
-                }
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    child.wait_with_output(),
-                )
+    append_command_findings(&mut findings, &st.cfg.git.inspect_command, &body.diff, "inspector").await;
+    append_command_findings(&mut findings, &st.cfg.git.status_command, &body.diff, "status").await;
+    Json(serde_json::json!({ "findings": findings, "blocks_approve": false }))
+}
+
+async fn append_command_findings(findings: &mut Vec<String>, argv: &[String], diff: &str, label: &str) {
+    let Some(bin) = argv.first() else {
+        return;
+    };
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(argv.iter().skip(1));
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(diff.as_bytes()).await;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
                 .await
-                {
-                    Ok(Ok(out)) => {
-                        for line in String::from_utf8_lossy(&out.stdout).lines().take(20) {
-                            if !line.trim().is_empty() {
-                                findings.push(line.trim().to_string());
-                            }
-                        }
-                        if !out.status.success() {
-                            findings.push("external inspector reported a problem".into());
+            {
+                Ok(Ok(out)) => {
+                    for line in String::from_utf8_lossy(&out.stdout).lines().take(20) {
+                        if !line.trim().is_empty() {
+                            findings.push(line.trim().to_string());
                         }
                     }
-                    _ => findings.push("external inspector timed out".into()),
+                    if !out.status.success() {
+                        findings.push(format!("{label} reported a problem"));
+                    }
                 }
+                _ => findings.push(format!("{label} timed out")),
             }
-            Err(_) => findings.push("external inspector could not start".into()),
         }
+        Err(_) => findings.push(format!("{label} could not start")),
     }
-    Json(serde_json::json!({ "findings": findings }))
+}
+
+#[derive(Deserialize)]
+struct AgenticBody {
+    channel: String,
+    enabled: bool,
+}
+
+async fn handle_agentic_get(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<ThreadsQuery>,
+) -> Json<serde_json::Value> {
+    let key = agentic_key(&q.channel);
+    let enabled = st.db.get_setting(&key).await.unwrap_or_default() != "0";
+    Json(serde_json::json!({ "enabled": enabled }))
+}
+
+async fn handle_agentic_set(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<AgenticBody>,
+) -> StatusCode {
+    let key = agentic_key(&body.channel);
+    let value = if body.enabled { "1" } else { "0" };
+    if st.db.set_setting(&key, value).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct ThreadReadBody {
+    channel: String,
+    thread: String,
+}
+
+async fn handle_thread_read(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<ThreadReadBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if body.thread == "main" || body.thread.trim().is_empty() {
+        return Ok(Json(serde_json::json!({ "seq": 0 })));
+    }
+    let seq = st
+        .db
+        .mark_thread_read(&body.channel, &body.thread)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "seq": seq })))
 }
 
 async fn handle_share(
@@ -2772,7 +2941,7 @@ async fn handle_share(
     let mut payload = payload;
     payload.token_hash = token_hash.clone();
     let listed = payload.members.join(",");
-    if let Some(base) = master_http(&st.cfg) {
+    if let Some(base) = mesh_base(&st.cfg) {
         let resp = signed_post(
             &st,
             &format!("{}/api/mesh/share", base.trim_end_matches('/')),
@@ -3009,7 +3178,7 @@ pub async fn publish_shared_outlines(st: Arc<WebState>) {
 }
 
 async fn push_entries(st: &WebState, channel: &str, entries: &[ShareEntry]) {
-    let Some(base) = master_http(&st.cfg) else {
+    let Some(base) = mesh_base(&st.cfg) else {
         for entry in entries {
             let _ = st.db.upsert_proto(&entry_proto(st, entry), false).await;
         }
@@ -3115,8 +3284,8 @@ async fn open_reply_thread(
 
 async fn high_water(st: &WebState, name: &str) -> i64 {
     let local = st.db.max_seq(name).await.unwrap_or(0);
-    let remote = if let Some(base) = master_http(&st.cfg) {
-        fetch_mesh(base, &st.cfg.node.id)
+    let remote = if mesh_base(&st.cfg).is_some() {
+        fetch_mesh(&st.cfg, &st.cfg.node.id)
             .await
             .and_then(|mesh| mesh.activity.get(name).copied())
             .unwrap_or(0)
@@ -3133,11 +3302,8 @@ async fn high_water(st: &WebState, name: &str) -> i64 {
     local.max(remote)
 }
 
-async fn fetch_remote_live(base: &str) -> Option<HashMap<String, String>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
-        .build()
-        .ok()?;
+async fn fetch_remote_live(cfg: &AppConfig, base: &str) -> Option<HashMap<String, String>> {
+    let client = hub_client(cfg, 4);
     client
         .get(format!("{}/api/mesh/live", base.trim_end_matches('/')))
         .send()
@@ -3237,16 +3403,10 @@ async fn snapshot_entries(st: &WebState, channel: &str) -> Vec<ShareEntry> {
 }
 
 async fn pull_remote_entries(st: &WebState, channel: &str) {
-    let Some(base) = master_http(&st.cfg) else {
+    let Some(base) = mesh_base(&st.cfg) else {
         return;
     };
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return,
-    };
+    let client = hub_client(&st.cfg, 8);
     let rows: Vec<ShareEntry> = match client
         .get(format!("{}/api/mesh/context", base.trim_end_matches('/')))
         .query(&[("node_id", st.cfg.node.id.as_str()), ("channel", channel)])
@@ -3279,7 +3439,7 @@ async fn pull_remote_entries(st: &WebState, channel: &str) {
 }
 
 async fn http_append(st: &WebState, msg: &SessionMessage) -> Option<SessionMessage> {
-    let base = master_http(&st.cfg)?;
+    let base = mesh_base(&st.cfg)?;
     let payload = ShareMsg {
         thread_id: msg.thread_id.clone(),
         seq: msg.seq,
@@ -3337,7 +3497,7 @@ async fn publish_edit(
     text: &str,
     edited_at_ms: i64,
 ) {
-    if let Some(base) = master_http(&st.cfg) {
+    if let Some(base) = mesh_base(&st.cfg) {
         let payload = ShareMsg {
             thread_id: thread.into(),
             seq,
@@ -3374,7 +3534,7 @@ async fn publish_edit(
 }
 
 async fn publish_delete(st: &WebState, channel: &str, thread: &str, seq: u64) {
-    if let Some(base) = master_http(&st.cfg) {
+    if let Some(base) = mesh_base(&st.cfg) {
         let payload = ShareMsg {
             thread_id: thread.into(),
             seq,
@@ -3523,7 +3683,7 @@ async fn handle_typing(
     } else {
         set_live(&st, &body.channel, &body.kind, now_ms() + 6_000);
     }
-    if let Some(base) = master_http(&st.cfg) {
+    if let Some(base) = mesh_base(&st.cfg) {
         let _ = signed_post(
             &st,
             &format!("{}/api/mesh/typing", base.trim_end_matches('/')),

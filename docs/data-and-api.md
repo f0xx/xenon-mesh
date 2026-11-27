@@ -56,9 +56,11 @@ The UI is `GET /`. JSON routes:
 | `POST` | `/api/channels` | `{name, visibility, namespace, context_namespaces}`. `public` is pushed to the hub |
 | `GET` | `/api/threads?channel=` | Thread ids. `main` is always present |
 | `POST` | `/api/threads/fork` | Copies head and tail into a new private thread |
-| `GET` | `/api/history?channel=&thread=` | Pulls a public thread from the hub, then returns local rows. Each row is `{role, text, created_at_ms}` |
-| `POST` | `/api/inspect` | `{diff}` returns `{findings}` from the built-in inspector and `git.inspect_command` |
-| `POST` | `/api/chat` | SSE. Events are JSON with `type` of `status`, `thought`, `delta`, or `done` |
+| `GET` | `/api/history?channel=&thread=` | Pulls a public thread from the hub, then returns local rows. A main-thread row that opened a child includes `reply_thread`, `thread_total`, and `thread_unread` |
+| `POST` | `/api/thread-read` | `{channel, thread}` marks that thread read on this node |
+| `GET`/`POST` | `/api/agentic` | Per-channel switch. Missing means on. `POST {channel, enabled}` |
+| `POST` | `/api/inspect` | `{diff}` returns `{findings, blocks_approve:false}` from the built-in inspector, `git.inspect_command`, and `git.status_command` |
+| `POST` | `/api/chat` | SSE. `agentic: false` stores the message and does not call a model. The field defaults to true |
 | `GET` | `/api/memory?channel=` | Pins and learned notes |
 | `DELETE` | `/api/memory?id=` | Deletes one context row |
 | `POST` | `/api/memory/learn` | `{channel, title, text, pin}`. `pin: false` asks the model to distill first |
