@@ -1106,7 +1106,7 @@ async fn prompt_for(
     }
     let entries: Vec<_> = merged.into_values().collect();
     let q_emb = st.models.embed_text(query).await.unwrap_or_default();
-    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, 10, 64_000);
+    let retrieved = assemble_context(&map_entries(&entries), query, &q_emb, 6, 28_000);
     let mut outline = String::new();
     if let Some(dir) = outline_dir {
         outline = project_outline(&st.cfg, dir).await;
@@ -1155,7 +1155,7 @@ async fn project_outline(cfg: &AppConfig, dir: std::path::PathBuf) -> String {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !text.is_empty() {
                     let numbered = number_harvest_code(&text);
-                    return numbered.chars().take(28_000).collect();
+                    return numbered.chars().take(10_000).collect();
                 }
             }
         }

@@ -191,7 +191,7 @@ pub fn assemble_context(
         if used >= char_budget {
             break;
         }
-        let room = char_budget.saturating_sub(used).min(12_000);
+        let room = char_budget.saturating_sub(used).min(4_000);
         if room < 200 {
             break;
         }
@@ -234,7 +234,7 @@ pub fn assemble_context(
         if used >= char_budget {
             break;
         }
-        let room = char_budget.saturating_sub(used).min(16_000);
+        let room = char_budget.saturating_sub(used).min(8_000);
         if room < 200 {
             break;
         }
