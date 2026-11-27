@@ -69,7 +69,8 @@ pub fn coding_preamble(channel: &str) -> String {
          - ```read with `<path>` or `<path>:<start>-<end>` (up to 3 paths per step). Paths stay inside the project.\n\
          - ```grep with a substring to search across the repository. This is not a regular expression.\n\
          - ```web with a search query, or ```fetch with one http(s) URL\n\
-         The daemon fetches the numbered lines and calls you again. Stop asking once you can answer."
+         - ```agent with a first line `provider/model` and the task below it, when a sub-agent should do that part. The scheduler may refuse a busy host. Then continue yourself.\n\
+         The daemon fetches the numbered lines and calls you again. Stop asking once you can answer. A clarification from the operator during this reply is extra instruction, not a new project context."
     )
 }
 

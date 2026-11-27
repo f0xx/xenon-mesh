@@ -60,7 +60,11 @@ The UI is `GET /`. JSON routes:
 | `POST` | `/api/thread-read` | `{channel, thread}` marks that thread read on this node |
 | `GET`/`POST` | `/api/agentic` | Per-channel switch. Missing means on. `POST {channel, enabled}` |
 | `POST` | `/api/inspect` | `{diff}` returns `{findings, blocks_approve:false}` from the built-in inspector, `git.inspect_command`, and `git.status_command` |
-| `POST` | `/api/chat` | SSE. `agentic: false` stores the message and does not call a model. The field defaults to true |
+| `POST` | `/api/chat` | SSE. `agentic: false` stores the message and does not call a model. The field defaults to true. A `status` event whose text is `cancelled` means that model stopped |
+| `POST` | `/api/chat/cancel` | `{channel, thread, model}` stops that pending agent reply. `409` when nothing is running |
+| `POST` | `/api/chat/steer` | `{channel, thread, text, model?}`. `model` empty steers every running reply in the thread. Applied after the current call, same context. `409` when nothing is running |
+| `GET`/`POST` | `/api/internal/load` | In-flight reply counts. Daemons post `{node, inflight, capacity, models, updated_ms}`. The hub is the board |
+| `POST` | `/api/internal/delegate` | `{model, task}` runs one sub-agent. `429` when this daemon is at `models.max_inflight`. `403` when sub-agents are off |
 | `GET` | `/api/memory?channel=` | Pins and learned notes |
 | `DELETE` | `/api/memory?id=` | Deletes one context row |
 | `POST` | `/api/memory/learn` | `{channel, title, text, pin}`. `pin: false` asks the model to distill first |

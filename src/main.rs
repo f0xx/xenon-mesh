@@ -3,7 +3,9 @@ mod cli;
 mod config;
 mod discover;
 mod executor;
+mod flights;
 mod git_sync;
+mod orchestrate;
 mod hub;
 mod identity;
 mod calendar;
@@ -365,6 +367,9 @@ async fn main() -> Result<()> {
         })),
         neighbors: Arc::new(std::sync::Mutex::new(Vec::new())),
         live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        flights: std::sync::Arc::new(crate::flights::Board::new()),
+        loads: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        local_inflight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
     });
     let neighbors = web.neighbors.clone();
     let publish = web.clone();

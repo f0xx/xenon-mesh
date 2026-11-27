@@ -101,6 +101,23 @@ pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
                     });
                 }
             }
+            "agent" | "delegate" => {
+                let query = inside.trim();
+                if crate::orchestrate::parse_agent_task(query).is_some() {
+                    tools.push(Lookup {
+                        kind: "agent".into(),
+                        query: query.chars().take(2_200).collect(),
+                    });
+                } else {
+                    kept.push_str("```");
+                    kept.push_str(lang);
+                    kept.push('\n');
+                    kept.push_str(inside);
+                    if close.is_some() {
+                        kept.push_str("```");
+                    }
+                }
+            }
             "grep" | "find" => {
                 let query = inside.trim();
                 if !query.is_empty() {
@@ -128,13 +145,45 @@ pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
     (kept.trim().to_string(), tools)
 }
 
-pub async fn search(query: &str) -> Result<String> {
+pub async fn search(query: &str, searx_url: &str) -> Result<String> {
+    let base = searx_url.trim().trim_end_matches('/');
+    if !base.is_empty() {
+        let url = format!(
+            "{base}/search?q={}&format=json&categories=general",
+            urlencoding_min(query)
+        );
+        if let Ok(body) = http_get(&url).await {
+            if let Some(text) = searx_snippets(&body) {
+                return Ok(text);
+            }
+        }
+    }
     let url = format!(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoding_min(query)
     );
     let html = http_get(&url).await?;
     Ok(snippets(&html))
+}
+
+fn searx_snippets(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let results = v.get("results")?.as_array()?;
+    let mut out = String::new();
+    for item in results.iter().take(5) {
+        let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let url = item.get("url").and_then(|t| t.as_str()).unwrap_or("");
+        let content = item.get("content").and_then(|t| t.as_str()).unwrap_or("");
+        if title.is_empty() && url.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("- {title}\n  {url}\n  {content}\n"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(clip(&out, 4_000))
+    }
 }
 
 pub async fn fetch_page(url: &str) -> Result<String> {
@@ -218,10 +267,11 @@ pub fn format_line_slice(text: &str, range: Option<(usize, usize)>, max_chars: u
     out
 }
 
-pub async fn run(lookup: &Lookup) -> Result<String> {
+pub async fn run(lookup: &Lookup, searx_url: &str) -> Result<String> {
     match lookup.kind.as_str() {
         "fetch" => fetch_page(&lookup.query).await,
-        _ => search(&lookup.query).await,
+        "agent" => bail!("agent tasks are run by the scheduler, not the browser"),
+        _ => search(&lookup.query, searx_url).await,
     }
 }
 
@@ -387,6 +437,17 @@ mod tests {
         let text = "давай http://example.com/a и ещё";
         assert_eq!(urls_in(text), vec!["http://example.com/a".to_string()]);
         assert!(urls_in("привет, без ссылки").is_empty());
+    }
+
+    #[test]
+    fn an_agent_fence_is_a_tool_and_rust_is_not() {
+        let (text, tools) = take_requests("answer\n```agent\nhuge/qwen\ncheck the parser\n```");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "agent");
+        assert!(!text.contains("check the parser"));
+        let (kept, none) = take_requests("```rust\nfn main() {}\n```");
+        assert!(none.is_empty());
+        assert!(kept.contains("fn main"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -46,6 +46,12 @@ pub struct WebState {
     pub neighbors: Arc<Mutex<Vec<crate::discover::Neighbor>>>,
     /// channel -> (typing|reply, expiry epoch ms)
     pub live: Arc<Mutex<HashMap<String, (String, i64)>>>,
+    /// Pending agent replies. Cancel and steer look a reply up here.
+    pub flights: Arc<crate::flights::Board>,
+    /// Last load report from each daemon, including this one.
+    pub loads: Arc<Mutex<HashMap<String, crate::orchestrate::HostLoad>>>,
+    /// Agent replies this process is running right now.
+    pub local_inflight: Arc<AtomicU32>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -163,6 +169,13 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/", get(|| async { Html(include_str!("../assets/index.html")) }))
         .route("/api/health", get(handle_health))
         .route("/api/chat", post(handle_persistent_chat))
+        .route("/api/chat/cancel", post(handle_cancel))
+        .route("/api/chat/steer", post(handle_steer))
+        .route(
+            "/api/internal/load",
+            get(handle_load_get).post(handle_load_post),
+        )
+        .route("/api/internal/delegate", post(handle_delegate))
         .route("/api/history", get(handle_history))
         .route("/api/threads", get(handle_list_threads))
         .route("/api/memory/learn", post(handle_learn))
@@ -219,7 +232,18 @@ pub fn router(state: Arc<WebState>) -> Router {
 }
 
 pub fn ui_router(state: Arc<WebState>) -> Router {
-    router(state).layer(axum::middleware::from_fn(mesh_loopback_only))
+    let lock_mesh = crate::mesh_tls::load(&state.cfg.node).is_some()
+        || state
+            .cfg
+            .node
+            .mesh_tls_addr
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|addr| !addr.is_empty());
+    router(state).layer(axum::middleware::from_fn(move |req, next| {
+        let lock_mesh = lock_mesh;
+        async move { mesh_loopback_only(lock_mesh, req, next).await }
+    }))
 }
 
 pub fn mesh_router(state: Arc<WebState>) -> Router {
@@ -227,10 +251,11 @@ pub fn mesh_router(state: Arc<WebState>) -> Router {
 }
 
 async fn mesh_loopback_only(
+    lock_mesh: bool,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if req.uri().path().starts_with("/api/mesh/") {
+    if lock_mesh && req.uri().path().starts_with("/api/mesh/") {
         let loopback = req
             .extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -1674,6 +1699,449 @@ fn stamp(ev: StreamEvent, model: &str) -> StreamEvent {
     }
 }
 
+struct Tracked(Arc<WebState>);
+
+impl Tracked {
+    fn enter(st: Arc<WebState>) -> Self {
+        st.local_inflight.fetch_add(1, Ordering::Relaxed);
+        let publish = st.clone();
+        tokio::spawn(async move {
+            publish_load(&publish).await;
+        });
+        Self(st)
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.0.local_inflight.fetch_sub(1, Ordering::Relaxed);
+        let st = self.0.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                publish_load(&st).await;
+            });
+        }
+    }
+}
+
+enum Round {
+    Text(String, String),
+    Cancelled,
+    Failed(String),
+}
+
+enum PeerErr {
+    Cancelled,
+    Rejected(String),
+    Unreachable,
+}
+
+fn neighbor_base(st: &WebState, node: &str) -> Option<String> {
+    let guard = st.neighbors.lock().ok()?;
+    guard
+        .iter()
+        .find(|n| n.name == node)
+        .map(|n| n.base.clone())
+}
+
+async fn publish_load(st: &WebState) {
+    let models = st
+        .models
+        .model_choices()
+        .await
+        .into_iter()
+        .map(|choice| choice.id)
+        .collect::<Vec<_>>();
+    let report = crate::orchestrate::HostLoad {
+        node: st.cfg.node.id.clone(),
+        inflight: st.local_inflight.load(Ordering::Relaxed),
+        capacity: st.cfg.models.max_inflight.max(1),
+        models,
+        updated_ms: now_ms(),
+    };
+    if let Ok(mut guard) = st.loads.lock() {
+        guard.insert(report.node.clone(), report.clone());
+    }
+    let Some(base) = master_http(&st.cfg) else {
+        return;
+    };
+    let client = hub_client(&st.cfg, 8);
+    let url = format!("{}/api/internal/load", base.trim_end_matches('/'));
+    let _ = client.post(url).json(&report).send().await;
+}
+
+async fn collect_board(st: &WebState) -> Vec<crate::orchestrate::HostLoad> {
+    let mut map: HashMap<String, crate::orchestrate::HostLoad> = HashMap::new();
+    if let Some(base) = master_http(&st.cfg) {
+        let client = hub_client(&st.cfg, 8);
+        let url = format!("{}/api/internal/load", base.trim_end_matches('/'));
+        if let Ok(resp) = client.get(url).send().await {
+            if let Ok(rows) = resp.json::<Vec<crate::orchestrate::HostLoad>>().await {
+                for row in rows {
+                    map.insert(row.node.clone(), row);
+                }
+            }
+        }
+    }
+    if let Ok(guard) = st.loads.lock() {
+        for (node, row) in guard.iter() {
+            map.insert(node.clone(), row.clone());
+        }
+    }
+    let models = st
+        .models
+        .model_choices()
+        .await
+        .into_iter()
+        .map(|choice| choice.id)
+        .collect();
+    let mine = crate::orchestrate::HostLoad {
+        node: st.cfg.node.id.clone(),
+        inflight: st.local_inflight.load(Ordering::Relaxed),
+        capacity: st.cfg.models.max_inflight.max(1),
+        models,
+        updated_ms: now_ms(),
+    };
+    map.insert(mine.node.clone(), mine);
+    map.into_values().collect()
+}
+
+async fn one_round(
+    st: &WebState,
+    model: &str,
+    ctx: &str,
+    turns: &[ChatTurn],
+    local_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    ticket: &mut crate::flights::Ticket,
+    audit: Option<serde_json::Value>,
+) -> Round {
+    let call = dispatch_chat(st, model, ctx, turns, local_tx.clone(), audit);
+    tokio::pin!(call);
+    tokio::select! {
+        biased;
+        _ = ticket.until_cancelled() => Round::Cancelled,
+        result = &mut call => match result {
+            Ok((text, used)) => Round::Text(text, used),
+            Err(err) => Round::Failed(format!("{err:#}")),
+        },
+    }
+}
+
+const SUBAGENT_SYSTEM: &str = "You are a sub-agent answering one task for a supervisor. \
+Use only the task text. Do not emit an agent, read, grep, web, or fetch fence.";
+
+async fn call_peer(
+    base: &str,
+    model: &str,
+    task: &str,
+    ticket: &mut crate::flights::Ticket,
+) -> Result<String, PeerErr> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|_| PeerErr::Unreachable)?;
+    let pending = client
+        .post(format!(
+            "{}/api/internal/delegate",
+            base.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({ "model": model, "task": task }))
+        .send();
+    tokio::pin!(pending);
+    let resp = tokio::select! {
+        biased;
+        _ = ticket.until_cancelled() => return Err(PeerErr::Cancelled),
+        resp = &mut pending => resp.map_err(|_| PeerErr::Unreachable)?,
+    };
+    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(PeerErr::Rejected(body));
+    }
+    if !resp.status().is_success() {
+        return Err(PeerErr::Unreachable);
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|_| PeerErr::Unreachable)?;
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            return Err(PeerErr::Rejected(err.to_string()));
+        }
+    }
+    Ok(body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+async fn execute_delegate(
+    st: Arc<WebState>,
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    channel: String,
+    thread: String,
+    sync_hub: bool,
+    model: String,
+    task: String,
+    host: String,
+    mut ticket: crate::flights::Ticket,
+) -> String {
+    let local = host == st.cfg.node.id;
+    let peer = if local {
+        None
+    } else {
+        neighbor_base(&st, &host)
+    };
+    let mut run_local = peer.is_none();
+    let (mut text, mut cancelled) = if let Some(base) = peer {
+        match call_peer(&base, &model, &task, &mut ticket).await {
+            Ok(text) => (text, false),
+            Err(PeerErr::Cancelled) => (String::new(), true),
+            Err(PeerErr::Rejected(reason)) => {
+                st.flights.end(ticket.id);
+                return format!("rejected: {reason}");
+            }
+            Err(PeerErr::Unreachable) => {
+                run_local = true;
+                (String::new(), false)
+            }
+        }
+    } else {
+        (String::new(), false)
+    };
+    if run_local && !cancelled {
+        let cap = st.cfg.models.max_inflight.max(1);
+        if !local && st.local_inflight.load(Ordering::Relaxed) >= cap {
+            st.flights.end(ticket.id);
+            return format!("rejected: `{host}` is not reachable and this node is at capacity");
+        }
+        let _slot = Tracked::enter(st.clone());
+        let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
+        let acc = Arc::new(Mutex::new(String::new()));
+        let acc_pump = acc.clone();
+        let forward = tx.clone();
+        let label = model.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(ev) = local_rx.recv().await {
+                if let StreamEvent::Delta { text: delta, .. } = &ev {
+                    if let Ok(mut guard) = acc_pump.lock() {
+                        guard.push_str(delta);
+                    }
+                }
+                let _ = forward.send(stamp(ev, &label)).await;
+            }
+        });
+        let turns = vec![ChatTurn {
+            role: "user".into(),
+            text: task.clone(),
+            attachments: vec![],
+        }];
+        let call = dispatch_chat(
+            &st,
+            &model,
+            SUBAGENT_SYSTEM,
+            &turns,
+            local_tx.clone(),
+            None,
+        );
+        tokio::pin!(call);
+        let outcome = tokio::select! {
+            biased;
+            _ = ticket.until_cancelled() => None,
+            result = &mut call => Some(result),
+        };
+        drop(local_tx);
+        let _ = pump.await;
+        let streamed = acc.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        match outcome {
+            None => {
+                text = streamed;
+                cancelled = true;
+            }
+            Some(Ok((full, _))) => text = full,
+            Some(Err(err)) => text = format!("[ERROR] {err:#}"),
+        }
+        if !local {
+            text = format!("`{host}` was not reachable, so this node ran it.\n{text}");
+        }
+    }
+    let (clean, _) = crate::browse::take_requests(&text);
+    if !clean.trim().is_empty() {
+        text = clean;
+    }
+    if cancelled {
+        if !text.contains("[cancelled]") {
+            if text.is_empty() {
+                text = "[cancelled]".into();
+            } else {
+                text.push_str("\n\n[cancelled]");
+            }
+        }
+        let _ = tx
+            .send(StreamEvent::Status {
+                text: "cancelled".into(),
+                model: model.clone(),
+            })
+            .await;
+    }
+    let detail = serde_json::json!({
+        "model": model,
+        "host": host,
+        "cancelled": cancelled,
+        "actions": ["subagent"]
+    })
+    .to_string();
+    let _ = store_message(
+        &st,
+        SessionMessage {
+            channel_id: channel,
+            thread_id: thread,
+            seq: 0,
+            author: model.clone(),
+            content: text.clone(),
+            created_at_ms: 0,
+        },
+        sync_hub,
+        &detail,
+    )
+    .await;
+    st.flights.end(ticket.id);
+    text
+}
+
+#[derive(Deserialize)]
+struct CancelReq {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct SteerReq {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    #[serde(default)]
+    model: String,
+    text: String,
+}
+
+async fn handle_cancel(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<CancelReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let thread = if req.thread.is_empty() {
+        "main"
+    } else {
+        req.thread.as_str()
+    };
+    let n = st.flights.cancel(&req.channel, thread, &req.model);
+    if n == 0 {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(Json(serde_json::json!({ "cancelled": n })))
+}
+
+async fn handle_steer(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<SteerReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let thread = if req.thread.is_empty() {
+        "main"
+    } else {
+        req.thread.as_str()
+    };
+    let n = st
+        .flights
+        .steer(&req.channel, thread, &req.model, &req.text);
+    if n == 0 {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(Json(serde_json::json!({ "steered": n })))
+}
+
+async fn handle_load_post(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<crate::orchestrate::HostLoad>,
+) -> StatusCode {
+    if body.node.trim().is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    if let Ok(mut guard) = st.loads.lock() {
+        guard.insert(body.node.clone(), body);
+    }
+    StatusCode::OK
+}
+
+async fn handle_load_get(
+    State(st): State<Arc<WebState>>,
+) -> Json<Vec<crate::orchestrate::HostLoad>> {
+    let rows = st
+        .loads
+        .lock()
+        .map(|guard| guard.values().cloned().collect())
+        .unwrap_or_default();
+    Json(rows)
+}
+
+#[derive(Deserialize)]
+struct DelegateReq {
+    model: String,
+    task: String,
+}
+
+async fn handle_delegate(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<DelegateReq>,
+) -> axum::response::Response {
+    if !st.cfg.models.sub_agents {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "sub-agents are disabled"})),
+        )
+            .into_response();
+    }
+    let cap = st.cfg.models.max_inflight.max(1);
+    if st.local_inflight.load(Ordering::Relaxed) >= cap {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "at capacity"})),
+        )
+            .into_response();
+    }
+    let _slot = Tracked::enter(st.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
+    let model = req.model.clone();
+    let turns = vec![ChatTurn {
+        role: "user".into(),
+        text: req.task,
+        attachments: vec![],
+    }];
+    let st2 = st.clone();
+    let model2 = model.clone();
+    let produce = async move {
+        dispatch_chat(&st2, &model2, SUBAGENT_SYSTEM, &turns, tx, None).await
+    };
+    tokio::pin!(produce);
+    let streamed = async {
+        let mut text = String::new();
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::Delta { text: delta, .. } = &ev {
+                text.push_str(delta);
+            }
+        }
+        text
+    };
+    let (result, streamed) = tokio::join!(produce, streamed);
+    let text = match result {
+        Ok((full, _)) if !full.is_empty() => full,
+        Ok(_) => streamed,
+        Err(err) => format!("[ERROR] {err:#}"),
+    };
+    let (clean, _) = crate::browse::take_requests(&text);
+    let text = if clean.trim().is_empty() { text } else { clean };
+    Json(serde_json::json!({ "text": text, "model": model })).into_response()
+}
+
 async fn run_one_reply(
     st: Arc<WebState>,
     model: String,
@@ -1688,106 +2156,274 @@ async fn run_one_reply(
     left: Arc<AtomicUsize>,
     send_saved: bool,
 ) -> bool {
+    let _slot = Tracked::enter(st.clone());
+    let mut ticket = st.flights.begin(&channel, &thread, &model);
     let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
     let forward = tx.clone();
     let label = model.clone();
+    let acc = Arc::new(Mutex::new(String::new()));
+    let acc_pump = acc.clone();
     let pump = tokio::spawn(async move {
         while let Some(ev) = local_rx.recv().await {
+            if let StreamEvent::Delta { text, .. } = &ev {
+                if let Ok(mut guard) = acc_pump.lock() {
+                    guard.push_str(text);
+                }
+            }
             let _ = forward.send(stamp(ev, &label)).await;
         }
     });
     let started = now_ms();
-    let (author, final_text) =
-        match dispatch_chat(&st, &model, &ctx, &turns, local_tx.clone(), audit).await {
-            Ok((mut reply, mut used)) => {
-                let mut loop_turns = turns.clone();
-                let mut repo_entries: Option<Vec<ContextEntry>> = None;
-                for step in 0..4 {
-                    let (clean, tools) = crate::browse::take_requests(&reply);
-                    if tools.is_empty() || used == "error" {
-                        break;
-                    }
-                    let status_label = match tools.first().map(|t| t.kind.as_str()) {
-                        Some("read") => format!("Reading {}...", tools[0].query),
-                        Some("grep") => format!("Searching repo for `{}`...", tools[0].query),
-                        _ => "Fetching the web...".into(),
-                    };
-                    let _ = local_tx
-                        .send(StreamEvent::Status {
-                            text: status_label,
-                            model: String::new(),
-                        })
-                        .await;
-                    if tools.iter().any(|t| t.kind == "read" || t.kind == "grep")
-                        && repo_entries.is_none()
-                    {
-                        let (entries, _) = collect_channel_entries(&st, &channel).await;
-                        repo_entries = Some(entries);
-                    }
-                    let pages = run_lookups(
-                        &st,
-                        &channel,
-                        repo_entries.as_deref().unwrap_or(&[]),
-                        &tools,
-                    )
-                    .await;
-                    loop_turns.push(ChatTurn {
-                        role: "assistant".into(),
-                        text: clean.clone(),
-                        attachments: vec![],
-                    });
-                    loop_turns.push(ChatTurn {
-                        role: "user".into(),
-                        text: format!("Tool results:\n{pages}"),
-                        attachments: vec![],
-                    });
-                    match dispatch_chat(&st, &model, &ctx, &loop_turns, local_tx.clone(), None)
-                        .await
-                    {
-                        Ok((next_reply, next_used)) => {
-                            reply = next_reply;
-                            used = next_used;
-                            if step == 3 {
-                                let (_, leftover) = crate::browse::take_requests(&reply);
-                                if !leftover.is_empty() {
-                                    reply.push_str(
-                                        "\n\n[lookup stopped after 4 steps; answer from what was fetched]",
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            reply = format!("{clean}\n\n[tool lookup failed: {err:#}]");
-                            break;
-                        }
-                    }
-                }
-                let (final_clean, _) = crate::browse::take_requests(&reply);
-                (
-                    used,
-                    if final_clean.is_empty() {
-                        reply
-                    } else {
-                        final_clean
-                    },
-                )
+    let mut cancelled = false;
+    let mut reply = String::new();
+    let mut used = String::new();
+    match one_round(
+        &st,
+        &model,
+        &ctx,
+        &turns,
+        &local_tx,
+        &mut ticket,
+        audit,
+    )
+    .await
+    {
+        Round::Text(text, author) => {
+            reply = text;
+            used = author;
+        }
+        Round::Cancelled => cancelled = true,
+        Round::Failed(err) => {
+            reply = format!("[ERROR] {err}");
+            used = "error".into();
+            let _ = local_tx
+                .send(StreamEvent::Delta {
+                    text: reply.clone(),
+                    model: String::new(),
+                })
+                .await;
+        }
+    }
+    let mut pending: Vec<tokio::task::JoinHandle<String>> = Vec::new();
+    if !cancelled && used != "error" {
+        let mut loop_turns = turns.clone();
+        let mut repo_entries: Option<Vec<ContextEntry>> = None;
+        let mut extras = 0;
+        let mut steers_applied = 0;
+        while extras < 8 {
+            if *ticket.cancel.borrow() {
+                cancelled = true;
+                break;
             }
-            Err(err) => {
-                let err_txt = format!("[ERROR] {err:#}");
+            let notes = ticket.take_steers();
+            let (clean, tools) = crate::browse::take_requests(&reply);
+            if !notes.is_empty() && steers_applied < 4 {
+                steers_applied += 1;
+                extras += 1;
+                let note = notes.join("\n");
+                let _ = store_message(
+                    &st,
+                    SessionMessage {
+                        channel_id: channel.clone(),
+                        thread_id: thread.clone(),
+                        seq: 0,
+                        author: "user".into(),
+                        content: note.clone(),
+                        created_at_ms: 0,
+                    },
+                    sync_hub,
+                    r#"{"actions":["steer"]}"#,
+                )
+                .await;
                 let _ = local_tx
-                    .send(StreamEvent::Delta {
-                        text: err_txt.clone(),
+                    .send(StreamEvent::Status {
+                        text: "Applying the clarification...".into(),
                         model: String::new(),
                     })
                     .await;
-                ("error".into(), err_txt)
+                loop_turns.push(ChatTurn {
+                    role: "assistant".into(),
+                    text: clean,
+                    attachments: vec![],
+                });
+                loop_turns.push(ChatTurn {
+                    role: "user".into(),
+                    text: format!("Clarification, same context:\n{note}"),
+                    attachments: vec![],
+                });
+                match one_round(&st, &model, &ctx, &loop_turns, &local_tx, &mut ticket, None).await
+                {
+                    Round::Text(text, author) => {
+                        reply = text;
+                        used = author;
+                    }
+                    Round::Cancelled => {
+                        cancelled = true;
+                        break;
+                    }
+                    Round::Failed(err) => {
+                        reply = format!("{reply}\n\n[clarification failed: {err}]");
+                        break;
+                    }
+                }
+                continue;
             }
-        };
-    let author = if author.is_empty() {
-        model.clone()
-    } else {
-        author
+            if tools.is_empty() || used == "error" {
+                break;
+            }
+            extras += 1;
+            let (agents, rest): (Vec<_>, Vec<_>) =
+                tools.into_iter().partition(|tool| tool.kind == "agent");
+            let status_label = if !agents.is_empty() {
+                "Asking a sub-agent...".into()
+            } else {
+                match rest.first().map(|t| t.kind.as_str()) {
+                    Some("read") => format!("Reading {}...", rest[0].query),
+                    Some("grep") => format!("Searching repo for `{}`...", rest[0].query),
+                    _ => "Fetching the web...".into(),
+                }
+            };
+            let _ = local_tx
+                .send(StreamEvent::Status {
+                    text: status_label,
+                    model: String::new(),
+                })
+                .await;
+            if rest.iter().any(|t| t.kind == "read" || t.kind == "grep") && repo_entries.is_none()
+            {
+                let (entries, _) = collect_channel_entries(&st, &channel).await;
+                repo_entries = Some(entries);
+            }
+            let mut pages = if rest.is_empty() {
+                String::new()
+            } else {
+                run_lookups(
+                    &st,
+                    &channel,
+                    repo_entries.as_deref().unwrap_or(&[]),
+                    &rest,
+                )
+                .await
+            };
+            for agent in agents.into_iter().take(2) {
+                if !st.cfg.models.sub_agents {
+                    pages.push_str("\n### agent\nsub-agents are disabled\n");
+                    continue;
+                }
+                let Some((child_model, task)) =
+                    crate::orchestrate::parse_agent_task(&agent.query)
+                else {
+                    pages.push_str("\n### agent\nmalformed agent fence\n");
+                    continue;
+                };
+                let board = collect_board(&st).await;
+                let host = match crate::orchestrate::admit(
+                    &st.cfg.node.id,
+                    st.local_inflight.load(Ordering::Relaxed),
+                    st.cfg.models.max_inflight.max(1),
+                    &child_model,
+                    &board,
+                    now_ms(),
+                ) {
+                    Ok(host) => host,
+                    Err(reason) => {
+                        pages.push_str(&format!("\n### agent {child_model}\nrejected: {reason}\n"));
+                        continue;
+                    }
+                };
+                let child = st.flights.begin(&channel, &thread, &child_model);
+                let mut job = tokio::spawn(execute_delegate(
+                    st.clone(),
+                    tx.clone(),
+                    channel.clone(),
+                    thread.clone(),
+                    sync_hub,
+                    child_model.clone(),
+                    task,
+                    host.clone(),
+                    child,
+                ));
+                tokio::select! {
+                    biased;
+                    _ = ticket.until_cancelled() => {
+                        pending.push(job);
+                        cancelled = true;
+                        break;
+                    }
+                    out = &mut job => {
+                        let text = out.unwrap_or_else(|_| "delegate task failed".into());
+                        pages.push_str(&format!("\n### agent {child_model} on {host}\n{text}\n"));
+                    }
+                }
+            }
+            if cancelled {
+                break;
+            }
+            loop_turns.push(ChatTurn {
+                role: "assistant".into(),
+                text: clean.clone(),
+                attachments: vec![],
+            });
+            loop_turns.push(ChatTurn {
+                role: "user".into(),
+                text: format!("Tool results:\n{pages}"),
+                attachments: vec![],
+            });
+            match one_round(&st, &model, &ctx, &loop_turns, &local_tx, &mut ticket, None).await {
+                Round::Text(text, author) => {
+                    reply = text;
+                    used = author;
+                    if extras >= 8 {
+                        let (_, leftover) = crate::browse::take_requests(&reply);
+                        if !leftover.is_empty() {
+                            reply.push_str(
+                                "\n\n[lookup stopped after 8 steps; answer from what was fetched]",
+                            );
+                        }
+                    }
+                }
+                Round::Cancelled => {
+                    cancelled = true;
+                    break;
+                }
+                Round::Failed(err) => {
+                    reply = format!("{clean}\n\n[tool lookup failed: {err}]");
+                    break;
+                }
+            }
+        }
+    }
+    drop(local_tx);
+    let _ = pump.await;
+    let streamed = acc.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    let mut final_text = {
+        let (clean, _) = crate::browse::take_requests(&reply);
+        if clean.trim().is_empty() { reply } else { clean }
     };
+    if cancelled {
+        let partial = if streamed.trim().is_empty() {
+            final_text.clone()
+        } else {
+            streamed
+        };
+        final_text = if partial.trim().is_empty() {
+            "[cancelled]".into()
+        } else if partial.contains("[cancelled]") {
+            partial
+        } else {
+            format!("{partial}\n\n[cancelled]")
+        };
+        let _ = tx
+            .send(StreamEvent::Status {
+                text: "cancelled".into(),
+                model: model.clone(),
+            })
+            .await;
+    }
+    for job in pending {
+        let _ = job.await;
+    }
+    let author = if used.is_empty() { model.clone() } else { used };
     let finished = now_ms();
     let detail = serde_json::json!({
         "started_at_ms": started,
@@ -1795,6 +2431,7 @@ async fn run_one_reply(
         "model": author,
         "raw": final_text,
         "processed": final_text,
+        "cancelled": cancelled,
         "error": if author == "error" { final_text.as_str() } else { "" },
         "actions": ["chat"]
     })
@@ -1813,10 +2450,9 @@ async fn run_one_reply(
         &detail,
     )
     .await;
-    drop(local_tx);
-    let _ = pump.await;
+    st.flights.end(ticket.id);
     let last = left.fetch_sub(1, Ordering::SeqCst) == 1;
-    let ok = author != "error";
+    let ok = author != "error" && !cancelled;
     if send_saved {
         let _ = tx
             .send(StreamEvent::Saved {
@@ -3618,7 +4254,7 @@ async fn run_lookup(
             return text;
         }
     }
-    crate::browse::run(lookup)
+    crate::browse::run(lookup, &st.cfg.browse.searx_url)
         .await
         .unwrap_or_else(|err| format!("lookup failed: {err}"))
 }
@@ -3651,12 +4287,19 @@ struct WebBody {
     query: String,
 }
 
-async fn handle_internal_web(Json(body): Json<WebBody>) -> Json<serde_json::Value> {
+async fn handle_internal_web(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<WebBody>,
+) -> Json<serde_json::Value> {
     let lookup = crate::browse::Lookup {
-        kind: if body.kind == "fetch" { "fetch".into() } else { "web".into() },
+        kind: if body.kind == "fetch" {
+            "fetch".into()
+        } else {
+            "web".into()
+        },
         query: body.query,
     };
-    let text = crate::browse::run(&lookup)
+    let text = crate::browse::run(&lookup, &st.cfg.browse.searx_url)
         .await
         .unwrap_or_else(|err| format!("lookup failed: {err}"));
     Json(serde_json::json!({ "text": text }))

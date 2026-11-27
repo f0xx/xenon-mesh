@@ -106,6 +106,10 @@
   <div id="log"></div>
   <div style="background:#181b20;border-top:1px solid #2d3748;padding:8px 12px">
     <div id="attBar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;font-size:12px"></div>
+    <div id="steerBar" style="display:none;gap:6px;margin-bottom:6px">
+      <input id="steerText" placeholder="Clarify the running reply. Its retrieved context stays." style="flex:1;background:#0f1115;color:#e2e8f0;border:1px solid #2d3748;border-radius:6px;padding:6px 8px">
+      <button type="button" style="background:#2b6cb0" onclick="steerRunning()">Steer</button>
+    </div>
     <div class="compose">
       <div class="compose-main">
         <div class="compose-tools">
@@ -389,6 +393,7 @@ async function setCh(c, keepThread) {
   await refreshThreads(); await refreshMemory(); await loadHistory(); await loadChatPref(); await loadAgentic();
   await fetch('/api/channel-state', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:c, mark_read:true, bump_use:true}) });
   await refreshChannels();
+  syncSteer();
 }
 function notifyAway(channel, text) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
@@ -609,6 +614,27 @@ function disarmTick() {
   liveClocks.clear();
   if (tickTimer) clearInterval(tickTimer);
   tickTimer = null;
+}
+function stopSlot(slot) {
+  if (!slot || !slot.timer) return;
+  clearInterval(slot.timer);
+  liveClocks.delete(slot.timer);
+  slot.timer = null;
+}
+function syncSteer() {
+  const bar = document.getElementById('steerBar');
+  if (bar) bar.style.display = inflight.has(ch) ? 'flex' : 'none';
+}
+async function steerRunning() {
+  const box = document.getElementById('steerText');
+  const text = (box.value || '').trim();
+  if (!text || !inflight.has(ch)) return;
+  box.value = '';
+  const resp = await fetch('/api/chat/steer', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel: ch, thread, text })
+  });
+  if (!resp.ok) box.value = text;
 }
 function armTick(node, started) {
   const paint = () => {
@@ -884,7 +910,7 @@ async function send(existing, rerun) {
   const ask = agenticToggle.checked;
   if (ask && inflight.has(sentOn)) return;
   if (ask) inflight.add(sentOn);
-  inflight.add(sentOn);
+  syncSteer();
   const atts = pendingAtts; pendingAtts = []; renderAtts();
   if (fromComposer && !rerun) box.innerHTML = '';
   fetch('/api/typing', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: sentOn, kind: '' }) });
@@ -899,7 +925,15 @@ async function send(existing, rerun) {
     const hdr = document.createElement('div'); hdr.className = 'msghead';
     const whoEl = document.createElement('span'); whoEl.textContent = `[${key}]`;
     const timeEl = document.createElement('span'); timeEl.className = 'mtime'; timeEl.textContent = clockLabel(sentAt);
-    hdr.append(whoEl, timeEl);
+    const stop = document.createElement('button');
+    stop.textContent = 'Stop';
+    stop.title = 'Stop this reply after the model confirms. Other replies keep going.';
+    stop.style.cssText = 'margin-left:8px;background:#9b2c2c;color:#fff;border:0;border-radius:4px;padding:2px 8px;cursor:pointer';
+    stop.onclick = () => fetch('/api/chat/cancel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel: sentOn, thread: sentThread, model: key })
+    });
+    hdr.append(whoEl, timeEl, stop);
     const statusLine = document.createElement('div'); statusLine.style.cssText = 'color:#ecc94b;font-size:12px;margin-bottom:6px';
     statusLine.textContent = '⏳ Awaiting response...';
     const thoughtBox = document.createElement('details'); thoughtBox.style.cssText = 'display:none;background:#0d0f12;padding:6px;margin-bottom:8px;border-left:2px solid #805ad5;font-size:12px;color:#cbd5e0';
@@ -907,7 +941,7 @@ async function send(existing, rerun) {
     const body = document.createElement('div');
     card.append(hdr, statusLine, thoughtBox, body);
     log.appendChild(card);
-    const slot = { card, whoEl, timeEl, statusLine, thoughtBox, body, thoughtText: '', fullText: '' };
+    const slot = { card, whoEl, timeEl, statusLine, thoughtBox, body, thoughtText: '', fullText: '', timer: null, stop };
     cards.set(key, slot);
     return slot;
   }
@@ -950,13 +984,22 @@ async function send(existing, rerun) {
         }
         const slot = ensureCard(ev.model || ids[0] || '');
         if (ev.type === 'status') {
-          slot.statusLine.textContent = `⏳ ${ev.text}`;
-          if (!slot.card.dataset.started && /Awaiting /.test(ev.text || '') && ch === sentOn && thread === sentThread) {
-            slot.card.dataset.started = String(Date.now());
-            const note = document.createElement('div');
-            note.className = 'took';
-            slot.card.appendChild(note);
-            armTick(note, Date.now());
+          if ((ev.text || '') === 'cancelled') {
+            stopSlot(slot);
+            if (slot.stop) slot.stop.remove();
+            slot.statusLine.style.display = 'block';
+            slot.statusLine.style.color = '#fc8181';
+            slot.statusLine.textContent = 'cancelled';
+          } else {
+            slot.statusLine.style.display = 'block';
+            slot.statusLine.textContent = `⏳ ${ev.text}`;
+            if (!slot.card.dataset.started && /Awaiting /.test(ev.text || '') && ch === sentOn && thread === sentThread) {
+              slot.card.dataset.started = String(Date.now());
+              const note = document.createElement('div');
+              note.className = 'took';
+              slot.card.appendChild(note);
+              slot.timer = armTick(note, Date.now());
+            }
           }
         }
         else if (ev.type === 'thought') {
@@ -1004,6 +1047,7 @@ async function send(existing, rerun) {
   } finally {
     disarmTick();
     inflight.delete(sentOn);
+    syncSteer();
   }
 }
 

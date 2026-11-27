@@ -28,6 +28,7 @@ A missing `schema` key means v1. `schema: 1` and `schema: v1` are the same. Any 
 | `models` | empty | map, below |
 | `deploy_pipelines` | empty | map of name → pipeline |
 | `calendar` | empty | read-only iCalendar feed, below |
+| `browse` | empty | optional SearxNG origin, below |
 
 ```yaml
 schema: 1
@@ -57,7 +58,7 @@ git:
 | `tls_key_path` | empty | PEM private key |
 | `master_url` | empty | node only. Hub gRPC URL, including the scheme (`http://hub.example:8443`). Use `https://` once mutual TLS is on |
 | `master_http` | empty | node only. Hub HTTP URL for the UI, model list, and completions. Each chat is its own request |
-| `master_mesh` | empty | node only. Mutual-TLS URL for `/api/mesh/*`. Empty uses `master_http`, which accepts those routes only from localhost |
+| `master_mesh` | empty | node only. Mutual-TLS URL for `/api/mesh/*`. Empty uses `master_http`. Plain HTTP mesh stays open until TLS material or `mesh_tls_addr` is set |
 | `mtls_ca_path` | empty | PEM CA that signed the node certificates. Required together with the cert and key |
 | `mtls_cert_path` | empty | this machine's certificate, signed by that CA |
 | `mtls_key_path` | empty | matching private key |
@@ -118,6 +119,8 @@ When `models.providers` is non-empty, it is the whole provider list. The legacy 
 | `sampling.top_p` | unset | sent only when set |
 | `sampling.repeat_penalty` | unset | Ollama `options.repeat_penalty` when set |
 | `debate_max_rounds` | `0` | extra critique rounds after a multi-model reply. `0` hides the debate checkbox. The server caps this at 6 |
+| `sub_agents` | `true` | a model may delegate one level of subtask. The scheduler can refuse a busy host |
+| `max_inflight` | `4` | agent replies this daemon will run at once, including sub-agents. The scheduler treats a daemon at this number as full |
 
 Each provider (`#[serde(default)]` on the whole map, so a short entry is valid):
 
@@ -212,6 +215,15 @@ Empty means no agenda. When the question mentions a calendar, schedule, meeting,
 calendar:
   ics_url: "https://calendar.example/team.ics"
   token_env: "XMESH_CALENDAR_TOKEN"
+```
+
+## `browse`
+
+Empty `searx_url` keeps the DuckDuckGo HTML search. A set origin is requested as `/search?format=json`. If that request fails, the daemon falls back to DuckDuckGo.
+
+```yaml
+browse:
+  searx_url: "http://search.example:8088"
 ```
 
 ## Secrets

@@ -22,7 +22,9 @@ Both modes serve the same HTTP UI and the same gRPC `ClusterService`. The mode f
 | Watcher | On `git.watched_repos`, debounces 10 seconds, stores the worktree diff, and uploads it only when that namespace has a public channel. A second watch, on by default, follows `git.project_roots` and `git.bare_repos_root` and updates the channel list |
 | Model hub | Discovers models, streams tokens, embeds when the endpoint supports it |
 
-The HTTP listener defaults to `127.0.0.1:8080`. Set `node.http_addr` to `0.0.0.0:8080` when other machines on the LAN should open the UI. gRPC defaults to whatever `node.listen_addr` says (the examples use `0.0.0.0:8443`). `/api/mesh/*` on those UI ports answers only for a localhost peer. Remote mesh uses `node.mesh_tls_addr` with a client certificate, and gRPC uses the same CA when the mutual-TLS files are set. There is no user login on the UI.
+The HTTP listener defaults to `127.0.0.1:8080`. Set `node.http_addr` to `0.0.0.0:8080` when other machines on the LAN should open the UI. gRPC defaults to whatever `node.listen_addr` says (the examples use `0.0.0.0:8443`). Once mutual TLS is configured (`mesh_tls_addr` or the certificate files), `/api/mesh/*` on the UI ports answers only for a localhost peer and remote mesh uses `node.mesh_tls_addr`. Until those files exist, mesh routes stay on the UI port so a lab can keep syncing. There is no user login on the UI.
+
+Sub-agent admission is one scheduler. Daemons POST their in-flight count to the hub at `/api/internal/load`. The hub is the board. A daemon with no hub is its own board. The least busy daemon that advertised the requested model and is under `models.max_inflight` gets the task. A discovered neighbour is asked directly at `/api/internal/delegate`. If that host cannot be reached, the supervisor runs the model through its normal provider route and says so. A host at its cap is refused.
 
 ## DR-9. Chat flow
 

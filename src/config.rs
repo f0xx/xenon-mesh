@@ -85,6 +85,16 @@ pub struct AppConfig {
     /// Read-only iCalendar feed. Empty disables it.
     #[serde(default)]
     pub calendar: CalendarSection,
+    /// Optional SearxNG base URL. Empty keeps the DuckDuckGo HTML search.
+    #[serde(default)]
+    pub browse: BrowseSection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrowseSection {
+    /// `http://host:8088` with no path. The daemon calls `/search?format=json`.
+    #[serde(default)]
+    pub searx_url: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -348,6 +358,16 @@ pub struct ModelsSection {
     /// Max follow-up critique rounds when multi-model debate is enabled. 0 disables debates.
     #[serde(default)]
     pub debate_max_rounds: u32,
+    /// A model may ask another model to do a subtask. The scheduler can refuse.
+    #[serde(default = "default_true")]
+    pub sub_agents: bool,
+    /// How many agent replies this daemon will run at once, including sub-agents.
+    #[serde(default = "default_capacity")]
+    pub max_inflight: u32,
+}
+
+fn default_capacity() -> u32 {
+    4
 }
 
 impl Default for ModelsSection {
@@ -360,6 +380,8 @@ impl Default for ModelsSection {
             providers_file: String::new(),
             sampling: Sampling::default(),
             debate_max_rounds: 0,
+            sub_agents: true,
+            max_inflight: default_capacity(),
         }
     }
 }
