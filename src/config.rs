@@ -85,7 +85,7 @@ pub struct AppConfig {
 }
 
 fn default_http_addr() -> String {
-    "0.0.0.0:8080".into()
+    "127.0.0.1:8080".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,7 +580,7 @@ models:
 
         let cfg = AppConfig::load(cluster.to_str().unwrap(), local.to_str().unwrap()).unwrap();
         assert!(matches!(cfg.node.mode, NodeMode::Node));
-        assert_eq!(cfg.node.http_addr, "0.0.0.0:8080");
+        assert_eq!(cfg.node.http_addr, "127.0.0.1:8080");
         assert_eq!(cfg.models.default, "local/coder");
         assert_eq!(cfg.models.providers.len(), 1);
         assert_eq!(cfg.models.providers[0].kind, "auto");

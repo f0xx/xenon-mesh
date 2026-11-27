@@ -509,7 +509,7 @@ async fn handle_upsert_channel(
                 channels: vec![stored.to_proto()],
                 ..Default::default()
             };
-            if let Err(err) = hub::push_envelope(url, env).await {
+            if let Err(err) = hub::push_envelope(url, env, &st.cfg.node.id, st.node_key.as_ref()).await {
                 warn!("public channel was saved locally but not published: {err}");
             }
         }
@@ -673,7 +673,7 @@ async fn handle_learn(
                 entries: vec![entry],
                 ..Default::default()
             };
-            let _ = hub::push_envelope(url, env).await;
+            let _ = hub::push_envelope(url, env, &st.cfg.node.id, st.node_key.as_ref()).await;
         }
     }
     Ok(StatusCode::OK)
@@ -802,7 +802,7 @@ async fn record_auto_lesson(st: &WebState, namespace: &str, key: &str, raw_event
                 entries: vec![entry],
                 ..Default::default()
             };
-            let _ = hub::push_envelope(url, env).await;
+            let _ = hub::push_envelope(url, env, &st.cfg.node.id, st.node_key.as_ref()).await;
         }
     }
 }

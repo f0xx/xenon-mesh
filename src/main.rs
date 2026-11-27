@@ -36,7 +36,36 @@ struct NodeRpcServer {
 #[tonic::async_trait]
 impl ClusterService for NodeRpcServer {
     async fn sync_contexts(&self, req: Request<SyncEnvelope>) -> Result<Response<SyncAck>, Status> {
+        let node_claim = req
+            .metadata()
+            .get("x-xmesh-node")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let ts = req
+            .metadata()
+            .get("x-xmesh-ts")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0);
+        let sig = req
+            .metadata()
+            .get("x-xmesh-sig")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let env = req.into_inner();
+        let body = identity::canonical(
+            "sync",
+            &[
+                &env.source_node,
+                &env.entries.len().to_string(),
+                &env.messages.len().to_string(),
+                &env.channels.len().to_string(),
+            ],
+        );
+        let verified_node = identity::resolve_peer(&self.peer_keys, &node_claim, ts, &sig, &body)
+            .map_err(Status::permission_denied)?;
         let (mut ok, mut skip) = (0u32, 0u32);
         for ch in &env.channels {
             if ch.visibility != "public" {
@@ -49,8 +78,9 @@ impl ClusterService for NodeRpcServer {
                 .map_err(|e| Status::internal(e.to_string()))?;
             ok += 1;
         }
-        for e in &env.entries {
-            match self.db.upsert_proto(e, false).await {
+        for mut e in env.entries {
+            e.origin_node = verified_node.clone();
+            match self.db.upsert_proto(&e, false).await {
                 Ok(true) => ok += 1,
                 Ok(false) => skip += 1,
                 Err(err) => return Err(Status::internal(err.to_string())),

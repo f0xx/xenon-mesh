@@ -57,8 +57,36 @@ pub async fn query_namespace(master_url: &str, namespace: &str) -> Result<SyncEn
     Ok(client.query_node_context(req).await?.into_inner())
 }
 
-pub async fn push_envelope(master_url: &str, env: SyncEnvelope) -> Result<()> {
+pub async fn push_envelope(
+    master_url: &str,
+    env: SyncEnvelope,
+    node_id: &str,
+    node_key: Option<&[u8; 32]>,
+) -> Result<()> {
     let mut client = ClusterServiceClient::connect(endpoint(master_url)?).await?;
-    client.sync_contexts(env).await?;
+    let body = crate::identity::canonical(
+        "sync",
+        &[
+            &env.source_node,
+            &env.entries.len().to_string(),
+            &env.messages.len().to_string(),
+            &env.channels.len().to_string(),
+        ],
+    );
+    let ts = crate::storage::now_ms();
+    let mut req = tonic::Request::new(env);
+    if let Ok(value) = node_id.parse() {
+        req.metadata_mut().insert("x-xmesh-node", value);
+    }
+    if let Some(key) = node_key {
+        let sig = crate::identity::sign(key, node_id, ts, &body);
+        if let Ok(value) = ts.to_string().parse() {
+            req.metadata_mut().insert("x-xmesh-ts", value);
+        }
+        if let Ok(value) = sig.parse() {
+            req.metadata_mut().insert("x-xmesh-sig", value);
+        }
+    }
+    client.sync_contexts(req).await?;
     Ok(())
 }

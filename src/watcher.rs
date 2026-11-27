@@ -70,7 +70,12 @@ pub async fn run_node_watcher(
             entries: batch,
             ..Default::default()
         };
-        match hub::push_envelope(master_url, env).await {
+        let node_key = cfg
+            .node
+            .node_key_path
+            .as_deref()
+            .and_then(|p| crate::identity::key_from_file(Path::new(p)));
+        match hub::push_envelope(master_url, env, &cfg.node.id, node_key.as_ref()).await {
             Ok(()) => info!("synced public diffs to the hub"),
             Err(err) => error!("failed to sync diffs: {err}"),
         }

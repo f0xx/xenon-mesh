@@ -109,6 +109,11 @@ async fn exec_pipeline(task_id: &str, pipe: &DeployPipeline) -> Result<NodeTaskR
             "/proc",
             "--tmpfs",
             "/tmp",
+            "--tmpfs",
+            "/etc/xmeshd",
+            "--tmpfs",
+            "/root",
+            "--die-with-parent",
         ]);
         c.args([
             "--bind",
