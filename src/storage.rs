@@ -915,26 +915,53 @@ impl Storage {
         {
             bail!("thread is private");
         }
+        let ts = if msg.created_at_ms > 0 {
+            msg.created_at_ms
+        } else {
+            now_ms()
+        };
         let mut seq = if msg.seq == 0 {
             self.next_seq(&msg.channel_id, &msg.thread_id).await?
         } else {
             msg.seq
         };
+        let ins_sql = match self.kind {
+            DbKind::Mysql => self.q(
+                "INSERT IGNORE INTO session_messages (id, channel_id, thread_id, seq, author, content, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            ),
+            _ => self.q(
+                "INSERT INTO session_messages (id, channel_id, thread_id, seq, author, content, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT(id) DO NOTHING",
+            ),
+        };
         for _ in 0..1000 {
             let id = message_id(&msg.channel_id, &msg.thread_id, seq);
+            let res = sqlx::query(&ins_sql)
+                .bind(&id)
+                .bind(&msg.channel_id)
+                .bind(&msg.thread_id)
+                .bind(seq as i64)
+                .bind(&msg.author)
+                .bind(&msg.content)
+                .bind(ts)
+                .execute(&self.pool)
+                .await?;
+            if res.rows_affected() > 0 {
+                let mut stored = msg.clone();
+                stored.seq = seq;
+                stored.created_at_ms = ts;
+                return Ok(stored);
+            }
             if let Some(existing) = self.message_content(&id).await? {
                 if existing == msg.content {
                     let mut stored = msg.clone();
                     stored.seq = seq;
                     return Ok(stored);
                 }
-                seq += 1;
-                continue;
             }
-            let mut stored = msg.clone();
-            stored.seq = seq;
-            self.append_message(&stored).await?;
-            return Ok(stored);
+            seq += 1;
         }
         bail!("could not allocate a message sequence")
     }

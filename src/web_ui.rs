@@ -1711,9 +1711,15 @@ async fn handle_persistent_chat(
         while pending.join_next().await.is_some() {}
 
         if has_debate {
+            let alive_models: Vec<String> = {
+                let hist = st_bg.db.load_thread(&req.channel, &model_thread, 100).await.unwrap_or_default();
+                let failed: HashSet<String> = hist.iter().filter(|m| m.author == "error").map(|m| m.content.clone()).collect();
+                models_bg.iter().filter(|m| !failed.iter().any(|e| e.contains(m.as_str()))).cloned().collect()
+            };
             'debate: for round in 1..=max_rounds {
-                for (idx, model) in models_bg.iter().enumerate() {
-                    let is_final_turn = round == max_rounds && idx + 1 == models_bg.len();
+                if alive_models.len() < 2 { break 'debate; }
+                for (idx, model) in alive_models.iter().enumerate() {
+                    let is_final_turn = round == max_rounds && idx + 1 == alive_models.len();
                     let _ = tx
                         .send(StreamEvent::Status {
                             text: format!("Debate round {round}/{max_rounds}: {model} reviewing..."),
@@ -1727,6 +1733,7 @@ async fn handle_persistent_chat(
                         .unwrap_or_default();
                     let mut debate_turns: Vec<ChatTurn> = history
                         .into_iter()
+                        .filter(|m| m.author != "error" && !m.content.trim().is_empty())
                         .map(|m| ChatTurn {
                             role: m.author,
                             text: m.content,
@@ -1734,7 +1741,7 @@ async fn handle_persistent_chat(
                         })
                         .collect();
                     debate_turns.push(ChatTurn {
-                        role: "system".into(),
+                        role: "user".into(),
                         text: format!(
                             "You are participating in a peer code/architecture review (round {round} of {max_rounds}) as `{model}`.\n\
                              Critically examine the previous responses from other models in this thread.\n\

@@ -136,17 +136,27 @@ pub fn assemble_context(
 
     let mut ranked: Vec<(f32, &PromptEntry)> = Vec::new();
     let embeddings_ok = !query_emb.is_empty();
+    let q_lower = query.to_ascii_lowercase();
     for e in entries
         .iter()
         .filter(|e| e.entry_type == ENTRY_DYNAMIC && !is_always_included(e))
     {
+        let path_lower = e.source_path.to_ascii_lowercase();
+        let file_name = path_lower.rsplit('/').next().unwrap_or(&path_lower);
+        let explicit_mention = (!path_lower.is_empty() && q_lower.contains(&path_lower))
+            || (file_name.len() >= 4 && file_name.contains('.') && q_lower.contains(file_name));
         let lexical = lexical_score(query, &e.content).max(lexical_score(query, &e.source_path));
-        let score =
+        let base_score =
             if embeddings_ok && e.embedding.len() == query_emb.len() && !e.embedding.is_empty() {
                 cosine_sim(&e.embedding, query_emb)
             } else {
                 lexical
             };
+        let score = if explicit_mention {
+            base_score + 2.0
+        } else {
+            base_score
+        };
         if score > 0.0 || query.trim().is_empty() {
             ranked.push((score, e));
         }
