@@ -74,9 +74,11 @@ pub async fn run_stdio_bridge(base_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run the MCP server loop over standard input/output.
-/// Ensure tracing/logging is directed to stderr before calling this function,
-/// because stdout is strictly reserved for newline-delimited JSON-RPC frames.
+/// In-process stdio loop for a caller that already holds the database.
+/// The lab command `xmeshd mcp` uses [`run_stdio_bridge`] instead, so the
+/// editor session does not open a second database beside the daemon.
+/// Stdout is reserved for JSON-RPC frames. Log to stderr.
+#[allow(dead_code)]
 pub async fn run_stdio(storage: Storage, node_id: String) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
