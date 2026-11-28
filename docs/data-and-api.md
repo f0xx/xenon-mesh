@@ -59,6 +59,9 @@ The UI is `GET /`. JSON routes:
 | `GET` | `/api/history?channel=&thread=` | Pulls a public thread from the hub, then returns local rows. A main-thread row that opened a child includes `reply_thread`, `thread_total`, and `thread_unread` |
 | `POST` | `/api/thread-read` | `{channel, thread}` marks that thread read on this node |
 | `GET`/`POST` | `/api/agentic` | Per-channel switch. Missing means on. `POST {channel, enabled}` |
+| `GET`/`POST` | `/api/suggest-pref` | Per-channel ghost text. Missing means on. `POST {channel, enabled}` |
+| `POST` | `/api/suggest` | `{channel, thread, prefix}` returns `{completion, source}`. `source` is `index`, `llm`, or `none`. See [suggestive-autocompletion.md](suggestive-autocompletion.md) |
+| `POST` | `/api/mcp` | One MCP JSON-RPC frame. `204` when the frame is a notification. See [mcp.md](mcp.md) |
 | `POST` | `/api/inspect` | `{diff}` returns `{findings, blocks_approve:false}` from the built-in inspector, `git.inspect_command`, and `git.status_command` |
 | `POST` | `/api/chat` | SSE. `agentic: false` stores the message and does not call a model. The field defaults to true. A `status` event whose text is `cancelled` means that model stopped |
 | `POST` | `/api/chat/cancel` | `{channel, thread, model}` stops that pending agent reply. `409` when nothing is running |
@@ -79,4 +82,4 @@ Channel names are 1 to 128 characters from `[A-Za-z0-9_.:/-]`.
 
 ## DR-26. UI bindings
 
-The page loads `/api/config` and fills the model select from `models[].id`, labeled `model : host`, grouped by host. Proxied models, including Gemini, are a group under the hub. Strings are still accepted so an older response shape does not blank the list. Enter sends. Shift+Enter inserts a newline. The composer textarea is not named `prompt`, so it does not replace `window.prompt`. Code fences show the fence language, not the UI language. A `diff` fence, including one that arrives at the end of a stream, adds an inspect button. The side panel then asks `/api/inspect` and shows the findings above the diff. History draws a day divider and a clock without seconds. The stored value stays `created_at_ms`. New channels ask for `private` or `public`. Public names are prefixed with `#`, private names with `·`.
+The page loads `/api/config` and fills the model select from `models[].id`, labeled `model : host`, grouped by host. Proxied models, including Gemini, are a group under the hub. Strings are still accepted so an older response shape does not blank the list. Enter sends. Shift+Enter inserts a newline. The composer is not named `prompt`, so it does not replace `window.prompt`. The suggest checkbox is per channel and defaults to on. Tab inserts the ghost suffix. Esc clears it. Code fences show the fence language, not the UI language. A `diff` fence, including one that arrives at the end of a stream, adds an inspect button. The side panel then asks `/api/inspect` and shows the findings above the diff. History draws a day divider and a clock without seconds. The stored value stays `created_at_ms`. New channels ask for `private` or `public`. Public names are prefixed with `#`, private names with `·`.

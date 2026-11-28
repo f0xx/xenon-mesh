@@ -121,6 +121,8 @@ When `models.providers` is non-empty, it is the whole provider list. The legacy 
 | `sampling.repeat_penalty` | unset | Ollama `options.repeat_penalty` when set |
 | `debate_max_rounds` | `0` | extra critique rounds after a multi-model reply. `0` hides the debate checkbox. The server caps this at 6 |
 | `sub_agents` | `true` | a model may delegate one level of subtask. The scheduler can refuse a busy host |
+| `autocomplete_model` | empty | `provider/model` for ghost text. Empty uses the index only. See [suggestive-autocompletion.md](suggestive-autocompletion.md) |
+| `autocomplete_timeout_ms` | `800` | drops a ghost-text model call. A reply already in flight skips the model |
 | `max_inflight` | `4` | agent replies this daemon will run at once, including sub-agents. The scheduler treats a daemon at this number as full |
 
 Each provider (`#[serde(default)]` on the whole map, so a short entry is valid):

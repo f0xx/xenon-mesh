@@ -55,6 +55,7 @@
   .msgtools button, #msgCtx button, #fmtBar button { background:transparent; color:#a0aec0; padding:0 6px; font-size:12px; }
   #fmtBar button { border:1px solid #2d3748; }
   #composer { min-height:52px; max-height:160px; overflow:auto; background:#0d0f12; color:#fff; border:1px solid #2d3748; padding:6px; }
+  #composer .hint { color:#718096; pointer-events:none; }
   .send-btn { align-self:stretch; min-width:72px; }
   #composer:empty:before { content:attr(data-ph); color:#718096; }
   .bubble-edit { background:#0d0f12; border:1px solid #4299e1; padding:6px; min-height:48px; }
@@ -130,6 +131,7 @@
       </div>
       <div style="display:flex;flex-direction:column;gap:6px">
         <label title="When off, the message is stored and no model is asked. Remembered per channel." style="font-size:11px;color:#a0aec0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="agenticToggle" checked> agentic review</label>
+        <label title="Ghost text from the channel index. Remembered per channel. Tab accepts, Esc clears." style="font-size:11px;color:#a0aec0;display:flex;align-items:center;gap:4px"><input type="checkbox" id="suggestToggle" checked> suggest</label>
         <button class="send-btn" onclick="send()" data-i18n="send">Send</button>
       </div>
     </div>
@@ -380,6 +382,16 @@ async function refreshMemory() {
 async function setPresence(viewing) {
   await fetch('/api/presence', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({channel: ch, viewing}) });
 }
+async function loadSuggest() {
+  const forCh = ch;
+  let enabled = true;
+  try {
+    const data = await (await fetch('/api/suggest-pref?channel=' + encodeURIComponent(forCh))).json();
+    if (typeof data.enabled === 'boolean') enabled = data.enabled;
+  } catch {}
+  if (ch !== forCh) return;
+  suggestToggle.checked = enabled;
+}
 async function loadAgentic() {
   const forCh = ch;
   let enabled = true;
@@ -398,7 +410,7 @@ async function setCh(c, keepThread) {
   log.innerHTML = '';
   disarmTick();
   await setPresence(document.visibilityState === 'visible');
-  await refreshThreads(); await refreshMemory(); await loadHistory(); await loadChatPref(); await loadAgentic();
+  await refreshThreads(); await refreshMemory(); await loadHistory(); await loadChatPref(); await loadAgentic(); await loadSuggest();
   await fetch('/api/channel-state', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:c, mark_read:true, bump_use:true}) });
   await refreshChannels();
   syncSteer();
@@ -838,7 +850,10 @@ function htmlToMd(node) {
   return inner;
 }
 function composerMarkdown() {
-  return htmlToMd(document.getElementById('composer')).replace(/\n{3,}/g, '\n\n').trim();
+  const box = document.getElementById('composer');
+  const hint = box.querySelector('.hint');
+  if (hint) hint.remove();
+  return htmlToMd(box).replace(/\n{3,}/g, '\n\n').trim();
 }
 function fmt(kind) {
   const box = document.getElementById('composer');
@@ -850,6 +865,51 @@ function fmt(kind) {
   else if (kind === 'quote') document.execCommand('formatBlock', false, 'blockquote');
 }
 let typeTimer;
+let suggestTimer;
+let suggestAbort;
+function clearHint() {
+  const hint = document.querySelector('#composer .hint');
+  if (hint) hint.remove();
+}
+function caretAtEnd(box) {
+  const sel = window.getSelection();
+  if (!sel || !sel.isCollapsed || !sel.anchorNode || !box.contains(sel.anchorNode)) return false;
+  const range = sel.getRangeAt(0).cloneRange();
+  range.selectNodeContents(box);
+  range.setStart(sel.anchorNode, sel.anchorOffset);
+  return range.toString() === '';
+}
+function scheduleSuggest() {
+  clearHint();
+  if (suggestAbort) suggestAbort.abort();
+  clearTimeout(suggestTimer);
+  if (!suggestToggle.checked) return;
+  const box = document.getElementById('composer');
+  if (!caretAtEnd(box)) return;
+  const prefix = composerMarkdown();
+  if (!prefix) return;
+  suggestTimer = setTimeout(() => fetchSuggest(prefix), 350);
+}
+async function fetchSuggest(prefix) {
+  suggestAbort = new AbortController();
+  try {
+    const resp = await fetch('/api/suggest', {
+      method: 'POST',
+      signal: suggestAbort.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel: ch, thread, prefix })
+    });
+    const data = await resp.json();
+    if (!data.completion || composerMarkdown() !== prefix) return;
+    const box = document.getElementById('composer');
+    if (!caretAtEnd(box)) return;
+    const span = document.createElement('span');
+    span.className = 'hint';
+    span.contentEditable = 'false';
+    span.textContent = data.completion;
+    box.appendChild(span);
+  } catch {}
+}
 function notifyTyping() {
   fetch('/api/typing', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, kind: 'typing' }) });
   clearTimeout(typeTimer);
@@ -1214,12 +1274,27 @@ window.onload = async () => {
   agenticToggle.addEventListener('change', () => {
     fetch('/api/agentic', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, enabled: agenticToggle.checked }) });
   });
+  suggestToggle.addEventListener('change', () => {
+    if (!suggestToggle.checked) clearHint();
+    fetch('/api/suggest-pref', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, enabled: suggestToggle.checked }) });
+  });
   const composer = document.getElementById('composer');
   composer.addEventListener('keydown', e => {
+    if (e.key === 'Tab') {
+      const hint = composer.querySelector('.hint');
+      if (hint && hint.textContent) {
+        e.preventDefault();
+        const text = hint.textContent;
+        hint.remove();
+        document.execCommand('insertText', false, text);
+      }
+      return;
+    }
+    if (e.key === 'Escape') { clearHint(); return; }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
   });
-  composer.addEventListener('input', notifyTyping);
+  composer.addEventListener('input', () => { notifyTyping(); scheduleSuggest(); });
   setInterval(async () => {
     await refreshChannels();
     if (editingSeq || inflight.has(ch)) return;

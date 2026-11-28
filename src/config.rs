@@ -382,6 +382,16 @@ pub struct ModelsSection {
     /// How many agent replies this daemon will run at once, including sub-agents.
     #[serde(default = "default_capacity")]
     pub max_inflight: u32,
+    /// `provider/model` for ghost-text completion. Empty stays on the index.
+    #[serde(default)]
+    pub autocomplete_model: String,
+    /// Bound for that completion. A chat in flight skips the model entirely.
+    #[serde(default = "default_autocomplete_timeout_ms")]
+    pub autocomplete_timeout_ms: u64,
+}
+
+fn default_autocomplete_timeout_ms() -> u64 {
+    800
 }
 
 fn default_capacity() -> u32 {
@@ -400,6 +410,8 @@ impl Default for ModelsSection {
             debate_max_rounds: 0,
             sub_agents: true,
             max_inflight: default_capacity(),
+            autocomplete_model: String::new(),
+            autocomplete_timeout_ms: default_autocomplete_timeout_ms(),
         }
     }
 }

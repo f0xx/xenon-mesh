@@ -1,6 +1,6 @@
 # Command line
 
-`xmeshd cli` talks to a daemon that is already running. It does not bind the HTTP or gRPC port.
+`xmeshd cli` talks to a daemon that is already running. It does not bind the HTTP or gRPC port. `xmeshd mcp` is the same idea for editors: it forwards stdin JSON-RPC to `POST /api/mcp` on that daemon. See [mcp.md](mcp.md).
 
 ```sh
 xmeshd cli
@@ -22,6 +22,7 @@ A line that starts with `/` is a command. Any other line is sent as a chat messa
 | `/model [provider/model]` | Show or select the model. Empty uses the daemon default |
 | `/history [count]` | Print the latest messages. A finished reply includes `generation took …` |
 | `/alias [name]` | Show or set the name stored on this node. An empty box falls back to `node.id` |
+| `/suggest [on\|off\|text]` | Show or set ghost text for this channel, or print a completion of `text` |
 | `/send <text>` | Send one message |
 | `/quit` | Leave the prompt |
 

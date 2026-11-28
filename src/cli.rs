@@ -97,6 +97,7 @@ pub async fn run(args: &[String]) -> Result<()> {
                         .await?;
                     }
                 }
+                "suggest" => suggest_cmd(&client, &url, &channel, &thread, arg).await?,
                 "send" => {
                     if arg.is_empty() {
                         println!("usage: /send <text>");
@@ -113,6 +114,58 @@ pub async fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+async fn suggest_cmd(
+    client: &reqwest::Client,
+    url: &str,
+    channel: &str,
+    thread: &str,
+    arg: &str,
+) -> Result<()> {
+    if arg.is_empty() || arg == "on" || arg == "off" {
+        if arg == "on" || arg == "off" {
+            let body = serde_json::json!({ "channel": channel, "enabled": arg == "on" });
+            let resp = client
+                .post(format!("{url}/api/suggest-pref"))
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                bail!("{} {}", resp.status(), resp.text().await?);
+            }
+        }
+        let value: Value = client
+            .get(format!(
+                "{url}/api/suggest-pref?channel={}",
+                urlencoding(channel)
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let on = value.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        println!("{}", if on { "on" } else { "off" });
+        return Ok(());
+    }
+    let body = serde_json::json!({ "channel": channel, "thread": thread, "prefix": arg });
+    let value: Value = client
+        .post(format!("{url}/api/suggest"))
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let suffix = value
+        .get("completion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if suffix.is_empty() {
+        println!("{arg}");
+    } else {
+        println!("{arg}{suffix}");
+    }
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "\
@@ -125,9 +178,13 @@ fn print_help() {
 /models
 /history [count]
 /alias [name]
+/suggest [on|off|text]
 /send <text>
 /quit
-A line without a slash is sent as a chat message."
+A line without a slash is sent as a chat message.
+/suggest with no argument prints on or off for this channel.
+/suggest on and /suggest off remember that choice.
+/suggest followed by text asks for a completion and prints it."
     );
 }
 

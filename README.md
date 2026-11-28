@@ -32,6 +32,8 @@ Packaging sketches for Gentoo, Debian, and Alpine live in [`packaging/`](packagi
 | [docs/data-and-api.md](docs/data-and-api.md) | Tables, gRPC, and HTTP |
 | [docs/operations.md](docs/operations.md) | Build, install, join a hub, back up, test |
 | [docs/cli.md](docs/cli.md) | `xmeshd cli` commands |
+| [docs/mcp.md](docs/mcp.md) | MCP on the running daemon |
+| [docs/suggestive-autocompletion.md](docs/suggestive-autocompletion.md) | Ghost text in the composer |
 | [docs/security.md](docs/security.md) | Trust boundary, channels, audit, and what the daemon does not authenticate |
 | [docs/integrations.md](docs/integrations.md) | Proposed company tools around the chat, not shipped adapters |
 | [docs/remote-access.md](docs/remote-access.md) | Reach a hub over SSH local forwards |

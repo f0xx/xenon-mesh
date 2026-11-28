@@ -93,11 +93,22 @@ fn default_true() -> bool {
 }
 
 fn agentic_key(channel: &str) -> String {
-    let raw = format!("ag:{channel}");
+    setting_key("ag", channel)
+}
+
+fn suggest_key(channel: &str) -> String {
+    setting_key("sg", channel)
+}
+
+fn setting_key(prefix: &str, channel: &str) -> String {
+    let raw = format!("{prefix}:{channel}");
     if raw.len() <= 64 {
         raw
     } else {
-        format!("ag:{}", &blake3::hash(channel.as_bytes()).to_hex()[..32])
+        format!(
+            "{prefix}:{}",
+            &blake3::hash(channel.as_bytes()).to_hex()[..32]
+        )
     }
 }
 
@@ -227,6 +238,12 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/api/mesh/join", post(handle_mesh_join))
         .route("/api/mesh/history", get(handle_mesh_history))
         .route("/api/agentic", get(handle_agentic_get).post(handle_agentic_set))
+        .route(
+            "/api/suggest-pref",
+            get(handle_suggest_get).post(handle_suggest_set),
+        )
+        .route("/api/suggest", post(handle_suggest))
+        .route("/api/mcp", post(handle_mcp))
         .route("/api/thread-read", post(handle_thread_read))
         .route("/api/status", get(|State(st): State<Arc<WebState>>| async move {
             Json(st.status.read().await.clone())
@@ -3740,6 +3757,146 @@ async fn handle_agentic_set(
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
     StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct SuggestBody {
+    channel: String,
+    #[serde(default)]
+    thread: String,
+    #[serde(default)]
+    prefix: String,
+}
+
+async fn handle_suggest_get(
+    State(st): State<Arc<WebState>>,
+    Query(q): Query<ThreadsQuery>,
+) -> Json<serde_json::Value> {
+    let enabled = st.db.get_setting(&suggest_key(&q.channel)).await.unwrap_or_default() != "0";
+    Json(serde_json::json!({ "enabled": enabled }))
+}
+
+async fn handle_suggest_set(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<AgenticBody>,
+) -> StatusCode {
+    let value = if body.enabled { "1" } else { "0" };
+    if st
+        .db
+        .set_setting(&suggest_key(&body.channel), value)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    StatusCode::OK
+}
+
+async fn handle_suggest(
+    State(st): State<Arc<WebState>>,
+    Json(body): Json<SuggestBody>,
+) -> Json<serde_json::Value> {
+    let empty = serde_json::json!({ "completion": "", "source": "none" });
+    if body.prefix.trim().is_empty() {
+        return Json(empty);
+    }
+    if st
+        .db
+        .get_setting(&suggest_key(&body.channel))
+        .await
+        .unwrap_or_default()
+        == "0"
+    {
+        return Json(empty);
+    }
+    let choices = st.models.model_choices().await;
+    let models: Vec<String> = choices.into_iter().map(|choice| choice.id).collect();
+    let namespaces = match st.db.get_channel(&body.channel).await {
+        Ok(Some(ch)) => ch.context_namespaces,
+        _ => vec![body.channel.clone()],
+    };
+    let mut paths = Vec::new();
+    let mut symbols = Vec::new();
+    let mut prompts = Vec::new();
+    for ns in &namespaces {
+        let Ok(entries) = st.db.load_entries(Some(ns)).await else {
+            continue;
+        };
+        for entry in entries.into_iter().take(200) {
+            if !entry.source_path.is_empty() {
+                paths.push(entry.source_path);
+            }
+            if entry.entry_type == ENTRY_EXEMPLAR {
+                if let Some(task) = entry.content.lines().find(|line| line.starts_with("Task:")) {
+                    prompts.push(task.trim_start_matches("Task:").trim().to_string());
+                }
+            }
+            if symbols.len() < 8_000 {
+                for line in entry.content.lines().take(40) {
+                    symbols.extend(crate::suggest::identifier_tokens(line));
+                    if symbols.len() >= 8_000 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let thread = if body.thread.trim().is_empty() {
+        "main"
+    } else {
+        body.thread.trim()
+    };
+    if let Ok(rows) = st.db.load_thread(&body.channel, thread, 50).await {
+        for message in rows.into_iter().rev() {
+            if crate::models::is_human_role(&message.author) && !message.content.trim().is_empty()
+            {
+                prompts.push(message.content);
+            }
+        }
+    }
+    if let Some(suffix) = crate::suggest::index_suffix(&body.prefix, &models, &paths, &symbols, &prompts)
+    {
+        return Json(serde_json::json!({ "completion": suffix, "source": "index" }));
+    }
+    let model = st.cfg.models.autocomplete_model.clone();
+    let inflight = st.local_inflight.load(Ordering::Relaxed);
+    if !crate::suggest::allow_llm(&body.prefix, &model, inflight) {
+        return Json(empty);
+    }
+    let files = paths.into_iter().take(8).collect::<Vec<_>>().join(", ");
+    let system = format!(
+        "Complete the user's partial coding prompt in 1 short phrase (max 15 words).\n\
+         Output ONLY the continuation text that immediately follows the prefix. No quotes, no markdown, no explanation.\n\
+         Project files: {files}"
+    );
+    let turns = [ChatTurn {
+        role: "user".into(),
+        text: format!("Partial input: {}", body.prefix),
+        attachments: vec![],
+    }];
+    let budget = std::time::Duration::from_millis(st.cfg.models.autocomplete_timeout_ms.max(100));
+    let generated = tokio::time::timeout(budget, st.models.generate(&model, &system, &turns)).await;
+    match generated {
+        Ok(Ok(text)) => {
+            let suffix = crate::suggest::llm_suffix(&body.prefix, &text);
+            if suffix.is_empty() {
+                Json(empty)
+            } else {
+                Json(serde_json::json!({ "completion": suffix, "source": "llm" }))
+            }
+        }
+        _ => Json(empty),
+    }
+}
+
+async fn handle_mcp(
+    State(st): State<Arc<WebState>>,
+    Json(req): Json<serde_json::Value>,
+) -> axum::response::Response {
+    match crate::mcp::handle_request(st.db.as_ref(), &st.cfg.node.id, &req).await {
+        Some(resp) => Json(resp).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 #[derive(Deserialize)]

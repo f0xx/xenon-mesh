@@ -17,6 +17,8 @@ mod retrieve;
 mod storage;
 mod watcher;
 mod web_ui;
+mod mcp;
+mod suggest;
 
 use anyhow::{bail, Context, Result};
 use config::{redact_url, AppConfig, NodeMode};
@@ -217,7 +219,7 @@ impl ClusterService for NodeRpcServer {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  xmeshd\n  xmeshd cli [--url http://127.0.0.1:PORT]\n  xmeshd check [local.yaml] [cluster.yaml]\n  xmeshd models <base_url>\n  xmeshd migrate <from_url> <to_url>\n  xmeshd export <db_url> <out.pb.zst>\n  xmeshd import <db_url> <in.pb.zst>"
+    "usage:\n  xmeshd\n  xmeshd cli [--url http://127.0.0.1:PORT]\n  xmeshd mcp\n  xmeshd check [local.yaml] [cluster.yaml]\n  xmeshd models <base_url>\n  xmeshd migrate <from_url> <to_url>\n  xmeshd export <db_url> <out.pb.zst>\n  xmeshd import <db_url> <in.pb.zst>"
 }
 
 #[tokio::main]
@@ -288,6 +290,20 @@ async fn main() -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        Some("mcp") => {
+            let local = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("/etc/xmeshd/local.yaml");
+            let cluster = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("/etc/xmeshd/cluster.yaml");
+            let cfg = AppConfig::load(cluster, local)?;
+            let base = mcp::http_base(&cfg.node.http_addr);
+            tracing::info!("mcp stdio bridge to {base}");
+            return mcp::run_stdio_bridge(&base).await;
         }
         Some(other) => bail!("{}\nunknown command: {other}", usage()),
         None => {}

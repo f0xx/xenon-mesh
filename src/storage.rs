@@ -1115,6 +1115,27 @@ impl Storage {
         Ok(rows.iter().map(Self::message_from_row).collect())
     }
 
+    /// Newest messages in a channel, across threads.
+    pub async fn recent_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: i64,
+    ) -> Result<Vec<pb::SessionMessage>> {
+        let sql = self.q(
+            "SELECT channel_id, thread_id, seq, author, content, created_at_ms
+             FROM session_messages
+             WHERE channel_id = $1
+             AND id NOT IN (SELECT id FROM message_meta WHERE deleted != 0)
+             ORDER BY created_at_ms DESC LIMIT $2",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(channel_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(Self::message_from_row).collect())
+    }
+
     pub async fn load_shown(
         &self,
         channel_id: &str,
