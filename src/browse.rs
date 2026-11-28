@@ -46,6 +46,68 @@ pub fn urls_in(text: &str) -> Vec<String> {
     out
 }
 
+/// A question that needs the tree, not a general chat reply.
+pub fn wants_code(question: &str) -> bool {
+    let q = question.to_ascii_lowercase();
+    [
+        "patch", "diff", "implement", "fix", "review", "refactor", "bug", "function",
+        "where is", "how does", "source", "crate", "module", "compile", "build",
+    ]
+    .iter()
+    .any(|word| q.contains(word))
+        || question.contains('/')
+        || question.contains(".rs")
+        || question.contains(".c")
+        || question.contains(".h")
+        || question.contains(".py")
+        || question.contains(".go")
+}
+
+/// When a coding reply never asks for a file and never offers a diff, open
+/// the tree once. A path in the question is a read. Otherwise the longest
+/// identifier is a grep.
+pub fn forced_lookup(question: &str, reply: &str) -> Option<Lookup> {
+    if !wants_code(question) || reply.contains("```diff") {
+        return None;
+    }
+    let (_, asked) = take_requests(reply);
+    if !asked.is_empty() {
+        return None;
+    }
+    for raw in question.split_whitespace() {
+        let token = raw.trim_matches(|c: char| "`,.;:()[]<>\"'".contains(c));
+        if token.contains("://") || token.len() < 4 {
+            continue;
+        }
+        let looks_like_path = token.contains('/')
+            || token.ends_with(".rs")
+            || token.ends_with(".c")
+            || token.ends_with(".h")
+            || token.ends_with(".py")
+            || token.ends_with(".go")
+            || token.ends_with(".toml");
+        if looks_like_path {
+            return Some(Lookup {
+                kind: "read".into(),
+                query: token.chars().take(300).collect(),
+            });
+        }
+    }
+    let mut best = String::new();
+    for token in crate::retrieve::tokens(question) {
+        if token.len() >= 5 && token.len() > best.len() {
+            best = token;
+        }
+    }
+    if best.is_empty() {
+        return None;
+    }
+    Some(Lookup {
+        kind: "grep".into(),
+        query: best,
+    })
+}
+
 /// Split lookup fences out of a reply. The fences are not part of the text
 /// that is shown after the lookup runs.
 pub fn take_requests(text: &str) -> (String, Vec<Lookup>) {
@@ -499,5 +561,17 @@ mod tests {
         let (text, tools) = take_requests("```rust\nfn main() {}\n```");
         assert!(tools.is_empty());
         assert!(text.contains("fn main"));
+    }
+
+    #[test]
+    fn a_patch_request_without_a_diff_opens_the_named_file() {
+        let lookup = forced_lookup("patch src/parser.rs to accept empty input", "I would change the parser.").unwrap();
+        assert_eq!(lookup.kind, "read");
+        assert_eq!(lookup.query, "src/parser.rs");
+        assert!(forced_lookup("hello there", "fine").is_none());
+        assert!(forced_lookup("fix the parser", "```diff\n+ok\n```").is_none());
+        let grep = forced_lookup("where is verify_task_sig used", "I am not sure").unwrap();
+        assert_eq!(grep.kind, "grep");
+        assert_eq!(grep.query, "verify");
     }
 }

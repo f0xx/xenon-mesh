@@ -12,6 +12,13 @@ respawn_max=0
 output_log="/var/log/xmeshd/stdout.log"
 error_log="/var/log/xmeshd/stderr.log"
 
+# Provider keys. Mode 640, not in git. Exported into the daemon, not the yaml.
+if [ -r /etc/xmeshd/provider.env ]; then
+	set -a
+	. /etc/xmeshd/provider.env
+	set +a
+fi
+
 depend() {
     need net
     use postgresql mariadb

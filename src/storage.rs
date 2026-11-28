@@ -2164,8 +2164,14 @@ mod tests {
     }
 
     async fn temp_db() -> Storage {
-        let path =
-            std::env::temp_dir().join(format!("xmesh-db-{}-{}.db", std::process::id(), now_ms()));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "xmesh-db-{}-{}-{}.db",
+            std::process::id(),
+            now_ms(),
+            n
+        ));
         let _ = std::fs::remove_file(&path);
         Storage::connect(None, path.to_str().unwrap())
             .await

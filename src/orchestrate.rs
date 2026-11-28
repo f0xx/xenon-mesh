@@ -61,6 +61,36 @@ pub fn admit(
 }
 
 /// First line is `provider/model` when it contains a slash and no spaces.
+/// The review turn a model actually sees. Prior replies are excerpts in this
+/// message, because a small context window drops them when they are only
+/// earlier turns.
+pub fn debate_brief(
+    model: &str,
+    round: u32,
+    max_rounds: u32,
+    question: &str,
+    prior: &[(String, String)],
+) -> String {
+    let mut text = format!(
+        "{question}\n\n---\nPeer review round {round} of {max_rounds} as `{model}`.\n\
+         The earlier replies are copied below. They are in this message.\n"
+    );
+    if prior.is_empty() {
+        text.push_str("No earlier reply is in this thread yet.\n");
+    }
+    for (author, body) in prior.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+        let excerpt: String = body.chars().take(1200).collect();
+        text.push_str(&format!("\n[{author}]\n{excerpt}\n"));
+    }
+    text.push_str(
+        "\nPoint out a concrete bug, missing file, or wrong assumption in those replies.\n\
+         If you agree with the latest shared solution, start with `CONSENSUS:`.\n\
+         If the question needs a code change and you disagree, end with one ```diff fence \
+         that applies to a file you were shown or that you read.\n",
+    );
+    text
+}
+
 pub fn parse_agent_task(body: &str) -> Option<(String, String)> {
     let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
@@ -126,6 +156,20 @@ mod tests {
             "hub"
         );
         assert!(admit("hub", 4, 4, "other/model", &[], 1_000_000).is_err());
+    }
+
+    #[test]
+    fn a_review_turn_contains_the_earlier_reply_and_cuts_it() {
+        let brief = debate_brief(
+            "huge/mesh-coder-7b",
+            1,
+            2,
+            "patch the parser",
+            &[("creative/mesh-coder".into(), "x".repeat(2000))],
+        );
+        assert!(brief.contains("[creative/mesh-coder]"));
+        assert!(brief.contains("```diff"));
+        assert!(brief.len() < 2000);
     }
 
     #[test]

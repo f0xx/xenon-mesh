@@ -9,6 +9,7 @@
 
 mod gemini;
 mod google;
+mod script;
 mod remote;
 
 use crate::config::{AppConfig, GeminiSection, ProviderConfig, Sampling};
@@ -30,6 +31,7 @@ pub enum ConcreteKind {
     OpenAi,
     Ollama,
     Google,
+    Script,
 }
 
 impl ConcreteKind {
@@ -39,6 +41,7 @@ impl ConcreteKind {
             Self::OpenAi => "openai",
             Self::Ollama => "ollama",
             Self::Google => "google",
+            Self::Script => "script",
         }
     }
 }
@@ -252,6 +255,7 @@ fn parse_kind(kind: &str) -> Option<ConcreteKind> {
         "openai" | "openapi" | "openai-compat" => Some(ConcreteKind::OpenAi),
         "ollama" => Some(ConcreteKind::Ollama),
         "google" | "web" => Some(ConcreteKind::Google),
+        "script" => Some(ConcreteKind::Script),
         _ => None,
     }
 }
@@ -462,7 +466,11 @@ impl ModelHub {
                     }
                 }
             }
-            if p.discover && p.kind != ConcreteKind::Gemini && p.kind != ConcreteKind::Google {
+            if p.discover
+                && p.kind != ConcreteKind::Gemini
+                && p.kind != ConcreteKind::Google
+                && p.kind != ConcreteKind::Script
+            {
                 let listed = match p.kind {
                     ConcreteKind::OpenAi => {
                         remote::openai_list_models(&self.http, &p.base_url, &p.key()).await
@@ -470,7 +478,9 @@ impl ModelHub {
                     ConcreteKind::Ollama => {
                         remote::ollama_list_models(&self.http, &p.base_url).await
                     }
-                    ConcreteKind::Gemini | ConcreteKind::Google => Ok(Vec::new()),
+                    ConcreteKind::Gemini | ConcreteKind::Google | ConcreteKind::Script => {
+                        Ok(Vec::new())
+                    }
                 };
                 match listed {
                     Ok(ids) if !ids.is_empty() => {
@@ -588,7 +598,7 @@ impl ModelHub {
                 )
                 .await
             }
-            ConcreteKind::Google => Ok(Vec::new()),
+            ConcreteKind::Google | ConcreteKind::Script => Ok(Vec::new()),
         };
         match result {
             Ok(v) => Ok(v),
@@ -715,6 +725,19 @@ impl ModelHub {
         tx: Option<&mpsc::Sender<StreamEvent>>,
     ) -> Result<String> {
         match (provider.kind, tx) {
+            (ConcreteKind::Script, tx) => {
+                script::run(
+                    &provider.command,
+                    &provider.base_url,
+                    &provider.key(),
+                    model,
+                    system,
+                    turns,
+                    provider.timeout,
+                    tx,
+                )
+                .await
+            }
             (ConcreteKind::Google, tx) => {
                 google::ask(
                     &provider.command,
@@ -814,7 +837,7 @@ impl ModelHub {
         let mut models = match kind {
             ConcreteKind::OpenAi => remote::openai_list_models(&http, base_url, "").await?,
             ConcreteKind::Ollama => remote::ollama_list_models(&http, base_url).await?,
-            ConcreteKind::Gemini | ConcreteKind::Google => Vec::new(),
+            ConcreteKind::Gemini | ConcreteKind::Google | ConcreteKind::Script => Vec::new(),
         };
         models.sort_by_key(|m| Reverse(coding_rank(m)));
         let suggested_default = models.first().cloned().unwrap_or_default();

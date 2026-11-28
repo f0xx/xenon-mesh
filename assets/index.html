@@ -48,6 +48,10 @@
   .dayline { display:flex; align-items:center; gap:10px; color:#718096; font-size:12px; margin:14px 4px; }
   .dayline:before, .dayline:after { content:''; flex:1; border-top:1px solid #2d3748; }
   .msgtools { display:flex; gap:4px; justify-content:flex-end; margin-top:6px; }
+  .votes { display:inline-flex; gap:4px; margin-left:8px; }
+  .votes button { background:#2d3748; color:#e2e8f0; border-radius:4px; padding:1px 7px; font-size:12px; font-weight:600; }
+  .votes button.up { color:#68d391; }
+  .votes button.down { color:#fc8181; }
   .msgtools button, #msgCtx button, #fmtBar button { background:transparent; color:#a0aec0; padding:0 6px; font-size:12px; }
   #fmtBar button { border:1px solid #2d3748; }
   #composer { min-height:52px; max-height:160px; overflow:auto; background:#0d0f12; color:#fff; border:1px solid #2d3748; padding:6px; }
@@ -168,6 +172,10 @@ let lang = localStorage.lang || 'en', ch = 'general', thread = 'main', currentDi
 let ctxName = '';
 let selfName = 'user';
 const inflight = new Set();
+const livePark = document.createElement('div');
+livePark.id = 'livePark';
+livePark.hidden = true;
+document.body.appendChild(livePark);
 let folded = new Set();
 try { folded = new Set(JSON.parse(localStorage.xmeshFold || '[]')); } catch (err) { folded = new Set(); }
 function groupOpen(title) { return title && !folded.has(title); }
@@ -457,14 +465,15 @@ async function forkThread() {
 }
 let histGen = 0;
 async function loadHistory() {
+  parkLive();
   const forCh = ch, forTh = thread, gen = histGen;
   const vis = (chMeta[ch] && chMeta[ch].visibility) || '';
   headerTitle.textContent = `# ${ch} / ${thread}${vis ? ' · ' + vis : ''}`;
   const rows = await (await fetch(`/api/history?channel=${encodeURIComponent(forCh)}&thread=${encodeURIComponent(forTh)}`)).json();
   if (gen !== histGen || ch !== forCh || thread !== forTh) return;
-  if (!Array.isArray(rows)) return;
+  if (!Array.isArray(rows)) { restoreLive(); return; }
   const key = forCh + '|' + forTh + '|' + rows.map(m => `${m.seq}:${m.text.length}:${m.edited_at_ms || 0}:${m.reply_thread || ''}:${m.thread_total || 0}:${m.thread_unread || 0}:${m.finished_at_ms || 0}:${m.vote || 0}`).join(',');
-  if (key === histKey && log.childElementCount) return;
+  if (key === histKey && log.childElementCount) { restoreLive(); return; }
   histKey = key;
   log.innerHTML = '';
   let lastDay = '';
@@ -475,6 +484,7 @@ async function loadHistory() {
     }
     appendBubble(m.role, m.text, m.created_at_ms, m.seq, m.edited_at_ms, m);
   });
+  if (ch === forCh && thread === forTh) restoreLive();
 }
 function dayKey(ms) {
   const d = new Date(ms);
@@ -653,11 +663,35 @@ function modelAuthor(who) {
   if (who.indexOf('/') >= 0) return true;
   return who === 'assistant' || who === 'model' || who === 'bot' || who === 'error';
 }
-async function voteMessage(seq, vote) {
-  const r = await fetch('/api/chat/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch, thread, seq, vote, note: '' }) });
+async function voteMessage(seq, vote, homeCh, homeTh) {
+  const r = await fetch('/api/chat/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: homeCh || ch, thread: homeTh || thread, seq, vote, note: '' }) });
   if (!r.ok) return;
-  histKey = '';
-  await loadHistory();
+  if ((homeCh || ch) === ch && (homeTh || thread) === thread) {
+    histKey = '';
+    await loadHistory();
+  }
+}
+function voteBar(seq, current, homeCh, homeTh) {
+  const wrap = document.createElement('span');
+  wrap.className = 'votes';
+  [['Useful', 1], ['Avoid', -1]].forEach(([label, vote]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    if (current === vote) b.className = vote > 0 ? 'up' : 'down';
+    b.onclick = () => voteMessage(seq, vote, homeCh, homeTh);
+    wrap.appendChild(b);
+  });
+  return wrap;
+}
+function parkLive() {
+  document.querySelectorAll('#log .msg.live').forEach(node => livePark.appendChild(node));
+}
+function restoreLive() {
+  const key = ch + '\n' + thread;
+  [...livePark.children].forEach(node => {
+    if (node.dataset.home === key) log.appendChild(node);
+  });
 }
 async function exportVotes() {
   const r = await fetch('/api/preferences/export', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ channel: ch }) });
@@ -682,6 +716,7 @@ function appendBubble(who, txt, ts, seq, edited, meta) {
   const whoEl = document.createElement('span');
   whoEl.textContent = `[${who}]`;
   hdr.appendChild(whoEl);
+  if (seq && modelAuthor(who)) hdr.appendChild(voteBar(seq, (meta && meta.vote) || 0, ch, thread));
   if (meta.reply_thread && thread === 'main') {
     const link = document.createElement('button');
     link.className = 'threadlink';
@@ -733,15 +768,6 @@ function appendBubble(who, txt, ts, seq, edited, meta) {
     const tools = document.createElement('div');
     tools.className = 'msgtools';
     const toolItems = [['Link', () => copyPermalink(seq)], ['Thread', () => replyInThread(seq)], ['Repeat', () => send(txt)], ['Edit', () => editMessage(seq, txt)], ['Clone', () => cloneMessage(seq, 'from')], ['Debug', () => debugMessage(seq)], ['Hide', () => hideMessage(seq)]].filter(item => item[0] !== 'Thread' || thread === 'main');
-    if (modelAuthor(who)) {
-      [['Useful', 1], ['Avoid', -1]].forEach(([label, vote]) => {
-        const b = document.createElement('button');
-        b.textContent = label;
-        if (meta.vote === vote) b.style.color = vote > 0 ? '#68d391' : '#fc8181';
-        b.onclick = () => voteMessage(seq, vote);
-        tools.appendChild(b);
-      });
-    }
     toolItems.filter(item => item[0] !== 'Thread' || thread === 'main')
       .filter(Boolean)
       .forEach(([label, fn]) => {
@@ -955,7 +981,8 @@ async function send(existing, rerun) {
   function ensureCard(id) {
     const key = id || ids[0] || 'model';
     if (cards.has(key)) return cards.get(key);
-    const card = document.createElement('div'); card.className = 'msg md';
+    const card = document.createElement('div'); card.className = 'msg md live';
+    card.dataset.home = sentOn + '\n' + sentThread;
     const hdr = document.createElement('div'); hdr.className = 'msghead';
     const whoEl = document.createElement('span'); whoEl.textContent = `[${key}]`;
     const timeEl = document.createElement('span'); timeEl.className = 'mtime'; timeEl.textContent = clockLabel(sentAt);
@@ -974,7 +1001,7 @@ async function send(existing, rerun) {
     thoughtBox.innerHTML = '<summary style="cursor:pointer;color:#b794f4">💭 Thinking...</summary><pre style="white-space:pre-wrap;margin:4px 0 0"></pre>';
     const body = document.createElement('div');
     card.append(hdr, statusLine, thoughtBox, body);
-    log.appendChild(card);
+    ((ch === sentOn && thread === sentThread) ? log : livePark).appendChild(card);
     const slot = { card, whoEl, timeEl, statusLine, thoughtBox, body, thoughtText: '', fullText: '', timer: null, stop };
     cards.set(key, slot);
     return slot;
@@ -988,7 +1015,7 @@ async function send(existing, rerun) {
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: sentOn, thread, prompt: p || 'Analyze attached files', model: ids[0] || '', models: ids, attachments: rerun ? [] : atts, rerun: !!rerun, debate: multiToggle.checked && debateToggle.checked, agentic: ask })
+      body: JSON.stringify({ channel: sentOn, thread: sentThread, prompt: p || 'Analyze attached files', model: ids[0] || '', models: ids, attachments: rerun ? [] : atts, rerun: !!rerun, debate: multiToggle.checked && debateToggle.checked, agentic: ask })
     });
     if (!resp.ok || !resp.body) {
       const slot = ensureCard(ids[0] || '');
@@ -1048,7 +1075,12 @@ async function send(existing, rerun) {
           if (ev.url) window.open(ev.url, '_blank', 'noopener');
           if (ev.text) { slot.fullText += ev.text; slot.body.innerHTML = renderMarkdown(slot.fullText); }
         } else if (ev.type === 'saved') {
+          if (ev.seq && modelAuthor(slot.whoEl.textContent.replace(/^\[|\]$/g, ''))) {
+            slot.whoEl.after(voteBar(ev.seq, 0, sentOn, sentThread));
+          }
           if (ev.last === false) continue;
+          cards.forEach(item => item.card.remove());
+          cards.clear();
           disarmTick();
           if (ch === sentOn && ev.thread && thread === 'main') {
             await openThread(ev.thread);

@@ -135,12 +135,18 @@ async fn generate_value(
 ) -> Result<Value> {
     let mut delay = 1u64;
     let mut last = String::new();
+    let thinking = model.starts_with("gemini-4");
+    let mut sampling = sampling;
+    if thinking && sampling.max_tokens.is_none() {
+        // Thinking tokens come out of this budget. Leave room for the answer.
+        sampling.max_tokens = Some(8192);
+    }
     for attempt in 0..3 {
         let resp = http
             .post(endpoint(model, "generateContent"))
             .timeout(timeout)
             .header("x-goog-api-key", api_key)
-            .json(&body(system_ctx, turns, false, sampling))
+            .json(&body(system_ctx, turns, thinking, sampling))
             .send()
             .await?;
         let status = resp.status();

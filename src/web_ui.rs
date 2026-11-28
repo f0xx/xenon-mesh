@@ -1186,14 +1186,15 @@ fn retrieval_budget(model: &str) -> (usize, usize, usize) {
     if model.to_ascii_lowercase().contains("gemini") {
         (10, 64_000, 12_000)
     } else {
-        (8, 28_000, 6_000)
+        // Leave room in an 8k context for the question and the prior replies.
+        (6, 12_000, 4_000)
     }
 }
 
 /// First prompt is a slice. `read` and `grep` fences pull the rest.
 fn disclosure_budget(model: &str) -> (usize, usize, usize) {
     let (top_k, budget, chunk) = retrieval_budget(model);
-    ((top_k / 2).max(4), (budget / 2).max(16_000), (chunk / 2).max(4_000))
+    ((top_k / 2).max(3), budget / 2, (chunk / 2).max(2_000))
 }
 
 async fn prompt_for(
@@ -1217,7 +1218,11 @@ async fn prompt_for(
     }
     let (entries, outline_dir) = collect_channel_entries(st, channel).await;
     let q_emb = st.models.embed_text(query).await.unwrap_or_default();
-    let (top_k, budget, chunk) = disclosure_budget(model);
+    let (top_k, budget, chunk) = if crate::browse::wants_code(query) {
+        retrieval_budget(model)
+    } else {
+        disclosure_budget(model)
+    };
     let mut mapped = map_entries(&entries);
     if let Ok(scores) = st.db.entry_scores().await {
         for entry in &mut mapped {
@@ -2477,8 +2482,21 @@ async fn run_one_reply(
                 }
                 continue;
             }
-            if tools.is_empty() || used == "error" {
-                break;
+            let mut tools = tools;
+            if tools.is_empty() {
+                if used == "error" || extras > 0 {
+                    break;
+                }
+                let question = loop_turns
+                    .iter()
+                    .rev()
+                    .find(|turn| crate::models::is_human_role(&turn.role))
+                    .map(|turn| turn.text.clone())
+                    .unwrap_or_default();
+                match crate::browse::forced_lookup(&question, &reply) {
+                    Some(lookup) => tools.push(lookup),
+                    None => break,
+                }
             }
             extras += 1;
             let (agents, rest): (Vec<_>, Vec<_>) =
@@ -2963,26 +2981,29 @@ async fn handle_persistent_chat(
                         .load_thread(&req.channel, &model_thread, 100)
                         .await
                         .unwrap_or_default();
-                    let mut debate_turns: Vec<ChatTurn> = history
-                        .into_iter()
-                        .filter(|m| m.author != "error" && !m.content.trim().is_empty())
-                        .map(|m| ChatTurn {
-                            role: m.author.clone(),
-                            text: m.content,
-                            attachments: vec![],
-                        })
+                    let question = history
+                        .iter()
+                        .rev()
+                        .find(|m| crate::models::is_human_role(&m.author))
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
+                    let prior: Vec<(String, String)> = history
+                        .iter()
+                        .filter(|m| m.author != "error" && !crate::models::is_human_role(&m.author))
+                        .filter(|m| !m.content.trim().is_empty())
+                        .map(|m| (m.author.clone(), m.content.clone()))
                         .collect();
-                    debate_turns.push(ChatTurn {
+                    let debate_turns = vec![ChatTurn {
                         role: "user".into(),
-                        text: format!(
-                            "You are participating in a peer review (round {round} of {max_rounds}) as `{model}`.\n\
-                             Critically examine the previous responses from other models in this thread.\n\
-                             Point out concrete bugs, edge cases, race conditions, or flawed assumptions.\n\
-                             If you fully agree with the latest shared solution, start your reply with `CONSENSUS:`.\n\
-                             Otherwise explain the flaw. Do not emit a diff unless it is the correction."
+                        text: crate::orchestrate::debate_brief(
+                            model,
+                            round,
+                            max_rounds,
+                            &question,
+                            &prior,
                         ),
                         attachments: vec![],
-                    });
+                    }];
                     let ok = run_one_reply(
                         st_bg.clone(),
                         model.clone(),

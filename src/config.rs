@@ -546,7 +546,10 @@ pub fn providers_from_json(text: &str) -> Result<Vec<ProviderConfig>> {
             chat_model: models.first().cloned().unwrap_or_default(),
             models,
             discover,
-            coding_bias: true,
+            coding_bias: obj
+                .get("coding_bias")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
             timeout_secs: obj.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(180),
             max_tokens,
             sampling,
@@ -608,6 +611,12 @@ mod tests {
         assert!(!parsed[0].discover);
         assert_eq!(parsed[0].sampling.temperature, Some(0.2));
         assert_eq!(parsed[0].sampling.max_tokens, Some(1000));
+        assert!(parsed[0].coding_bias);
+        let quiet = providers_from_json(
+            r#"{"side":{"type":"openai_chat","base_url":"https://side.example/v1","auth_optional":true,"models":["auto"],"coding_bias":false}}"#,
+        )
+        .unwrap();
+        assert!(!quiet[0].coding_bias);
     }
 
     #[test]
