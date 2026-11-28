@@ -1645,8 +1645,9 @@ async fn handle_complete(
                 .await;
             let _ = tx
                 .send(StreamEvent::Done {
-                    model_used: "error".into(),
-                    model: String::new(),
+                    model_used: req.model.clone(),
+                    model: req.model.clone(),
+                    failed: true,
                 })
                 .await;
         }
@@ -1709,6 +1710,7 @@ async fn relay_complete(
     let mut carry = Vec::new();
     let mut text = String::new();
     let mut used = String::new();
+    let mut failed = false;
     let idle = std::time::Duration::from_secs(300);
     loop {
         let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
@@ -1731,7 +1733,14 @@ async fn relay_complete(
             };
             match &ev {
                 StreamEvent::Delta { text: delta, .. } => text.push_str(delta),
-                StreamEvent::Done { model_used, .. } => used = model_used.clone(),
+                StreamEvent::Done {
+                    model_used,
+                    failed: flag,
+                    ..
+                } => {
+                    failed = *flag || model_used == "error";
+                    used = stored_model(model, model_used);
+                }
                 _ => {}
             }
             let _ = tx.send(ev).await;
@@ -1740,7 +1749,28 @@ async fn relay_complete(
     if used.is_empty() {
         used = model.to_string();
     }
+    if failed {
+        let detail = text
+            .trim()
+            .trim_start_matches("[ERROR]")
+            .trim()
+            .to_string();
+        anyhow::bail!(if detail.is_empty() {
+            "model call failed".to_string()
+        } else {
+            detail
+        });
+    }
     Ok((text, used))
+}
+
+/// A failed call is still that model's reply. `error` is not an author.
+fn stored_model(requested: &str, reported: &str) -> String {
+    if reported.is_empty() || reported == "error" {
+        requested.to_string()
+    } else {
+        reported.to_string()
+    }
 }
 
 fn stamp(ev: StreamEvent, model: &str) -> StreamEvent {
@@ -1757,9 +1787,14 @@ fn stamp(ev: StreamEvent, model: &str) -> StreamEvent {
             text,
             model: model.to_string(),
         },
-        StreamEvent::Done { model_used, .. } => StreamEvent::Done {
+        StreamEvent::Done {
+            model_used,
+            failed,
+            ..
+        } => StreamEvent::Done {
             model_used,
             model: model.to_string(),
+            failed,
         },
         other => other,
     }
@@ -2406,6 +2441,7 @@ async fn run_one_reply(
     });
     let started = now_ms();
     let mut cancelled = false;
+    let mut failed = false;
     let mut reply = String::new();
     let mut used = String::new();
     match one_round(
@@ -2425,18 +2461,26 @@ async fn run_one_reply(
         }
         Round::Cancelled => cancelled = true,
         Round::Failed(err) => {
-            reply = format!("[ERROR] {err}");
-            used = "error".into();
-            let _ = local_tx
-                .send(StreamEvent::Delta {
-                    text: reply.clone(),
-                    model: String::new(),
-                })
-                .await;
+            reply = if err.starts_with("[ERROR]") {
+                err
+            } else {
+                format!("[ERROR] {err}")
+            };
+            used = model.clone();
+            failed = true;
+            let seen = acc.lock().map(|g| g.contains("[ERROR]")).unwrap_or(false);
+            if !seen {
+                let _ = local_tx
+                    .send(StreamEvent::Delta {
+                        text: reply.clone(),
+                        model: model.clone(),
+                    })
+                    .await;
+            }
         }
     }
     let mut pending: Vec<tokio::task::JoinHandle<String>> = Vec::new();
-    if !cancelled && used != "error" {
+    if !cancelled && !failed {
         let mut loop_turns = turns.clone();
         let mut repo_entries: Option<Vec<ContextEntry>> = None;
         let mut extras = 0;
@@ -2501,7 +2545,7 @@ async fn run_one_reply(
             }
             let mut tools = tools;
             if tools.is_empty() {
-                if used == "error" || extras > 0 {
+                if failed || extras > 0 {
                     break;
                 }
                 let question = loop_turns
@@ -2676,7 +2720,7 @@ async fn run_one_reply(
         "raw": final_text,
         "processed": final_text,
         "cancelled": cancelled,
-        "error": if author == "error" { final_text.as_str() } else { "" },
+        "error": if failed { final_text.as_str() } else { "" },
         "actions": ["chat"]
     })
     .to_string();
@@ -2696,7 +2740,7 @@ async fn run_one_reply(
     .await;
     st.flights.end(ticket.id);
     let last = left.fetch_sub(1, Ordering::SeqCst) == 1;
-    let ok = author != "error" && !cancelled;
+    let ok = !failed && !cancelled;
     if send_saved {
         let _ = tx
             .send(StreamEvent::Saved {
@@ -3848,6 +3892,14 @@ async fn handle_suggest(
     };
     if let Ok(rows) = st.db.load_thread(&body.channel, thread, 50).await {
         for message in rows.into_iter().rev() {
+            if crate::models::is_human_role(&message.author) && !message.content.trim().is_empty()
+            {
+                prompts.push(message.content);
+            }
+        }
+    }
+    if let Ok(rows) = st.db.recent_channel_messages(&body.channel, 50).await {
+        for message in rows {
             if crate::models::is_human_role(&message.author) && !message.content.trim().is_empty()
             {
                 prompts.push(message.content);
@@ -5154,4 +5206,19 @@ struct P2pPushBody {
     token: String,
     channel: String,
     messages: Vec<ShareMsg>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_model;
+
+    #[test]
+    fn a_failed_call_keeps_the_model_that_was_asked() {
+        assert_eq!(stored_model("huge/mesh-coder-7b", "error"), "huge/mesh-coder-7b");
+        assert_eq!(stored_model("huge/mesh-coder-7b", ""), "huge/mesh-coder-7b");
+        assert_eq!(
+            stored_model("huge/mesh-coder-7b", "huge/mesh-coder-7b"),
+            "huge/mesh-coder-7b"
+        );
+    }
 }

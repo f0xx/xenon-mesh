@@ -85,6 +85,9 @@ pub enum StreamEvent {
         model_used: String,
         #[serde(default)]
         model: String,
+        /// The call failed. `model_used` is still the model that was asked.
+        #[serde(default)]
+        failed: bool,
     },
     Saved {
         seq: u64,
@@ -684,6 +687,7 @@ impl ModelHub {
                             .send(StreamEvent::Done {
                                 model_used: format!("{}/{}", provider.id, m),
                                 model: String::new(),
+                                failed: false,
                             })
                             .await;
                     }
